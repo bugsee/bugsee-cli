@@ -1,0 +1,84 @@
+name: Mirror release to download.bugsee.com
+
+# Fires after dist's release.yml publishes the GitHub Release (via the
+# announce job). Downloads every release asset and pushes it to:
+#   s3://${S3_BUCKET}/cli/v<version>/  (immutable, year-long cache)
+#   s3://${S3_BUCKET}/cli/latest/      (short cache, must-revalidate)
+#
+# The bucket is served as plain S3 (no CloudFront), so no invalidation
+# step is needed — clients re-hit S3 directly when Cache-Control expires.
+#
+# AWS credentials come via GitHub OIDC against a dedicated IAM role
+# (`arn:aws:iam::*:role/bugsee-cli-deploy`) whose trust policy restricts
+# AssumeRole to this repo on `refs/tags/v*` only.
+
+on:
+  release:
+    types: [published]
+
+# OIDC token write + repo read for `gh release download` + checkout.
+permissions:
+  id-token: write
+  contents: read
+
+# Don't cancel an in-flight mirror if a second release lands quickly —
+# both should publish. Group by tag so the same release doesn't race
+# itself if the workflow re-runs.
+concurrency:
+  group: s3-mirror-${{ github.event.release.tag_name }}
+  cancel-in-progress: false
+
+jobs:
+  mirror:
+    name: mirror to s3
+    runs-on: ubuntu-latest
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Download release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p assets
+          gh release download "${{ github.event.release.tag_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir assets \
+            --pattern '*'
+          echo "Downloaded:"
+          ls -la assets/
+
+      - name: Upload versioned (immutable, year-long cache)
+        # `cli/v<version>/<artifact>` is immutable: once a tag ships,
+        # those bytes never change. Long cache + `immutable` directive
+        # lets every CDN / browser cache aggressively.
+        # `--acl public-read` mirrors the docs deploy pattern; drop the
+        # flag if the bucket has Object Ownership = "Bucket owner
+        # enforced" (ACLs disabled — modern default for new buckets).
+        run: |
+          aws s3 cp assets/ \
+            "s3://${{ vars.S3_BUCKET }}/cli/${{ github.event.release.tag_name }}/" \
+            --recursive \
+            --acl public-read \
+            --cache-control "public, max-age=31536000, immutable"
+
+      - name: Upload latest (mutable alias, short cache)
+        # `cli/latest/<artifact>` is overwritten on every release. Keep
+        # the cache short so users running `curl … | sh` always pick up
+        # the newest installer. `must-revalidate` forces a conditional
+        # request once max-age expires (304 if unchanged — cheap).
+        run: |
+          aws s3 cp assets/ \
+            "s3://${{ vars.S3_BUCKET }}/cli/latest/" \
+            --recursive \
+            --acl public-read \
+            --cache-control "public, max-age=300, must-revalidate"
+
+      - name: Summary
+        run: |
+          echo "Mirrored ${{ github.event.release.tag_name }} to:"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.release.tag_name }}/"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/latest/"
