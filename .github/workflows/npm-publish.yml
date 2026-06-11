@@ -48,14 +48,18 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Setup Node
+        # DELIBERATELY no `registry-url:` here — setup-node@v6 with that
+        # option writes an .npmrc containing
+        # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`, which
+        # tells npm to use token auth instead of OIDC. We want the
+        # opposite: no .npmrc, so npm 11.5+ auto-uses the OIDC token
+        # minted from `permissions: id-token: write` above.
         uses: actions/setup-node@v6
         with:
           node-version: '22'
-          registry-url: 'https://registry.npmjs.org'
 
       - name: Upgrade npm to satisfy Trusted Publishing floor (≥ 11.5.1)
         # Node 22's bundled npm is below the OIDC floor as of 2026.
-        # Bumping explicitly keeps the publish step deterministic.
         run: |
           npm install -g npm@latest
           node --version
@@ -72,14 +76,14 @@ jobs:
             --pattern 'bugsee-cli-npm-package.tar.gz'
           ls -la release-assets/
 
-      - name: Extract and publish via OIDC
-        # Critical: NO `env: NODE_AUTH_TOKEN: ...` block. The mere
-        # presence (even empty) of NODE_AUTH_TOKEN disables OIDC and
-        # falls back to broken token auth.
-        run: |
-          mkdir -p extracted
-          tar -xzf release-assets/bugsee-cli-npm-package.tar.gz -C extracted
-          cd extracted
-          echo "Package to publish:"
-          node -e "const p = require('./package.json'); console.log('  name:', p.name); console.log('  version:', p.version); console.log('  repository:', JSON.stringify(p.repository));"
-          npm publish --access public --provenance
+      - name: Publish via OIDC
+        # `npm publish <tarball>` accepts an npm-pack-format tarball
+        # directly — no extraction needed. npm 11.5+ detects the
+        # ACTIONS_ID_TOKEN_REQUEST_* env vars GitHub injects when
+        # `id-token: write` is granted, mints the OIDC token, and
+        # presents it to the registry. Trust on npmjs.com side maps
+        # (repo, workflow filename) → @bugsee/bugsee-cli publish.
+        #
+        # Do NOT add `env: NODE_AUTH_TOKEN: ...` — even an empty value
+        # makes npm prefer broken token auth over OIDC.
+        run: npm publish release-assets/bugsee-cli-npm-package.tar.gz --access public --provenance
