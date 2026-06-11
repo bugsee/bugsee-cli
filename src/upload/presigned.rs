@@ -39,12 +39,24 @@ const TELEMETRY_VALUE: &str = "cli";
 
 /// Metadata POST body. Field names MUST match the wire format the worker
 /// has been receiving — every existing uploader emits these exact keys.
+///
+/// Field absence reflects per-platform reality:
+///   - ProGuard mapping (Android): sends `uuid` (Java-UUID hash) + `hash`
+///     (SHA-1) so the server can dedup; `transform` absent.
+///   - Native ELF (Android NDK): sends `uuid` + `hash` + `transform =
+///     "breakpad"`.
+///   - dSYM (iOS): sends ONLY `version` + `build`. The server extracts the
+///     Mach-O UUIDs from the uploaded zip itself (one per arch slice);
+///     dedup is client-side in BugseeAgent's `~/.bugseeUploadList`, which
+///     this CLI does not yet re-implement.
 #[derive(Debug, Clone, Serialize)]
 pub struct Metadata<'a> {
-    pub uuid: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub uuid: Option<&'a str>,
     pub version: &'a str,
     pub build: &'a str,
-    pub hash: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hash: Option<&'a str>,
 
     /// Only set for native ELF / Breakpad uploads (value `"breakpad"`).
     /// Absent for ProGuard mappings, dSYMs, etc.

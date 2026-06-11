@@ -4,7 +4,8 @@
 //!   - `proguard`    — R8 / ProGuard mapping files (v0.1)
 //!   - `elf`         — NDK native-debug-symbols zip pass-through
 //!     (v0.1 pass-through; per-`.so` build-id extraction TBD)
-//!   - `dsym`        — Apple Mach-O dSYM bundles (and BCSymbolMaps)        [TODO]
+//!   - `dsym`        — Apple Mach-O dSYM bundles (v0.1: single bundle;
+//!     multi-bundle directory walk + BCSymbolMap support TBD)
 //!   - `pe_pdb`      — Windows PE binaries and PDB files                   [TODO]
 //!   - `portable_pdb` — Portable PDB (.NET / MAUI managed code)            [TODO]
 //!   - `breakpad`    — Breakpad ASCII symbols                              [TODO]
@@ -14,5 +15,6 @@
 //! wire format for upload is ZIP-with-Zstd entries (see `crate::compress`)
 //! keyed by debug-id on the server.
 
+pub mod dsym;
 pub mod elf;
 pub mod proguard;

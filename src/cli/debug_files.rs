@@ -5,7 +5,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
-use crate::symbols::{elf, proguard};
+use crate::symbols::{dsym, elf, proguard};
 use crate::upload::presigned;
 
 const DEFAULT_ENDPOINT: &str = "https://api.bugsee.com";
@@ -120,10 +120,11 @@ pub async fn dispatch(
             match kind {
                 DebugFileType::Proguard => {}
                 DebugFileType::Elf => {}
+                DebugFileType::Dsym => {}
                 other => {
                     return Err(config_invalid(format!(
-                        "v0.1 supports --type proguard and --type elf only; got {other:?} \
-                         (other formats are scaffold-only)"
+                        "v0.1 supports --type proguard, --type elf, and --type dsym only; \
+                         got {other:?} (other formats are scaffold-only)"
                     )));
                 }
             }
@@ -138,9 +139,15 @@ pub async fn dispatch(
                 ),
             };
 
-            if kind == DebugFileType::Elf && icon.is_some() {
+            if matches!(kind, DebugFileType::Elf | DebugFileType::Dsym) && icon.is_some() {
                 return Err(config_invalid(
                     "--icon is only valid for --type proguard (mapping files attach the launcher icon)",
+                ));
+            }
+            if kind == DebugFileType::Dsym && parsed_override.is_some() {
+                return Err(config_invalid(
+                    "--uuid does not apply to --type dsym — the server extracts Mach-O UUIDs \
+                     from the dSYM bundle itself, one per architecture slice",
                 ));
             }
 
@@ -182,6 +189,13 @@ pub async fn dispatch(
                     &build,
                     uuid_for_elf,
                     dry_run,
+                )
+                .await;
+            }
+
+            if kind == DebugFileType::Dsym {
+                return run_dsym_upload(
+                    &paths, &endpoint, &app_token, &version, &build, strategy, dry_run,
                 )
                 .await;
             }
@@ -340,10 +354,10 @@ async fn run_proguard_upload(
 
         let resolved_uuid_str = resolved_uuid.to_string();
         let metadata = presigned::Metadata {
-            uuid: &resolved_uuid_str,
+            uuid: Some(&resolved_uuid_str),
             version,
             build,
-            hash: &identity.content_sha1_hex,
+            hash: Some(&identity.content_sha1_hex),
             transform: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
@@ -458,10 +472,10 @@ async fn run_elf_upload(
         }
 
         let metadata = presigned::Metadata {
-            uuid: &build_uuid_str,
+            uuid: Some(&build_uuid_str),
             version,
             build,
-            hash: &identity.content_sha1_hex,
+            hash: Some(&identity.content_sha1_hex),
             transform: Some("breakpad"),
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
@@ -474,6 +488,121 @@ async fn run_elf_upload(
             presigned::Outcome::AlreadyExists => {
                 already_existed += 1;
                 tracing::info!(uuid = %build_uuid, "already on server, skipped");
+            }
+        }
+    }
+
+    if dry_run {
+        tracing::info!("dry-run complete");
+    } else {
+        tracing::info!(uploaded, already_existed, "upload complete");
+    }
+    Ok(())
+}
+
+/// Pack and upload one or more Apple `.dSYM` bundles.
+///
+/// Phase 1 scope: each input path must be a `.dSYM` directory. Each bundle is
+/// independently identified (UUIDs per Mach-O slice extracted for logging),
+/// re-packed with the chosen compression strategy, and uploaded. The metadata
+/// POST carries ONLY `version` + `build` — server-side `images[].uuid`
+/// extraction matches BugseeAgent's wire protocol.
+async fn run_dsym_upload(
+    paths: &[PathBuf],
+    endpoint: &str,
+    app_token: &str,
+    version: &str,
+    build: &str,
+    strategy: Strategy,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    if paths.is_empty() {
+        return Err(input_not_found("no input paths supplied"));
+    }
+    for p in paths {
+        if !p.is_dir() {
+            return Err(input_invalid(format!(
+                "--type dsym expects a `.dSYM` bundle (a directory); got {}",
+                p.display()
+            )));
+        }
+    }
+
+    let client = if dry_run {
+        None
+    } else {
+        Some(presigned::build_client()?)
+    };
+
+    let mut uploaded = 0u32;
+    let mut already_existed = 0u32;
+    for dsym_path in paths {
+        tracing::info!(path = %dsym_path.display(), "processing dSYM bundle");
+
+        let identity = dsym::identify(dsym_path)?;
+        for slice in &identity.slices {
+            tracing::info!(
+                uuid = %slice.uuid,
+                arch = %slice.arch,
+                "extracted Mach-O slice",
+            );
+        }
+
+        let entries = dsym::enumerate_bundle_entries(dsym_path)?;
+        let zip_entries: Vec<ZipEntry<'_>> = entries
+            .iter()
+            .map(|(name, path)| ZipEntry {
+                name: name.as_str(),
+                source: path.as_path(),
+            })
+            .collect();
+
+        let tmpdir = tempfile::tempdir()?;
+        let bundle_name = dsym_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("bundle.dSYM");
+        let zip_path = tmpdir.path().join(format!("{}.zip", bundle_name));
+
+        let zip_size = compress::pack_entries(&zip_entries, &zip_path, strategy)?;
+        tracing::info!(
+            zip_size,
+            entries = zip_entries.len(),
+            slices = identity.slices.len(),
+            ?strategy,
+            "packed",
+        );
+
+        if dry_run {
+            tracing::info!(
+                "dry-run: would POST metadata + PUT {} ({} bytes)",
+                zip_path.display(),
+                zip_size,
+            );
+            continue;
+        }
+
+        // dSYM metadata is intentionally minimal: only version + build.
+        // The worker extracts Mach-O UUIDs from the zip via
+        // `symbolic.debuginfo.Archive.iter_objects()` and stores one entry
+        // per arch slice in `images[]`.
+        let metadata = presigned::Metadata {
+            uuid: None,
+            version,
+            build,
+            hash: None,
+            transform: None,
+        };
+        let client = client.as_ref().expect("client constructed when !dry_run");
+        let outcome = presigned::upload(client, endpoint, app_token, &metadata, &zip_path).await?;
+        match outcome {
+            presigned::Outcome::Uploaded => {
+                uploaded += 1;
+                tracing::info!(bundle = bundle_name, "uploaded");
+            }
+            presigned::Outcome::AlreadyExists => {
+                already_existed += 1;
+                tracing::info!(bundle = bundle_name, "already on server, skipped");
             }
         }
     }
