@@ -1,0 +1,70 @@
+[package]
+name = "bugsee-cli"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.79"
+authors = ["Bugsee"]
+description = "Bugsee CLI — cross-platform symbol collection, conversion, and upload."
+readme = "README.md"
+publish = false
+
+[[bin]]
+name = "bugsee-cli"
+path = "src/main.rs"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive", "cargo", "env"] }
+
+# Async runtime + HTTP
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs", "io-util", "sync", "signal"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream", "multipart", "gzip"] }
+futures-util = "0.3"
+
+# Symbol parsing — the `symbolic` Rust crate family, aligned with the worker's
+# `symbolic` Python wheels so both sides parse the same artifacts. Drifting
+# majors across producer/consumer would risk subtle DWARF/ELF/PE divergence.
+# Worker is on 13 (target 13.1.1); float within the same major.
+symbolic-common = "13"
+symbolic-debuginfo = "13"
+# Format-specific crates pulled in per-module as implementation lands:
+# symbolic-proguard = "13"
+# symbolic-sourcemapcache = "13"
+# symbolic-il2cpp = "13"  # experimental, for the Unity gap
+
+# Compression — zstd is the wire format (level 9–11 typical); zip writes archives with Z_STANDARD entries
+zstd = { version = "0.13", features = ["zstdmt"] }
+zip = { version = "2", default-features = false, features = ["zstd", "deflate"] }
+
+# Serialization + IDs
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v3", "v4", "v5", "serde"] }
+
+# Hashing (sha1 for content fingerprints + chunk identity; sha2 for stronger hashes;
+# md-5 matches Java `UUID.nameUUIDFromBytes` for legacy mapping-derived BUILD_UUIDs.)
+sha1 = "0.10"
+sha2 = "0.10"
+md-5 = "0.10"
+hex = "0.4"
+
+# File discovery
+walkdir = "2"
+globset = "0.4"
+
+# Errors + diagnostics
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+indicatif = "0.17"
+tempfile = "3"
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
