@@ -1,0 +1,85 @@
+name: Publish to npm
+
+# OIDC-based npm publish (Trusted Publishing). This workflow is the
+# trust target on the @bugsee/bugsee-cli package's npm.js settings —
+# `workflow_filename = npm-publish.yml` in npm's Trusted Publisher UI.
+#
+# Why a separate workflow (and not folded into release.yml):
+# `dist init` regenerates release.yml on every dist upgrade and would
+# silently clobber any OIDC wiring there. Keeping the npm publish in
+# our own workflow file insulates it from dist's lifecycle. dist still
+# generates the `bugsee-cli-npm-package.tar.gz` tarball as a GitHub
+# Release asset (via `installers = [..., "npm"]`); we just download
+# the asset and publish ourselves.
+#
+# Trigger is `workflow_dispatch` (same pattern as mirror-to-s3.yml):
+# the `release: published` event would NOT fire downstream workflows
+# because dist's `Release` workflow creates the release using the
+# default GITHUB_TOKEN, and GitHub deliberately suppresses recursive
+# workflow chains in that case.
+#
+# Hard requirements for npm Trusted Publishing (per npm docs):
+#   - `permissions: id-token: write` to mint the OIDC token
+#   - Node ≥ 22.14.0 and npm ≥ 11.5.1
+#   - No `NODE_AUTH_TOKEN` env var anywhere — even an empty value makes
+#     npm prefer (broken) token auth over OIDC
+#   - `package.json#repository` matches the GitHub URL exactly
+#     (dist generates this from Cargo.toml — already correct)
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v0.1.2)'
+        required: true
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+concurrency:
+  group: npm-publish-${{ github.event.inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: publish to npm via OIDC
+    runs-on: ubuntu-latest
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '22'
+          registry-url: 'https://registry.npmjs.org'
+
+      - name: Upgrade npm to satisfy Trusted Publishing floor (≥ 11.5.1)
+        # Node 22's bundled npm is below the OIDC floor as of 2026.
+        # Bumping explicitly keeps the publish step deterministic.
+        run: |
+          npm install -g npm@latest
+          node --version
+          npm --version
+
+      - name: Download npm package tarball from release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p release-assets
+          gh release download "${{ github.event.inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --dir release-assets \
+            --pattern 'bugsee-cli-npm-package.tar.gz'
+          ls -la release-assets/
+
+      - name: Extract and publish via OIDC
+        # Critical: NO `env: NODE_AUTH_TOKEN: ...` block. The mere
+        # presence (even empty) of NODE_AUTH_TOKEN disables OIDC and
+        # falls back to broken token auth.
+        run: |
+          mkdir -p extracted
+          tar -xzf release-assets/bugsee-cli-npm-package.tar.gz -C extracted
+          cd extracted
+          echo "Package to publish:"
+          node -e "const p = require('./package.json'); console.log('  name:', p.name); console.log('  version:', p.version); console.log('  repository:', JSON.stringify(p.repository));"
+          npm publish --access public --provenance
