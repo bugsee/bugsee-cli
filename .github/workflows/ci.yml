@@ -50,7 +50,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
-      # `cargo test` does NOT run doctests under `--all-targets`. Run them
-      # separately so README-style examples in module docs (when they
-      # land) are validated alongside everything else.
-      - run: cargo test --doc
+      # No `cargo test --doc` step: `bugsee-cli` is a binary-only crate
+      # (no `[lib]` target), so doctests don't exist. If we ever split out
+      # a reusable library crate, add the step back here.
