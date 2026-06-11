@@ -84,6 +84,14 @@ jobs:
         # presents it to the registry. Trust on npmjs.com side maps
         # (repo, workflow filename) → @bugsee/bugsee-cli publish.
         #
+        # Absolute path is critical: a bare relative path like
+        # `release-assets/bugsee-cli-npm-package.tar.gz` is parsed by
+        # npm as a git spec (`owner/repo`) and routed through git
+        # ls-remote, failing with a confusing SSH/permission error.
+        #
         # Do NOT add `env: NODE_AUTH_TOKEN: ...` — even an empty value
         # makes npm prefer broken token auth over OIDC.
-        run: npm publish release-assets/bugsee-cli-npm-package.tar.gz --access public --provenance
+        run: |
+          tarball="$GITHUB_WORKSPACE/release-assets/bugsee-cli-npm-package.tar.gz"
+          ls -la "$tarball"
+          npm publish "$tarball" --access public --provenance
