@@ -1,20 +1,32 @@
 name: Mirror release to download.bugsee.com
 
-# Fires after dist's release.yml publishes the GitHub Release (via the
-# announce job). Downloads every release asset and pushes it to:
-#   s3://${S3_BUCKET}/cli/v<version>/  (immutable, year-long cache)
-#   s3://${S3_BUCKET}/cli/latest/      (short cache, must-revalidate)
+# Mirrors a published GitHub Release to:
+#   s3://${S3_BUCKET}/cli/<tag>/    (immutable, year-long cache)
+#   s3://${S3_BUCKET}/cli/latest/   (short cache, must-revalidate)
 #
 # The bucket is served as plain S3 (no CloudFront), so no invalidation
 # step is needed — clients re-hit S3 directly when Cache-Control expires.
+#
+# Why `workflow_dispatch` (manual trigger) and not `release: published`:
+# GitHub does NOT fire downstream workflow events for activity initiated
+# by the default `GITHUB_TOKEN` — and `dist`'s release.yml uses exactly
+# that token to publish the Release. This is documented behavior
+# (https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow):
+# the safeguard prevents recursive workflow chains. Either the release
+# needs to be published with a PAT / GitHub App, or we trigger this
+# workflow manually. Manual is simpler for v0.1; switching is one-line.
 #
 # AWS credentials come via GitHub OIDC against a dedicated IAM role
 # (`arn:aws:iam::*:role/bugsee-cli-deploy`) whose trust policy restricts
 # AssumeRole to this repo on `refs/tags/v*` only.
 
 on:
-  release:
-    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Release tag to mirror (e.g. v0.1.0)'
+        required: true
+        type: string
 
 # OIDC token write + repo read for `gh release download` + checkout.
 permissions:
@@ -25,7 +37,7 @@ permissions:
 # both should publish. Group by tag so the same release doesn't race
 # itself if the workflow re-runs.
 concurrency:
-  group: s3-mirror-${{ github.event.release.tag_name }}
+  group: s3-mirror-${{ github.event.inputs.tag }}
   cancel-in-progress: false
 
 jobs:
@@ -44,7 +56,7 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p assets
-          gh release download "${{ github.event.release.tag_name }}" \
+          gh release download "${{ github.event.inputs.tag }}" \
             --repo "${{ github.repository }}" \
             --dir assets \
             --pattern '*'
@@ -60,7 +72,7 @@ jobs:
         # enforced" (ACLs disabled — modern default for new buckets).
         run: |
           aws s3 cp assets/ \
-            "s3://${{ vars.S3_BUCKET }}/cli/${{ github.event.release.tag_name }}/" \
+            "s3://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/" \
             --recursive \
             --acl public-read \
             --cache-control "public, max-age=31536000, immutable"
@@ -79,6 +91,6 @@ jobs:
 
       - name: Summary
         run: |
-          echo "Mirrored ${{ github.event.release.tag_name }} to:"
-          echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.release.tag_name }}/"
+          echo "Mirrored ${{ github.event.inputs.tag }} to:"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/"
           echo "  https://${{ vars.S3_BUCKET }}/cli/latest/"
