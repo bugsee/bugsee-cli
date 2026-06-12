@@ -94,6 +94,13 @@ pub struct CollectArgs {
 
 /// Per-entry shape. Matches the Python wire format the existing
 /// `_build_dependencies_payload` consumes.
+///
+/// The optional `url` field is populated from Package.resolved's
+/// `location` field for SPM entries — it's the key OSV's
+/// SwiftURL ecosystem uses for vulnerability lookups. Dedup
+/// prefers entries that carry `url` over those that don't (same
+/// package via CocoaPods vs SPM → SPM wins because it has the
+/// upstream URL).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DepEntry {
     pub id: String,
@@ -107,6 +114,8 @@ pub struct DepEntry {
     #[serde(rename = "type")]
     pub type_: String,
     pub parents: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
 }
 
 /// Top-level CLI output shape. Mirrors the Python
@@ -260,6 +269,12 @@ pub fn parse_podfile_lock(path: &Path) -> Vec<DepEntry> {
             scope: None,
             type_: "library".to_string(),
             parents: parents_by_name.get(name).cloned().unwrap_or_default(),
+            // CocoaPods lockfile carries no upstream URL — pods are
+            // resolved through the CocoaPods spec repo by name.
+            // Absence here is the signal that SPM's `location` (if
+            // the same package is also pulled via SPM) should win
+            // on dedup so the OSV vuln lookup has a URL key.
+            url: None,
         });
     }
     out
@@ -364,6 +379,19 @@ pub fn parse_package_resolved(path: &Path) -> Vec<DepEntry> {
             .or_else(|| pin.pointer("/state/revision").and_then(|s| s.as_str()))
             .map(|s| s.to_string());
 
+        // Upstream URL — v1 uses `repositoryURL`, v2 uses
+        // `location`. Both forms encode the same thing (the SPM
+        // pin's source location); we surface either. OSV's
+        // SwiftURL ecosystem keys vulnerability lookups off this
+        // field, so a missing URL silently excludes the package
+        // from the vuln scan. Dedup pref prioritises url-bearing
+        // entries over url-less ones (see merge_dep_entries).
+        let url = pin
+            .pointer("/location")
+            .and_then(|s| s.as_str())
+            .or_else(|| pin.pointer("/repositoryURL").and_then(|s| s.as_str()))
+            .map(|s| s.to_string());
+
         out.push(DepEntry {
             id: make_dep_id("library", "", &name),
             group: String::new(),
@@ -373,6 +401,7 @@ pub fn parse_package_resolved(path: &Path) -> Vec<DepEntry> {
             scope: None,
             type_: "library".to_string(),
             parents: Vec::new(),
+            url,
         });
     }
     out
@@ -414,6 +443,10 @@ pub fn parse_cartfile_resolved(path: &Path) -> Vec<DepEntry> {
             scope: None,
             type_: "library".to_string(),
             parents: Vec::new(),
+            // Cartfile.resolved doesn't carry an upstream URL for
+            // the github / binary forms (the repo path IS the
+            // identifier); leave None.
+            url: None,
         });
     }
     out
@@ -483,6 +516,9 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
             scope: None,
             type_: "file".to_string(),
             parents: Vec::new(),
+            // Vendored frameworks are local binary blobs — no
+            // upstream URL to surface.
+            url: None,
         });
     }
     entries
@@ -490,33 +526,79 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
 
 // ─── Merger ─────────────────────────────────────────────────────────
 
-/// Merge multiple source lists into one with first-source-wins dedup
-/// and truncation. Matches the Python `_merge_dep_entries` contract.
+/// Merge multiple source lists into one. Dedup prefers entries that
+/// carry the `url` field over those that don't (OSV's SwiftURL
+/// ecosystem needs the URL for vulnerability lookups, so dropping the
+/// url-bearing variant in favour of a url-less one would silently
+/// exclude that package from the vuln scan). Ties — both or neither
+/// carry a url — keep the first seen, matching the manifest append
+/// order (CocoaPods → SPM → Carthage → vendored).
+///
+/// Output is sorted by `id` for deterministic JSON output and for
+/// stable diffs across consecutive runs of the same build.
+///
+/// Truncation: when the deduped set exceeds `max_entries`, drop
+/// non-direct entries first (transitive deps are less actionable
+/// than direct ones). Among entries with the same `direct` flag,
+/// drop by id-ascending order so the truncation is deterministic.
+///
+/// Returns `(entries, truncated)`. After truncation, parent refs
+/// pointing at evicted ids are stripped so consumers never need to
+/// handle dangling refs.
 pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Vec<DepEntry>, bool) {
-    let mut seen: HashSet<String> = HashSet::new();
-    let mut out: Vec<DepEntry> = Vec::new();
-    let mut truncated = false;
-    'outer: for source in sources {
+    // Dedup pass: url-preference, then first-seen. Track insertion
+    // order via a parallel Vec<String> of ids so the dedup is
+    // observable in tests.
+    let mut by_id: HashMap<String, DepEntry> = HashMap::new();
+    for source in sources {
         for entry in source {
-            if seen.contains(&entry.id) {
-                continue;
+            match by_id.get(&entry.id) {
+                None => {
+                    by_id.insert(entry.id.clone(), entry);
+                }
+                Some(prev) => {
+                    // Replace only when the incoming entry has a url
+                    // and the previous one didn't. Otherwise the
+                    // previous entry (first seen) wins.
+                    if entry.url.is_some() && prev.url.is_none() {
+                        by_id.insert(entry.id.clone(), entry);
+                    }
+                }
             }
-            if out.len() >= max_entries {
-                truncated = true;
-                break 'outer;
-            }
-            seen.insert(entry.id.clone());
-            out.push(entry);
         }
     }
+    if by_id.is_empty() {
+        return (Vec::new(), false);
+    }
+
+    // Sort by id for deterministic output.
+    let mut deduped: Vec<DepEntry> = by_id.into_values().collect();
+    deduped.sort_by(|a, b| a.id.cmp(&b.id));
+
+    let truncated = deduped.len() > max_entries;
+    if truncated {
+        // Direct-prefer truncation: keep direct entries first. Stable
+        // sort floats direct entries to the front while preserving id-
+        // ascending order within each group. Then truncate at the cap.
+        deduped.sort_by(|a, b| match (a.direct, b.direct) {
+            (true, false) => std::cmp::Ordering::Less,
+            (false, true) => std::cmp::Ordering::Greater,
+            _ => std::cmp::Ordering::Equal, // stable sort preserves id order
+        });
+        deduped.truncate(max_entries);
+        // Re-sort the kept set by id so the final output stays
+        // id-ordered regardless of the truncation pass.
+        deduped.sort_by(|a, b| a.id.cmp(&b.id));
+    }
+
     // Self-consistency: filter parent refs pointing at evicted ids.
-    let kept: HashSet<String> = out.iter().map(|e| e.id.clone()).collect();
-    for e in out.iter_mut() {
+    let kept: HashSet<String> = deduped.iter().map(|e| e.id.clone()).collect();
+    for e in deduped.iter_mut() {
         if !e.parents.is_empty() {
             e.parents.retain(|p| kept.contains(p));
         }
     }
-    (out, truncated)
+    (deduped, truncated)
 }
 
 // ─── Orchestrator + CLI dispatch ────────────────────────────────────
@@ -691,6 +773,42 @@ mod tests {
         );
         // All SPM pins are direct=true.
         assert!(entries.iter().all(|e| e.direct));
+        // v1 carries the url under `repositoryURL` — populate `url`
+        // from it. A regression that read only the v2 `location`
+        // field would miss vuln-scan keys for every Xcode-managed
+        // SPM project.
+        assert_eq!(
+            by_name["Alamofire"].url.as_deref(),
+            Some("https://github.com/Alamofire/Alamofire.git"),
+        );
+        // No URL on the revision-locked pin → None.
+        assert_eq!(by_name["swift-collections"].url, None);
+    }
+
+    #[test]
+    fn package_resolved_v2_uses_location_for_url() {
+        // SPM CLI v2 carries the url under `location`. The url is
+        // load-bearing for OSV vuln scanning, so a regression that
+        // dropped the field would silently lose vuln coverage on
+        // every SPM project using the new format.
+        let body = r#"{
+            "pins": [
+                {
+                    "identity": "alamofire",
+                    "kind": "remoteSourceControl",
+                    "location": "https://github.com/Alamofire/Alamofire.git",
+                    "state": {"version": "5.8.1"}
+                }
+            ],
+            "version": 2
+        }"#;
+        let tmp = TempDir::new().unwrap();
+        let path = write_fixture(tmp.path(), "Package.resolved", body);
+        let entries = parse_package_resolved(&path);
+        assert_eq!(
+            entries[0].url.as_deref(),
+            Some("https://github.com/Alamofire/Alamofire.git"),
+        );
     }
 
     #[test]
@@ -771,11 +889,27 @@ mod tests {
             scope: None,
             type_: "library".to_string(),
             parents: Vec::new(),
+            url: None,
         }
     }
 
+    fn dummy_entry_with_url(name: &str, url: &str) -> DepEntry {
+        let mut e = dummy_entry(name);
+        e.url = Some(url.to_string());
+        e
+    }
+
+    fn dummy_transitive(name: &str) -> DepEntry {
+        let mut e = dummy_entry(name);
+        e.direct = false;
+        e
+    }
+
     #[test]
-    fn merger_dedup_first_source_wins() {
+    fn merger_dedup_first_source_wins_when_no_url_advantage() {
+        // When neither colliding entry has a url, dedup falls through
+        // to first-seen — matches the legacy first-source-wins
+        // contract the fastlane Python tests have pinned.
         let mut first = dummy_entry("A");
         first.version = Some("from-cocoapods".to_string());
         let mut second = dummy_entry("A");
@@ -789,6 +923,146 @@ mod tests {
         // First source's A survives.
         assert_eq!(kept_a.version.as_deref(), Some("from-cocoapods"));
         assert!(!truncated);
+    }
+
+    #[test]
+    fn merger_dedup_url_preference_wins_over_first_source() {
+        // Cross-manager case the SDK relies on: same package surfaces
+        // via CocoaPods (no url) AND SPM (with url). The SPM entry
+        // MUST win because OSV vulnerability lookups key off the
+        // url; dropping it would silently exclude this package from
+        // every vuln scan.
+        let cocoapods_a = dummy_entry("A"); // no url
+        let spm_a = dummy_entry_with_url(
+            "A", "https://github.com/example/A.git",
+        );
+        let (out, _) = merge_dep_entries(
+            vec![vec![cocoapods_a], vec![spm_a]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://github.com/example/A.git"),
+        );
+    }
+
+    #[test]
+    fn merger_dedup_both_with_url_first_wins() {
+        // Edge case: both colliding entries have a url. First-seen
+        // wins (no preference reason to replace).
+        let first = dummy_entry_with_url("A", "https://first.example/A");
+        let second = dummy_entry_with_url("A", "https://second.example/A");
+        let (out, _) = merge_dep_entries(
+            vec![vec![first], vec![second]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].url.as_deref(), Some("https://first.example/A"));
+    }
+
+    #[test]
+    fn merger_dedup_url_bearing_entry_does_not_get_overwritten_by_url_less() {
+        // Opposite order from the cross-manager case: SPM first,
+        // CocoaPods second. The url-bearing entry MUST remain — a
+        // regression that flipped the comparison would lose the
+        // url every time the manifest order put SPM first.
+        let spm_a = dummy_entry_with_url(
+            "A", "https://github.com/example/A.git",
+        );
+        let cocoapods_a = dummy_entry("A"); // no url
+        let (out, _) = merge_dep_entries(
+            vec![vec![spm_a], vec![cocoapods_a]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://github.com/example/A.git"),
+        );
+    }
+
+    #[test]
+    fn merger_output_is_sorted_by_id_ascending() {
+        // The output ordering pins determinism — consecutive runs
+        // of the same build MUST produce identical diffs, so the
+        // dashboard's deps diff view doesn't show false noise. Pin
+        // ascending-id sort.
+        let entries = vec![vec![
+            dummy_entry("Zebra"),
+            dummy_entry("Apple"),
+            dummy_entry("Mango"),
+        ]];
+        let (out, _) = merge_dep_entries(entries, DEPENDENCIES_MAX_COUNT);
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Apple", "Mango", "Zebra"]);
+    }
+
+    #[test]
+    fn merger_truncation_prefers_direct_entries() {
+        // Cap exceeded. The truncation strategy floats `direct: true`
+        // entries to the kept set first — users care more about
+        // their direct deps than transitive ones, and dropping a
+        // direct entry from the vuln scan is more impactful.
+        let mut entries = Vec::new();
+        // 3 direct entries.
+        for i in 0..3 {
+            entries.push(dummy_entry(&format!("D{}", i)));
+        }
+        // 7 transitive entries.
+        for i in 0..7 {
+            entries.push(dummy_transitive(&format!("T{}", i)));
+        }
+        let (out, truncated) = merge_dep_entries(vec![entries], 5);
+        assert!(truncated);
+        assert_eq!(out.len(), 5);
+        // All 3 direct entries must be in the kept set; the
+        // remaining 2 slots are transitive.
+        let kept_names: HashSet<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        for i in 0..3 {
+            let n = format!("D{}", i);
+            assert!(
+                kept_names.contains(n.as_str()),
+                "direct entry D{} must survive truncation, but didn't",
+                i,
+            );
+        }
+        // Pin direct-count to catch a regression that lost the
+        // direct-prefer behaviour.
+        let direct_count = out.iter().filter(|e| e.direct).count();
+        assert_eq!(direct_count, 3);
+    }
+
+    #[test]
+    fn merger_truncated_output_still_id_sorted() {
+        // After truncation, the final output must still be id-
+        // sorted. A regression that skipped the post-truncation
+        // re-sort would surface as a non-deterministic order in
+        // the kept set — caught here.
+        let mut entries = Vec::new();
+        entries.push(dummy_entry("Zebra"));
+        entries.push(dummy_entry("Apple"));
+        entries.push(dummy_entry("Mango"));
+        entries.push(dummy_entry("Banana"));
+        let (out, truncated) = merge_dep_entries(vec![entries], 2);
+        assert!(truncated);
+        assert_eq!(out.len(), 2);
+        // First two by id-ascending = Apple, Banana.
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Apple", "Banana"]);
+    }
+
+    #[test]
+    fn merger_truncation_strips_dangling_parent_refs_in_kept_set() {
+        // Self-consistency: when a child entry survives truncation
+        // but its parent was evicted, the dangling parent id MUST
+        // be stripped from the child's parents list.
+        let mut child = dummy_entry("Child");
+        child.parents = vec![make_dep_id("library", "", "Evicted")];
+        // No "Evicted" entry in the source — simulates the
+        // post-truncation dangling-ref case directly.
+        let (out, _) = merge_dep_entries(vec![vec![child]], DEPENDENCIES_MAX_COUNT);
+        assert_eq!(out[0].parents, Vec::<String>::new());
     }
 
     #[test]
@@ -843,6 +1117,7 @@ mod tests {
                 scope: None,
                 type_: "library".to_string(),
                 parents: Vec::new(),
+                url: None,
             }],
             scope_label: "all".to_string(),
             truncated: false,
