@@ -71,6 +71,13 @@ symbolic-debuginfo = "13"
 # Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
 # load-path lines). Used in cli/ios_deps.rs only.
 regex = "1"
+
+# Apple plist reader — used by `bugsee-cli build-env read-plist` so the
+# Python BugseeAgents can shell to a single canonical Info.plist reader
+# instead of each having its own `plistlib.load` / `PlistBuddy` shim.
+# `1.x` lineage is stable; same major the worker's `symbolic` family
+# pulls in transitively, so cargo dedup keeps this free.
+plist = "1"
 # Format-specific crates pulled in per-module as implementation lands:
 # symbolic-proguard = "13"
 # symbolic-sourcemapcache = "13"

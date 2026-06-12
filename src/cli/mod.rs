@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 
+pub mod build_env;
 pub mod debug_files;
 pub mod ios_deps;
 pub mod sourcemaps;
@@ -54,6 +55,15 @@ pub enum Command {
     /// parsers + the merger.
     #[command(subcommand)]
     IosDeps(ios_deps::IosDepsCommand),
+
+    /// Build environment resolvers — Xcode version, CI-aware machine label,
+    /// Info.plist reader. Each subcommand prints its result to stdout (empty
+    /// string / empty object on unresolved).
+    ///
+    /// Consumed by both Python BugseeAgents to eliminate the duplicated
+    /// in-process helpers for these three concerns.
+    #[command(subcommand)]
+    BuildEnv(build_env::BuildEnvCommand),
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -62,5 +72,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::Sourcemaps(cmd) => sourcemaps::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
         Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
+        Command::BuildEnv(cmd) => build_env::dispatch(cmd),
     }
 }
