@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 pub mod debug_files;
 pub mod sourcemaps;
+pub mod vcs_metadata;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -34,11 +35,20 @@ pub enum Command {
     /// Manage JavaScript source maps (inject debug IDs, upload).
     #[command(subcommand)]
     Sourcemaps(sourcemaps::SourcemapsCommand),
+
+    /// Resolve VCS metadata (provider, commit_sha, branch, PR number, repo)
+    /// from CI provider env vars or a `git` fallback. Outputs JSON to stdout.
+    ///
+    /// Consumed by the Bugsee fastlane plugin's BugseeAgent and the iOS SDK's
+    /// `tools.bundle/BugseeAgent` as a single canonical resolver — both Python
+    /// scripts previously duplicated the same provider-detection logic.
+    VcsMetadata(vcs_metadata::VcsMetadataArgs),
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::DebugFiles(cmd) => debug_files::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::Sourcemaps(cmd) => sourcemaps::dispatch(cmd, cli.endpoint, cli.app_token).await,
+        Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
     }
 }
