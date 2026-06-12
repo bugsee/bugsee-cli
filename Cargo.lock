@@ -199,6 +199,7 @@ dependencies = [
  "indicatif",
  "md-5",
  "predicates",
+ "regex",
  "reqwest",
  "serde",
  "serde_json",

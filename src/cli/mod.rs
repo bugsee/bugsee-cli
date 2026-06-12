@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 
 pub mod debug_files;
+pub mod ios_deps;
 pub mod sourcemaps;
 pub mod vcs_metadata;
 
@@ -43,6 +44,16 @@ pub enum Command {
     /// `tools.bundle/BugseeAgent` as a single canonical resolver — both Python
     /// scripts previously duplicated the same provider-detection logic.
     VcsMetadata(vcs_metadata::VcsMetadataArgs),
+
+    /// Collect iOS dependency graph from Podfile.lock / Package.resolved /
+    /// Cartfile.resolved / linked vendored frameworks. Outputs JSON to stdout.
+    ///
+    /// Consumed by the Bugsee fastlane plugin's BugseeAgent and the iOS SDK's
+    /// `tools.bundle/BugseeAgent` as a single canonical parser — both Python
+    /// scripts previously had near-identical implementations of all four
+    /// parsers + the merger.
+    #[command(subcommand)]
+    IosDeps(ios_deps::IosDepsCommand),
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -50,5 +61,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::DebugFiles(cmd) => debug_files::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::Sourcemaps(cmd) => sourcemaps::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
+        Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
     }
 }

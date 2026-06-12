@@ -67,6 +67,10 @@ futures-util = "0.3"
 # Worker is on 13 (target 13.1.1); float within the same major.
 symbolic-common = "13"
 symbolic-debuginfo = "13"
+
+# Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
+# load-path lines). Used in cli/ios_deps.rs only.
+regex = "1"
 # Format-specific crates pulled in per-module as implementation lands:
 # symbolic-proguard = "13"
 # symbolic-sourcemapcache = "13"
