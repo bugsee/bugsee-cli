@@ -2,6 +2,7 @@ use clap::{Parser, Subcommand};
 
 pub mod build_env;
 pub mod debug_files;
+pub mod dsym;
 pub mod ios_deps;
 pub mod sourcemaps;
 pub mod vcs_metadata;
@@ -64,6 +65,13 @@ pub enum Command {
     /// in-process helpers for these three concerns.
     #[command(subcommand)]
     BuildEnv(build_env::BuildEnvCommand),
+
+    /// dSYM utilities — UUID extraction from a `.dSYM` bundle or a single
+    /// Mach-O binary. Replaces the `dwarfdump -u` shell-outs in both Python
+    /// BugseeAgents with one canonical Rust implementation keyed off the
+    /// `symbolic-debuginfo` Mach-O parser.
+    #[command(subcommand)]
+    Dsym(dsym::DsymCommand),
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -73,5 +81,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
         Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),
+        Command::Dsym(cmd) => dsym::dispatch(cmd),
     }
 }
