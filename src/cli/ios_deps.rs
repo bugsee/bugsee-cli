@@ -571,6 +571,18 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
         return Vec::new();
     }
     let stdout = String::from_utf8_lossy(&output);
+    parse_otool_output(&stdout)
+}
+
+/// Parse the line-oriented `otool -L <binary>` stdout into a list of
+/// vendored-framework `file`-type entries.
+///
+/// Lifted out of `parse_vendored_frameworks` so the regex + dedup
+/// logic has unit-test coverage without needing to drive the real
+/// `otool` binary (which would require shipping a Mach-O fixture).
+/// `parse_vendored_frameworks` is just an otool-spawn shim around
+/// this function.
+pub fn parse_otool_output(stdout: &str) -> Vec<DepEntry> {
     let framework_re = otool_framework_regex();
     let line_re = otool_line_regex();
 
@@ -1262,6 +1274,41 @@ mod tests {
     }
 
     #[test]
+    fn merger_truncation_keeps_transitive_consistently_within_id_order() {
+        // W17 pin: when the cap drops transitive entries, the kept
+        // transitive set must be the LOWEST-id-ascending subset of
+        // the input transitives — NOT a "random" subset that varies
+        // across runs. A regression that fell back to HashMap-iteration
+        // order for the leftover slots would still pass
+        // `merger_truncation_prefers_direct_entries` (it only checks
+        // that direct survives) but break here.
+        let mut entries = Vec::new();
+        // 1 direct + 6 transitive, capped at 4 → keep direct + 3
+        // transitive (the 3 with the lowest ids: B, D, F).
+        entries.push(dummy_entry("A"));   // direct
+        for name in ["F", "B", "H", "D", "J", "L"] {
+            entries.push(dummy_transitive(name));
+        }
+        let (out, truncated) = merge_dep_entries(vec![entries], 4);
+        assert!(truncated);
+        assert_eq!(out.len(), 4);
+        // After truncation the kept entries are re-sorted by id;
+        // direct A + transitive B, D, F in ascending order.
+        let names: Vec<&str> = out.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["A", "B", "D", "F"]);
+        // Pin direct flags so a future regression can't silently
+        // promote a transitive into the direct count.
+        assert!(out.iter().find(|e| e.name == "A").unwrap().direct);
+        for n in ["B", "D", "F"] {
+            assert!(
+                !out.iter().find(|e| e.name == n).unwrap().direct,
+                "{} should remain transitive after truncation",
+                n,
+            );
+        }
+    }
+
+    #[test]
     fn merger_truncated_output_still_id_sorted() {
         // After truncation, the final output must still be id-
         // sorted. A regression that skipped the post-truncation
@@ -1332,6 +1379,158 @@ mod tests {
     }
 
     // ── JSON wire shape ────────────────────────────────────────────
+
+    // ── otool stdout parser (I9) ────────────────────────────────────
+
+    #[test]
+    fn parse_otool_returns_empty_on_empty_input() {
+        // Empty stdout (otool ran but produced nothing) must yield
+        // an empty entry list, not panic or emit synthetic entries.
+        assert!(parse_otool_output("").is_empty());
+    }
+
+    #[test]
+    fn parse_otool_skips_system_dylibs_and_main_binary_lines() {
+        // The first line is the binary itself; the next two are
+        // system dylibs the back-end already accounts for. Result:
+        // empty entries (nothing vendored).
+        let stdout = "\
+/path/to/Foo.app/Foo:
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)
+\t/System/Library/Frameworks/Foundation.framework/Foundation (compatibility version 300.0.0, current version 1953.4.0)
+";
+        assert!(parse_otool_output(stdout).is_empty());
+    }
+
+    #[test]
+    fn parse_otool_extracts_rpath_relative_vendored_frameworks() {
+        // The canonical iOS shape: vendored frames live under
+        // @rpath/<Name>.framework/<Name>. The parser must pick out
+        // the `<Name>.framework` component and emit a `file`-type
+        // entry per unique framework.
+        let stdout = "\
+/path/to/Foo.app/Foo:
+\t@rpath/Stripe.framework/Stripe (compatibility version 1.0.0, current version 1.0.0)
+\t@rpath/Alamofire.framework/Alamofire (compatibility version 1.0.0, current version 5.10.0)
+\t/usr/lib/libSystem.B.dylib (compatibility version 1.0.0, current version 1.0.0)
+";
+        let entries = parse_otool_output(stdout);
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"Stripe.framework"));
+        assert!(names.contains(&"Alamofire.framework"));
+        assert_eq!(entries.len(), 2);
+        // All vendored entries are `file` type, direct=true, no url.
+        for e in &entries {
+            assert_eq!(e.type_, "file");
+            assert!(e.direct);
+            assert!(e.url.is_none());
+            // id has the documented `file::<name>` shape.
+            assert!(e.id.starts_with("file::"), "id shape: {}", e.id);
+        }
+    }
+
+    #[test]
+    fn parse_otool_dedups_repeated_framework_references() {
+        // A framework may appear in multiple LC_LOAD_DYLIB entries
+        // if it ships several dylibs. Same `<Name>.framework`
+        // path-component → one entry only.
+        let stdout = "\
+/path/to/Foo.app/Foo:
+\t@rpath/Stripe.framework/Stripe (compatibility version 1.0.0, current version 1.0.0)
+\t@rpath/Stripe.framework/Stripe (compatibility version 1.0.0, current version 1.0.0)
+\t@rpath/Stripe.framework/StripeCore (compatibility version 1.0.0, current version 1.0.0)
+";
+        let entries = parse_otool_output(stdout);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Stripe.framework");
+    }
+
+    #[test]
+    fn parse_otool_skips_non_rpath_relative_loads() {
+        // Loads with absolute paths outside the system prefixes
+        // (e.g. an Xcode-installed Swift runtime under /usr/lib/swift)
+        // are NOT vendored — they belong to the toolchain. The
+        // gate is `@rpath/` / `@executable_path/` / `@loader_path/`;
+        // anything else falls through.
+        let stdout = "\
+/path/to/Foo.app/Foo:
+\t/opt/homebrew/lib/libsomething.dylib (compatibility version 1.0.0, current version 1.0.0)
+";
+        assert!(parse_otool_output(stdout).is_empty());
+    }
+
+    // ── find_first_above (I10) ──────────────────────────────────────
+
+    #[test]
+    fn find_first_above_returns_none_for_empty_start_dir() {
+        assert!(find_first_above(Path::new(""), "Foo.txt").is_none());
+    }
+
+    #[test]
+    fn find_first_above_finds_file_at_start_dir() {
+        // Trivial case: filename is directly at start_dir.
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path(), "Podfile.lock", "PODS:\n");
+        let result = find_first_above(tmp.path(), "Podfile.lock");
+        assert!(result.is_some());
+        assert!(result.unwrap().is_file());
+    }
+
+    #[test]
+    fn find_first_above_walks_up_when_file_lives_at_ancestor() {
+        // Pins the upward-walk: file at <tmp>/X but search from
+        // <tmp>/sub/sub2 must find it.
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path(), "Cartfile.resolved", "github \"x\" \"1\"\n");
+        let nested = tmp.path().join("a").join("b");
+        std::fs::create_dir_all(&nested).unwrap();
+        let result = find_first_above(&nested, "Cartfile.resolved");
+        assert!(
+            result.is_some(),
+            "expected upward walk to find Cartfile.resolved at tmp root",
+        );
+    }
+
+    #[test]
+    fn find_first_above_caps_climb_at_six_levels() {
+        // Documented cap: walk at most 6 ancestors. A file 7 levels
+        // up should NOT be found. We can't easily construct a 7-
+        // deep tree under /tmp without temp helpers; instead pin
+        // the contract by starting from a deep path under tmp and
+        // asserting the cap is reached before /.
+        let tmp = TempDir::new().unwrap();
+        // Build a 7-deep nested dir but put the file ABOVE the cap.
+        let mut current = tmp.path().to_path_buf();
+        for _ in 0..7 {
+            current = current.join("d");
+            std::fs::create_dir(&current).unwrap();
+        }
+        // File lives at the tmp root — 7 ancestors away from
+        // `current`. Cap of 6 means it must NOT be found.
+        write_fixture(tmp.path(), "OutOfReach.txt", "x");
+        let result = find_first_above(&current, "OutOfReach.txt");
+        assert!(
+            result.is_none(),
+            "find_first_above must respect the 6-level cap; \
+             a file 7 levels above was reachable",
+        );
+    }
+
+    #[test]
+    fn find_first_above_handles_relative_start_dir() {
+        // The function previously canonicalised the start dir which
+        // resolved symlinks; the fix switched to `absolute()` so
+        // relative inputs still work. Pin: passing a relative path
+        // does NOT panic and the walk still resolves correctly.
+        let tmp = TempDir::new().unwrap();
+        write_fixture(tmp.path(), "Hello.txt", "hi");
+        // `current_dir` is process-wide state; restore after the test.
+        let original = std::env::current_dir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = find_first_above(Path::new("."), "Hello.txt");
+        std::env::set_current_dir(original).unwrap();
+        assert!(result.is_some(), "relative `.` must resolve correctly");
+    }
 
     // ── Xcode-managed SPM discovery ─────────────────────────────────
 
