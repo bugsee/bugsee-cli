@@ -287,14 +287,74 @@ mod tests {
         }
     }
 
-    // Real Mach-O fixture tests would require shipping a binary
-    // dSYM fixture in the repo. The existing
-    // `src/symbols/dsym.rs::identify` function (which this module
-    // delegates parsing to via `Archive::parse`) has its own
-    // round-trip tests against fixtures — duplicating those here
-    // would be redundant. The cases above pin the iOS-side
-    // empty-fallback contract for malformed / missing inputs,
-    // which is the load-bearing posture for the Python callers.
+    // ─── Real Mach-O round-trip ───────────────────────────────────
+    //
+    // A synthetic 56-byte Mach-O 64-bit binary with just an LC_UUID
+    // load command. Enough for `symbolic-debuginfo`'s `Archive::parse`
+    // + `debug_id()` round-trip, so this single fixture pins:
+    //   - extract_uuids actually parses Mach-O (not just empty-
+    //     fallback paths).
+    //   - The uppercase invariant survives the production code path
+    //     (a regression that dropped `.to_uppercase()` would surface
+    //     here as a lowercase comparison failure).
+    //   - format_uuid produces the documented 8-4-4-4-12 shape end-
+    //     to-end through `push_slices_from_macho`.
+    //
+    // Pins the previously-deferred review finding (real Mach-O round-
+    // trip absent) without checking in a multi-megabyte dSYM bundle.
+
+    /// Build a minimal valid Mach-O 64-bit binary with a single
+    /// LC_UUID load command. UUID layout matches the expected hex
+    /// `54D75FB3-747F-387F-8A93-4EA034B1F8CF`.
+    fn synthetic_macho_with_uuid() -> Vec<u8> {
+        let mut buf = Vec::with_capacity(56);
+        // mach_header_64
+        buf.extend_from_slice(&[0xcf, 0xfa, 0xed, 0xfe]); // MH_MAGIC_64
+        buf.extend_from_slice(&[0x07, 0x00, 0x00, 0x01]); // cputype = x86_64
+        buf.extend_from_slice(&[0x03, 0x00, 0x00, 0x00]); // cpusubtype
+        buf.extend_from_slice(&[0x0a, 0x00, 0x00, 0x00]); // filetype = MH_DSYM
+        buf.extend_from_slice(&[0x01, 0x00, 0x00, 0x00]); // ncmds = 1
+        buf.extend_from_slice(&[0x18, 0x00, 0x00, 0x00]); // sizeofcmds = 24
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags
+        buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
+        // LC_UUID
+        buf.extend_from_slice(&[0x1b, 0x00, 0x00, 0x00]); // cmd = LC_UUID
+        buf.extend_from_slice(&[0x18, 0x00, 0x00, 0x00]); // cmdsize = 24
+        buf.extend_from_slice(&[
+            0x54, 0xd7, 0x5f, 0xb3, 0x74, 0x7f, 0x38, 0x7f,
+            0x8a, 0x93, 0x4e, 0xa0, 0x34, 0xb1, 0xf8, 0xcf,
+        ]);
+        buf
+    }
+
+    #[test]
+    fn extract_uuids_round_trips_synthetic_macho_to_uppercase_hex() {
+        // Pins the end-to-end contract: a real (if minimal) Mach-O
+        // → extract_uuids returns the LC_UUID in 8-4-4-4-12 uppercase
+        // hex form. Any mutation in `push_slices_from_macho` that
+        // dropped `.to_uppercase()` (the original tautological pin's
+        // failure mode) surfaces here as a case-mismatch.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("synthetic.macho");
+        std::fs::write(&path, synthetic_macho_with_uuid()).unwrap();
+        let uuids = extract_uuids(&path);
+        assert_eq!(uuids, vec!["54D75FB3-747F-387F-8A93-4EA034B1F8CF"]);
+    }
+
+    #[test]
+    fn extract_slices_round_trips_synthetic_macho_with_arch() {
+        // Pair pin for the arch-aware variant. The synthetic Mach-O
+        // declares cputype=x86_64; symbolic-debuginfo's arch().name()
+        // must surface that as the lowercase short name. A serde
+        // rename mutation in DsymSliceView would also fail here.
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("synthetic.macho");
+        std::fs::write(&path, synthetic_macho_with_uuid()).unwrap();
+        let slices = extract_slices(&path);
+        assert_eq!(slices.len(), 1, "exactly one slice expected, got {:?}", slices);
+        assert_eq!(slices[0].uuid, "54D75FB3-747F-387F-8A93-4EA034B1F8CF");
+        assert_eq!(slices[0].arch, "x86_64");
+    }
 
     #[test]
     fn format_uuid_emits_uppercase_hyphenated_8_4_4_4_12() {

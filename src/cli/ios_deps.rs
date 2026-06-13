@@ -57,7 +57,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::io::Read;
+use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
 // ─── Lazy regex initialisation ──────────────────────────────────────
@@ -249,6 +250,13 @@ pub fn find_xcode_spm_resolved(root: &Path) -> Option<PathBuf> {
             _ => {}
         }
     }
+    // Sort both candidate lists by path lex order so the pick is
+    // reproducible across runs / filesystems. `read_dir` order is
+    // filesystem-defined (APFS, ext4, tmpfs all differ) and the
+    // discovery test would pass non-deterministically without this
+    // pin. Standard `Vec::sort` works on PathBuf via its `Ord` impl.
+    xcworkspace.sort();
+    xcodeproj.sort();
     let nested_in_proj = "project.xcworkspace/xcshareddata/swiftpm/Package.resolved";
     let nested_in_ws = "xcshareddata/swiftpm/Package.resolved";
     for ws in &xcworkspace {
@@ -570,17 +578,48 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
     if !binary_path.is_file() {
         return Vec::new();
     }
-    let output = match Command::new("/usr/bin/otool")
+    // Spawn otool with stdout piped so the cap is enforced WHILE we
+    // read rather than after the kernel has already buffered the
+    // full output. Previous shape called `.output()` which buffered
+    // the whole stdout — an adversarial Mach-O that drives otool to
+    // emit 2 GiB of dylib references would still allocate 2 GiB
+    // before being rejected by the post-call cap. With piped stdout
+    // + `take(MAX + 1)` we allocate at most MAX_OTOOL_STDOUT_BYTES + 1
+    // before bailing.
+    let mut child = match Command::new("/usr/bin/otool")
         .args(["-L", binary_path.to_string_lossy().as_ref()])
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
     {
-        Ok(o) if o.status.success() => o.stdout,
-        _ => return Vec::new(),
+        Ok(c) => c,
+        Err(_) => return Vec::new(),
     };
-    if output.len() > MAX_OTOOL_STDOUT_BYTES {
+    let mut buf = Vec::with_capacity(64 * 1024);
+    if let Some(mut stdout) = child.stdout.take() {
+        // `take` from std::io::Read caps the bytes read from the
+        // handle; +1 so we can detect overflow (read > cap).
+        let cap = MAX_OTOOL_STDOUT_BYTES as u64 + 1;
+        if stdout.take(cap).read_to_end(&mut buf).is_err() {
+            // Kill the child so it doesn't dangle if our read failed.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Vec::new();
+        }
+    }
+    // Reap the process to avoid zombies (matters on long-running
+    // hosts and in test loops).
+    let status = match child.wait() {
+        Ok(s) => s,
+        Err(_) => return Vec::new(),
+    };
+    if !status.success() {
         return Vec::new();
     }
-    let stdout = String::from_utf8_lossy(&output);
+    if buf.len() > MAX_OTOOL_STDOUT_BYTES {
+        return Vec::new();
+    }
+    let stdout = String::from_utf8_lossy(&buf);
     parse_otool_output(&stdout)
 }
 
@@ -690,20 +729,35 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
                     // preference, the CocoaPods graph evidence
                     // would silently disappear.
                     //
-                    // Rules: copy `url` from incoming if previous
-                    // had none. Promote `direct: true` (a true flag
-                    // from any source is authoritative). Fill in
-                    // `version` only when previous had none.
-                    // Preserve previous `parents` — they're the more
-                    // reliable graph signal.
+                    // Rules:
+                    // - When the incoming entry brings a `url` and
+                    //   the previous one had none, copy BOTH the url
+                    //   and the version onto the existing record.
+                    //   The url and the version it ships with belong
+                    //   to the SAME source — leaving the previous
+                    //   (Podfile-lock) version paired with the SPM
+                    //   url would silently advertise a vulnerability
+                    //   scan against the wrong version. The version
+                    //   only gets overwritten when the incoming
+                    //   carries one (so url-without-version doesn't
+                    //   wipe a valid prev.version).
+                    // - Promote `direct: true` (a true flag from any
+                    //   source is authoritative).
+                    // - Backfill `version` from incoming when previous
+                    //   had none (the url-paired case is the strict
+                    //   overwrite above; this is the no-url case).
+                    // - Preserve previous `parents` — the more
+                    //   reliable graph signal.
                     if prev.url.is_none() && entry.url.is_some() {
                         prev.url = entry.url;
+                        if entry.version.is_some() {
+                            prev.version = entry.version;
+                        }
+                    } else if prev.version.is_none() && entry.version.is_some() {
+                        prev.version = entry.version;
                     }
                     if entry.direct {
                         prev.direct = true;
-                    }
-                    if prev.version.is_none() && entry.version.is_some() {
-                        prev.version = entry.version;
                     }
                     if prev.parents.is_empty() && !entry.parents.is_empty() {
                         prev.parents = entry.parents;

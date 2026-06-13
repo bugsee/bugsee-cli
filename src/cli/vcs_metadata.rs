@@ -153,7 +153,34 @@ pub fn resolve(env: &HashMap<String, String>, working_dir: &Path) -> VcsMetadata
                 out.pr_number = Some(n);
             }
         } else {
-            set_if_present(&mut out.branch, env.get("CI_COMMIT_REF_NAME"));
+            // Branch vs tag pipeline distinction. GitLab CI sets:
+            //   - CI_COMMIT_BRANCH on branch pipelines (NOT tag).
+            //   - CI_COMMIT_TAG on tag pipelines (NOT branch).
+            //   - CI_COMMIT_REF_NAME is ALWAYS set; on a tag pipeline
+            //     it equals the tag name, which used to land in the
+            //     `branch` field verbatim — same bug class as the
+            //     GitHub `refs/tags/<tag>` leak fixed in cf1325f.
+            // Prefer CI_COMMIT_BRANCH when present; otherwise leave
+            // `branch` absent so tag-triggered pipelines don't
+            // mis-render the tag in the branch column.
+            if env
+                .get("CI_COMMIT_BRANCH")
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
+                set_if_present(&mut out.branch, env.get("CI_COMMIT_BRANCH"));
+            } else if env
+                .get("CI_COMMIT_TAG")
+                .map(|s| !s.trim().is_empty())
+                .unwrap_or(false)
+            {
+                // Tag pipeline — leave branch absent.
+            } else {
+                // No specific branch/tag marker — fall back to
+                // CI_COMMIT_REF_NAME for legacy GitLab versions
+                // (pre-12.6) that didn't emit CI_COMMIT_BRANCH.
+                set_if_present(&mut out.branch, env.get("CI_COMMIT_REF_NAME"));
+            }
         }
         return out;
     }
