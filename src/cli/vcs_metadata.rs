@@ -226,6 +226,19 @@ fn git_fallback(working_dir: &Path) -> VcsMetadata {
 /// Run `git` with the given args in `working_dir`. Returns the trimmed
 /// stdout on success, `None` on any failure (non-zero exit, missing
 /// binary, timeout-equivalent kill).
+///
+/// `git` is intentionally PATH-resolved here (no absolute path), even
+/// though the rest of this codebase uses `/usr/bin/<tool>` absolute
+/// paths. `git` is user-configurable in a way that `hostname` /
+/// `xcodebuild` / `otool` are not — Homebrew users run
+/// `/opt/homebrew/bin/git`, asdf/mise users get a shim, NixOS users
+/// don't have a system `/usr/bin/git` at all. Pinning the absolute
+/// path would silently fall back to "no VCS metadata" on every one
+/// of those configurations. The trade-off: in a shared CI workspace
+/// where an attacker can write to a directory earlier on PATH than
+/// the build user's intended git, a malicious shim runs in the
+/// build user's context. Document the threat model rather than
+/// pretend it isn't there.
 fn run_git(working_dir: &Path, args: &[&str]) -> Option<String> {
     Command::new("git")
         .args(args)

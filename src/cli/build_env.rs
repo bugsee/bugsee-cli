@@ -263,10 +263,14 @@ pub fn resolve_machine_label(env: &HashMap<String, String>) -> Option<String> {
 }
 
 fn local_hostname() -> Option<String> {
-    // Use the libc-level `gethostname` via the `gethostname` shim.
-    // For our purposes, std::process::Command to `hostname` is the
-    // simplest portable path that doesn't pull a new dep.
-    let output = Command::new("hostname").output().ok()?;
+    // Absolute path `/usr/bin/hostname` (POSIX standard location on
+    // both macOS and Linux). The rest of this codebase already uses
+    // absolute paths for system utilities (`/usr/bin/xcodebuild`,
+    // `/usr/bin/otool`); the previously-bare `Command::new("hostname")`
+    // was a PATH-hijack outlier — an attacker who can drop a `hostname`
+    // shim earlier on PATH (CI workspace, direnv-prepended project
+    // bin/, etc.) would have escalated to "run as the build user".
+    let output = Command::new("/usr/bin/hostname").output().ok()?;
     if !output.status.success() {
         return None;
     }
