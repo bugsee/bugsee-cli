@@ -169,6 +169,49 @@ pub fn find_first_above(start_dir: &Path, filename: &str) -> Option<PathBuf> {
     None
 }
 
+/// Locate an Xcode-managed `Package.resolved` by scanning `root` for
+/// sibling `*.xcodeproj` and `*.xcworkspace` directories and probing
+/// the nested SPM path inside each. Mirrors the Python BugseeAgent's
+/// `_spm_resolved_paths` (tools.bundle/BugseeAgent:3578–3595) which
+/// is what both Python implementations relied on before the migration.
+///
+/// `find_first_above` only walks UP and joins the relative path to
+/// each ancestor, so it never descends into a sibling `*.xcodeproj` —
+/// that's the regression this helper closes. Returns the first
+/// matching `Package.resolved`, with `.xcworkspace` preferred over
+/// `.xcodeproj` (Xcode prefers a workspace when both exist).
+pub fn find_xcode_spm_resolved(root: &Path) -> Option<PathBuf> {
+    let entries = std::fs::read_dir(root).ok()?;
+    let mut xcodeproj: Vec<PathBuf> = Vec::new();
+    let mut xcworkspace: Vec<PathBuf> = Vec::new();
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if !p.is_dir() {
+            continue;
+        }
+        match p.extension().and_then(|e| e.to_str()) {
+            Some("xcodeproj") => xcodeproj.push(p),
+            Some("xcworkspace") => xcworkspace.push(p),
+            _ => {}
+        }
+    }
+    let nested_in_proj = "project.xcworkspace/xcshareddata/swiftpm/Package.resolved";
+    let nested_in_ws = "xcshareddata/swiftpm/Package.resolved";
+    for ws in &xcworkspace {
+        let candidate = ws.join(nested_in_ws);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    for proj in &xcodeproj {
+        let candidate = proj.join(nested_in_proj);
+        if candidate.is_file() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
 // ─── Podfile.lock parser ────────────────────────────────────────────
 
 /// Parse a Podfile.lock. Returns the list of top-level pods + parent
@@ -552,16 +595,42 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
     let mut by_id: HashMap<String, DepEntry> = HashMap::new();
     for source in sources {
         for entry in source {
-            match by_id.get(&entry.id) {
+            match by_id.get_mut(&entry.id) {
                 None => {
                     by_id.insert(entry.id.clone(), entry);
                 }
                 Some(prev) => {
-                    // Replace only when the incoming entry has a url
-                    // and the previous one didn't. Otherwise the
-                    // previous entry (first seen) wins.
-                    if entry.url.is_some() && prev.url.is_none() {
-                        by_id.insert(entry.id.clone(), entry);
+                    // Field-wise merge. Wholesale-replacing the
+                    // existing record (the historic behaviour) loses
+                    // first-seen `parents` / `direct` / `version`
+                    // from the loser, because the parsers populate
+                    // those asymmetrically: CocoaPods walks the PODS
+                    // graph and emits `direct: false` +
+                    // `parents: [...]` for transitive subspecs; SPM
+                    // emits `direct: true` + `parents: []` because a
+                    // `Package.resolved` only records resolved pins,
+                    // not the dependency graph. If both sources
+                    // surface the same id and SPM wins for url-
+                    // preference, the CocoaPods graph evidence
+                    // would silently disappear.
+                    //
+                    // Rules: copy `url` from incoming if previous
+                    // had none. Promote `direct: true` (a true flag
+                    // from any source is authoritative). Fill in
+                    // `version` only when previous had none.
+                    // Preserve previous `parents` — they're the more
+                    // reliable graph signal.
+                    if prev.url.is_none() && entry.url.is_some() {
+                        prev.url = entry.url;
+                    }
+                    if entry.direct {
+                        prev.direct = true;
+                    }
+                    if prev.version.is_none() && entry.version.is_some() {
+                        prev.version = entry.version;
+                    }
+                    if prev.parents.is_empty() && !entry.parents.is_empty() {
+                        prev.parents = entry.parents;
                     }
                 }
             }
@@ -607,11 +676,20 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
 /// parses each, merges, returns the canonical result.
 pub fn collect(project_root: &Path, product_binary: Option<&Path>, max_entries: usize) -> CollectResult {
     let podfile = find_first_above(project_root, "Podfile.lock");
-    let package_resolved = find_first_above(project_root, "Package.resolved").or_else(|| {
-        // Xcode-managed SPM nests under
-        // `<root>/<project>.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`
-        find_first_above(project_root, "xcshareddata/swiftpm/Package.resolved")
-    });
+    // SPM `Package.resolved` discovery has three shapes the iOS
+    // toolchain produces:
+    //   1. Pure-SPM package: directly at `<root>/Package.resolved`.
+    //   2. Xcode-managed (project file): nested under
+    //      `<root>/<App>.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved`.
+    //   3. Xcode-managed (workspace file): nested under
+    //      `<root>/<App>.xcworkspace/xcshareddata/swiftpm/Package.resolved`.
+    // `find_first_above` only walks upward joining the relative path
+    // to ancestors, so it never finds the nested-in-xcodeproj shape.
+    // Probe (2)+(3) via `find_xcode_spm_resolved` before the upward
+    // search.
+    let package_resolved = find_first_above(project_root, "Package.resolved")
+        .or_else(|| find_xcode_spm_resolved(project_root))
+        .or_else(|| find_first_above(project_root, "xcshareddata/swiftpm/Package.resolved"));
     let cartfile = find_first_above(project_root, "Cartfile.resolved");
 
     let pods = podfile.as_deref().map(parse_podfile_lock).unwrap_or_default();
@@ -962,6 +1040,102 @@ mod tests {
     }
 
     #[test]
+    fn merger_url_preference_preserves_parents_and_demoted_direct_flag() {
+        // The bite the field-wise merge fix closes. A CocoaPods
+        // subspec (`Braintree/Core`) is a transitive dep — the
+        // parser emits `direct: false` + `parents: ["library::Braintree"]`,
+        // and no url. The same package surfaces via SPM as a
+        // resolved pin — the parser emits `direct: true` (SPM
+        // doesn't model transitivity) + `parents: []` + a url.
+        //
+        // Pre-fix wholesale-replacement would wipe the CocoaPods
+        // graph evidence: kept entry would have `parents: []`. The
+        // dashboard would render `Braintree/Core` as orphaned /
+        // direct even though the lockfile clearly shows it's a
+        // child of `Braintree`.
+        //
+        // Post-fix the previous entry's `parents` survive; the url
+        // is grafted on; `direct` is OR-merged so an SPM-direct +
+        // CocoaPods-transitive package ends up direct=true (it IS
+        // directly reachable via SPM).
+        let braintree_umbrella = dummy_entry("Braintree");
+        let mut cocoapods_subspec = dummy_transitive("Braintree/Core");
+        cocoapods_subspec.parents = vec![make_dep_id("library", "", "Braintree")];
+        let spm_entry = dummy_entry_with_url(
+            "Braintree/Core",
+            "https://github.com/braintree/braintree_ios.git",
+        );
+        let (out, _) = merge_dep_entries(
+            vec![vec![braintree_umbrella, cocoapods_subspec], vec![spm_entry]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        let core = out.iter().find(|e| e.name == "Braintree/Core").expect("Core kept");
+        assert_eq!(
+            core.url.as_deref(),
+            Some("https://github.com/braintree/braintree_ios.git"),
+        );
+        // Parents from CocoaPods survive. The parent edge is the
+        // load-bearing graph signal — without it, reachability
+        // analysis on the worker side breaks.
+        assert_eq!(
+            core.parents,
+            vec![make_dep_id("library", "", "Braintree")],
+            "CocoaPods parent edge must survive url-preference replacement",
+        );
+        // `direct` is OR-merged. CocoaPods said false (transitive),
+        // SPM said true (resolved pin) → result is true.
+        assert!(core.direct, "direct must OR-merge to true");
+    }
+
+    #[test]
+    fn merger_url_preference_does_not_demote_direct_when_both_transitive() {
+        // Reverse asymmetry: SPM-style first (direct=true), then a
+        // CocoaPods transitive (direct=false) bringing parents. We
+        // should pick up the parents but NOT demote direct from
+        // true → false. (`direct: true` is monotonic — once any
+        // source reaches the package directly, it stays direct.)
+        let umbrella = dummy_entry("Umbrella");
+        let spm_first = dummy_entry_with_url("Pkg", "https://example.com/pkg.git");
+        let mut cocoapods_subspec = dummy_transitive("Pkg");
+        cocoapods_subspec.parents = vec![make_dep_id("library", "", "Umbrella")];
+        let (out, _) = merge_dep_entries(
+            vec![vec![spm_first], vec![umbrella, cocoapods_subspec]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        let pkg = out.iter().find(|e| e.name == "Pkg").expect("Pkg kept");
+        assert!(pkg.direct, "first-source direct=true must not be demoted");
+        // Empty previous parents → backfilled from incoming.
+        assert_eq!(
+            pkg.parents,
+            vec![make_dep_id("library", "", "Umbrella")],
+            "empty parents must be backfilled from incoming source",
+        );
+    }
+
+    #[test]
+    fn merger_url_preference_fills_in_missing_version() {
+        // SPM emits `version: Some(...)` from `state.version`;
+        // vendored-frameworks emit `version: None`. If a package
+        // surfaces first as a vendored framework (no version, no
+        // url) and later via SPM (with both), the merger should
+        // accept SPM's version onto the existing record.
+        let mut vendored = dummy_entry("Foo");
+        vendored.version = None;
+        let mut spm = dummy_entry_with_url("Foo", "https://example.com/foo.git");
+        spm.version = Some("2.0".to_string());
+        let (out, _) = merge_dep_entries(
+            vec![vec![vendored], vec![spm]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].version.as_deref(), Some("2.0"));
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://example.com/foo.git"),
+        );
+    }
+
+    #[test]
     fn merger_dedup_url_bearing_entry_does_not_get_overwritten_by_url_less() {
         // Opposite order from the cross-manager case: SPM first,
         // CocoaPods second. The url-bearing entry MUST remain — a
@@ -1104,6 +1278,102 @@ mod tests {
     }
 
     // ── JSON wire shape ────────────────────────────────────────────
+
+    // ── Xcode-managed SPM discovery ─────────────────────────────────
+
+    fn write_spm_resolved_minimal(p: &Path) {
+        let body = "{\n  \"originHash\" : \"\",\n  \"pins\" : [{\n    \"identity\" : \"alamofire\",\n    \"kind\" : \"remoteSourceControl\",\n    \"location\" : \"https://github.com/Alamofire/Alamofire.git\",\n    \"state\" : { \"revision\" : \"abc\", \"version\" : \"5.10.0\" }\n  }],\n  \"version\" : 3\n}\n";
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, body).unwrap();
+    }
+
+    #[test]
+    fn discovery_finds_xcode_managed_spm_resolved_in_xcodeproj() {
+        // The bug the discovery fix closes. Xcode-managed SPM
+        // nests `Package.resolved` 5 levels deep under
+        // `<App>.xcodeproj/project.xcworkspace/...`. `find_first_above`
+        // walks UP, never sideways into siblings, so it would
+        // silently miss this shape — the migration regressed it.
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path()
+            .join("MyApp.xcodeproj")
+            .join("project.xcworkspace")
+            .join("xcshareddata")
+            .join("swiftpm")
+            .join("Package.resolved");
+        write_spm_resolved_minimal(&nested);
+
+        let result = collect(tmp.path(), None, DEPENDENCIES_MAX_COUNT);
+        assert!(
+            result.entries.iter().any(|e| e.name == "alamofire"),
+            "Xcode-managed SPM Package.resolved must be discoverable; got {:?}",
+            result.entries,
+        );
+    }
+
+    #[test]
+    fn discovery_finds_xcode_managed_spm_resolved_in_xcworkspace() {
+        // Workspace-rooted projects (App.xcworkspace, no xcodeproj
+        // wrapper) nest one level shallower. Same discovery
+        // mechanism, different sibling extension.
+        let tmp = TempDir::new().unwrap();
+        let nested = tmp.path()
+            .join("MyApp.xcworkspace")
+            .join("xcshareddata")
+            .join("swiftpm")
+            .join("Package.resolved");
+        write_spm_resolved_minimal(&nested);
+
+        let result = collect(tmp.path(), None, DEPENDENCIES_MAX_COUNT);
+        assert!(
+            result.entries.iter().any(|e| e.name == "alamofire"),
+            "Workspace-managed SPM Package.resolved must be discoverable",
+        );
+    }
+
+    #[test]
+    fn discovery_prefers_xcworkspace_over_xcodeproj_when_both_exist() {
+        // Xcode prefers `.xcworkspace` over `.xcodeproj` when both
+        // are present in the same dir. Mirror that here so the dep
+        // graph the CLI reports matches what Xcode is actually
+        // building from.
+        let tmp = TempDir::new().unwrap();
+        let in_proj = tmp.path()
+            .join("MyApp.xcodeproj")
+            .join("project.xcworkspace")
+            .join("xcshareddata")
+            .join("swiftpm")
+            .join("Package.resolved");
+        let in_ws = tmp.path()
+            .join("MyApp.xcworkspace")
+            .join("xcshareddata")
+            .join("swiftpm")
+            .join("Package.resolved");
+        // Write distinct fixtures so we can tell which one won.
+        std::fs::create_dir_all(in_proj.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(in_ws.parent().unwrap()).unwrap();
+        std::fs::write(&in_proj,
+            "{\"pins\":[{\"identity\":\"from-proj\",\"kind\":\"remoteSourceControl\",\
+             \"location\":\"https://example/proj.git\",\
+             \"state\":{\"version\":\"1.0\",\"revision\":\"a\"}}],\"version\":3}",
+        ).unwrap();
+        std::fs::write(&in_ws,
+            "{\"pins\":[{\"identity\":\"from-ws\",\"kind\":\"remoteSourceControl\",\
+             \"location\":\"https://example/ws.git\",\
+             \"state\":{\"version\":\"2.0\",\"revision\":\"b\"}}],\"version\":3}",
+        ).unwrap();
+
+        let result = collect(tmp.path(), None, DEPENDENCIES_MAX_COUNT);
+        assert!(
+            result.entries.iter().any(|e| e.name == "from-ws"),
+            "xcworkspace should win when both exist; got {:?}",
+            result.entries,
+        );
+        assert!(
+            !result.entries.iter().any(|e| e.name == "from-proj"),
+            "xcodeproj nested Package.resolved should be skipped when xcworkspace exists",
+        );
+    }
 
     #[test]
     fn collect_result_serialises_to_expected_shape() {
