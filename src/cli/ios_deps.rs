@@ -156,6 +156,16 @@ pub struct DepEntry {
 /// Top-level CLI output shape. Mirrors the Python
 /// `_collect_all_dependencies` return tuple
 /// `(entries, scope_label, truncated)`.
+///
+/// `scope_label`: always `"all"` for now. Reserved for a future
+/// `--scope=runtime_direct_only` mode that the Android plugin
+/// already supports (`DependencyPayloadSerializer.scopeLabel`). The
+/// SDK Python side reads this field into `collection_config.scope`
+/// (see `_deps_summary`) — the appserver pins it to the previous
+/// build's value during the diff-compatibility check, so it's
+/// load-bearing for that path even though `entries` doesn't yet
+/// vary by scope. Do NOT remove the field without a coordinated
+/// shape bump across all three producers.
 #[derive(Debug, Clone, Serialize)]
 pub struct CollectResult {
     pub entries: Vec<DepEntry>,
