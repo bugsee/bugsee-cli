@@ -1,0 +1,15 @@
+PODS:
+  - Alamofire (5.10.0)
+  - SocketRocket (0.7.1)
+
+DEPENDENCIES:
+  - Alamofire (~> 5.10.0)
+  - SocketRocket (~> 0.7.0)
+
+SPEC CHECKSUMS:
+  Alamofire: deadbeef0123456789abcdef0123456789abcdef
+  SocketRocket: feedface0123456789abcdef0123456789abcdef
+
+PODFILE CHECKSUM: 1111111111111111111111111111111111111111
+
+COCOAPODS: 1.15.2

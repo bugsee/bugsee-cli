@@ -45,6 +45,7 @@
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::path::{Path, PathBuf};
+use symbolic_common::DebugId;
 use symbolic_debuginfo::Archive;
 
 #[derive(Subcommand, Debug)]
@@ -150,19 +151,27 @@ fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
     };
     for obj in archive.objects() {
         if let Ok(obj) = obj {
-            // `debug_id().to_string()` produces lowercase hyphenated
-            // UUIDs by default. dwarfdump's traditional output is
-            // uppercase, so we uppercase here for cross-tool
-            // compatibility — Python callers parse with case-
-            // insensitive regexes BUT a future consumer that
-            // string-compared against dwarfdump output would silently
-            // break on lowercase.
             out.push(DsymSliceView {
-                uuid: obj.debug_id().to_string().to_uppercase(),
+                uuid: format_uuid(obj.debug_id()),
                 arch: obj.arch().name().to_string(),
             });
         }
     }
+}
+
+/// Stringify a `DebugId` in the uppercase hyphenated 8-4-4-4-12 form
+/// that `dwarfdump -u` traditionally emits. `DebugId::to_string()`
+/// defaults to lowercase; we override here for cross-tool
+/// compatibility. Python callers parse with case-insensitive regexes
+/// today BUT a future consumer that string-compared against dwarfdump
+/// output (the SDK's `BGSCrashReport.m` reports `LC_UUID` lowercase
+/// without dashes, so any cross-tool comparison must explicitly
+/// normalise) would silently break on lowercase. Extracted to its
+/// own function so the uppercase invariant has a behaviour-pinning
+/// test rather than the previous tautological pin (which tested
+/// `String::to_uppercase` against itself).
+pub fn format_uuid(id: DebugId) -> String {
+    id.to_string().to_uppercase()
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────
@@ -271,18 +280,88 @@ mod tests {
     // which is the load-bearing posture for the Python callers.
 
     #[test]
-    fn uppercase_output_is_pinned() {
-        // Pinning that any UUID we DO emit is uppercase. We can't
-        // produce a real UUID without a Mach-O fixture, so this
-        // test documents the contract via a comment-only pin —
-        // the actual round-trip lives in the production code's
-        // `.to_uppercase()` call which is exercised end-to-end
-        // by `bugsee-cli debug-files upload --type dsym`'s
-        // existing tests.
-        let lower = "54d75fb3-747f-387f-8a93-4ea034b1f8cf";
+    fn format_uuid_emits_uppercase_hyphenated_8_4_4_4_12() {
+        // Behaviour-pinning test for the uppercase invariant the CLI
+        // owes its consumers. The previous `uppercase_output_is_pinned`
+        // test was tautological — it tested `String::to_uppercase`
+        // against itself — and would have passed even if production
+        // dropped the `.to_uppercase()` call entirely. This test
+        // exercises `format_uuid` (the actual production code path)
+        // with a known UUID and pins the shape contract documented
+        // at the top of this module: `8-4-4-4-12 uppercase hex`.
+        let id: DebugId = "54d75fb3-747f-387f-8a93-4ea034b1f8cf"
+            .parse()
+            .expect("known-valid debug id");
         assert_eq!(
-            lower.to_uppercase(),
+            format_uuid(id),
             "54D75FB3-747F-387F-8A93-4EA034B1F8CF",
         );
+        // Cross-check: explicitly assert the four hyphens are at the
+        // canonical positions (8, 13, 18, 23) so a future serde-rename
+        // or formatter swap that drops dashes can't slip past.
+        let out = format_uuid(id);
+        let dash_positions: Vec<usize> = out
+            .char_indices()
+            .filter(|(_, c)| *c == '-')
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(dash_positions, vec![8, 13, 18, 23]);
+        assert_eq!(out.len(), 36);
+    }
+
+    #[test]
+    fn dsym_slice_view_serialises_to_lowercase_field_names() {
+        // Cross-language wire-shape pin for `DsymSliceView`. The
+        // Python consumer at
+        // `ios/sdk/scripts/test_bugsee_agent_dsym_cli.py` looks up
+        // `entry.get("uuid")` and `entry.get("arch")` — those exact
+        // lowercase field names. An accidental serde rename
+        // (`#[serde(rename_all = "PascalCase")]`) would silently
+        // produce `{"Uuid":...,"Arch":...}` and the Python parser's
+        // `_load_macho_slices_via_cli` would emit an empty dict per
+        // entry, so dSYM symbolication would silently degrade. The
+        // existing sibling test (`json_round_trips_through_serde...`
+        // in vcs_metadata.rs) pins field names that way; this is the
+        // dsym-side equivalent.
+        let view = DsymSliceView {
+            uuid: "54D75FB3-747F-387F-8A93-4EA034B1F8CF".to_string(),
+            arch: "arm64".to_string(),
+        };
+        let json = serde_json::to_string(&view).unwrap();
+        // Exact lowercase keys.
+        assert!(json.contains("\"uuid\":"), "missing lowercase uuid key in {json}");
+        assert!(json.contains("\"arch\":"), "missing lowercase arch key in {json}");
+        // Negative pin — common accidental renames.
+        assert!(!json.contains("\"UUID\":"), "UUID (uppercase) leaked in {json}");
+        assert!(!json.contains("\"Uuid\":"), "Uuid (PascalCase) leaked in {json}");
+        assert!(!json.contains("\"Arch\":"), "Arch (PascalCase) leaked in {json}");
+        // Value round-trip — the field values come through as strings.
+        assert!(json.contains("\"54D75FB3-747F-387F-8A93-4EA034B1F8CF\""));
+        assert!(json.contains("\"arm64\""));
+    }
+
+    #[test]
+    fn dsym_slice_view_vec_serialises_to_array_of_objects() {
+        // Pair pin for the top-level emit. The CLI prints
+        // `serde_json::to_string(&extract_slices(&path))` — a JSON
+        // array. Python parses with `json.loads(out)` and checks
+        // `isinstance(data, list)`, so an accidental serde-flatten
+        // that emitted `{"slices":[...]}` would silently produce a
+        // dict the Python parser rejects.
+        let views = vec![
+            DsymSliceView {
+                uuid: "AA000000-0000-0000-0000-000000000001".to_string(),
+                arch: "arm64".to_string(),
+            },
+            DsymSliceView {
+                uuid: "BB000000-0000-0000-0000-000000000002".to_string(),
+                arch: "x86_64".to_string(),
+            },
+        ];
+        let json = serde_json::to_string(&views).unwrap();
+        assert!(json.starts_with('['));
+        assert!(json.ends_with(']'));
+        // Two slice objects, comma-separated.
+        assert!(json.contains("},{"), "expected 2-object array shape in {json}");
     }
 }
