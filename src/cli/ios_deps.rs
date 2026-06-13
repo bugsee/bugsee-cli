@@ -607,8 +607,22 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
             return Vec::new();
         }
     }
+    // CAP-HIT DEADLOCK GUARD. `read_to_end(take(MAX+1))` returns Ok
+    // as soon as the take limit is reached, but otool may still be
+    // running with pending stdout bytes — the pipe buffer fills,
+    // otool blocks on its next write, and `child.wait()` below would
+    // block FOREVER waiting for a child that can't make progress.
+    // Detect cap-hit (buf.len() reached MAX+1, the explicit overflow
+    // sentinel) and kill+reap the child BEFORE calling wait.
+    if buf.len() > MAX_OTOOL_STDOUT_BYTES {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Vec::new();
+    }
     // Reap the process to avoid zombies (matters on long-running
-    // hosts and in test loops).
+    // hosts and in test loops). Safe to wait here — we know stdout
+    // EOFed (we read less than the cap), so otool isn't blocked on
+    // an unread pipe.
     let status = match child.wait() {
         Ok(s) => s,
         Err(_) => return Vec::new(),
@@ -616,9 +630,9 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
     if !status.success() {
         return Vec::new();
     }
-    if buf.len() > MAX_OTOOL_STDOUT_BYTES {
-        return Vec::new();
-    }
+    // Post-wait cap check removed — the pre-wait guard above already
+    // returned when buf overflowed, so any path that reaches here has
+    // buf.len() <= MAX_OTOOL_STDOUT_BYTES by construction.
     let stdout = String::from_utf8_lossy(&buf);
     parse_otool_output(&stdout)
 }
@@ -754,7 +768,23 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
                             prev.version = entry.version;
                         }
                     } else if prev.version.is_none() && entry.version.is_some() {
-                        prev.version = entry.version;
+                        // Only backfill version if the prev record has
+                        // no url either — otherwise the resulting
+                        // record would have prev's url paired with
+                        // entry's version (different sources). The
+                        // version that "ships with the url" is the
+                        // OSV-keying contract; cross-pairing would
+                        // silently scan against the wrong version.
+                        // Matching-url case (same upstream from two
+                        // sources) is safe and gets the backfill too.
+                        let same_origin = match (&prev.url, &entry.url) {
+                            (Some(pu), Some(eu)) => pu == eu,
+                            (None, None) => true,
+                            _ => false,
+                        };
+                        if same_origin {
+                            prev.version = entry.version;
+                        }
                     }
                     if entry.direct {
                         prev.direct = true;
@@ -1262,6 +1292,44 @@ mod tests {
         assert_eq!(
             out[0].url.as_deref(),
             Some("https://example.com/foo.git"),
+        );
+    }
+
+    #[test]
+    fn merger_url_and_version_travel_together_on_replacement() {
+        // The original bug (review finding #13): a CocoaPods entry
+        // carrying a stale Podfile.lock version `1.0` and no url
+        // collides with an SPM entry carrying `2.0` PLUS the
+        // upstream url. Pre-fix the merger took the url but kept
+        // the stale `1.0` version, silently advertising vuln scans
+        // against the wrong version. Post-fix: when url is promoted,
+        // the version comes with it. Without this regression pin
+        // the bug could trivially resurface — every other merger
+        // test uses entries where prev.version == entry.version.
+        let mut cocoapods = dummy_entry("Alamofire");
+        cocoapods.version = Some("1.0".to_string());
+        let mut spm = dummy_entry_with_url(
+            "Alamofire", "https://github.com/Alamofire/Alamofire.git",
+        );
+        spm.version = Some("2.0".to_string());
+        let (out, _) = merge_dep_entries(
+            vec![vec![cocoapods], vec![spm]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        // Both fields took the incoming source's value — they belong
+        // to the same package release.
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://github.com/Alamofire/Alamofire.git"),
+            "url must come from the SPM source",
+        );
+        assert_eq!(
+            out[0].version.as_deref(),
+            Some("2.0"),
+            "version must come from the SPM source — NOT stay at the \
+             stale CocoaPods value, which would scan the wrong version \
+             against OSV",
         );
     }
 

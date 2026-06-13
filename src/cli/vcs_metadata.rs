@@ -495,6 +495,57 @@ mod tests {
         assert_eq!(m.base_branch, None);
     }
 
+    #[test]
+    fn gitlab_push_prefers_ci_commit_branch_over_ref_name() {
+        // Modern GitLab (>=12.6) sets CI_COMMIT_BRANCH on branch
+        // pipelines AND CI_COMMIT_REF_NAME (which equals the branch
+        // name). The branch-preferred gate must pick CI_COMMIT_BRANCH
+        // — not the ref-name fallback.
+        let env = env_with(&[
+            ("GITLAB_CI", "true"),
+            ("CI_COMMIT_SHA", "gl-push-sha"),
+            ("CI_COMMIT_BRANCH", "feature/x"),
+            ("CI_COMMIT_REF_NAME", "feature/x"),
+        ]);
+        let m = resolve(&env, Path::new("/no/such/dir"));
+        assert_eq!(m.branch.as_deref(), Some("feature/x"));
+    }
+
+    #[test]
+    fn gitlab_tag_pipeline_omits_branch() {
+        // Tag pipelines set CI_COMMIT_TAG (NOT CI_COMMIT_BRANCH) +
+        // CI_COMMIT_REF_NAME (which equals the tag name). The
+        // historic `_set_if_present(branch, CI_COMMIT_REF_NAME)`
+        // leaked the tag into the branch column verbatim — same bug
+        // class as the GitHub `refs/tags/<tag>` leak fixed earlier.
+        // Post-fix: branch must be absent on tag pipelines.
+        let env = env_with(&[
+            ("GITLAB_CI", "true"),
+            ("CI_COMMIT_SHA", "gl-tag-sha"),
+            ("CI_COMMIT_TAG", "v1.0.0"),
+            ("CI_COMMIT_REF_NAME", "v1.0.0"),
+        ]);
+        let m = resolve(&env, Path::new("/no/such/dir"));
+        assert_eq!(
+            m.branch, None,
+            "tag pipeline must omit `branch`, not echo the tag name",
+        );
+    }
+
+    #[test]
+    fn gitlab_legacy_pre_12_6_falls_back_to_ref_name() {
+        // Pre-12.6 GitLab only set CI_COMMIT_REF_NAME (no
+        // CI_COMMIT_BRANCH / CI_COMMIT_TAG markers). The fallback
+        // path must still work for those legacy hosts.
+        let env = env_with(&[
+            ("GITLAB_CI", "true"),
+            ("CI_COMMIT_SHA", "gl-legacy-sha"),
+            ("CI_COMMIT_REF_NAME", "main"),
+        ]);
+        let m = resolve(&env, Path::new("/no/such/dir"));
+        assert_eq!(m.branch.as_deref(), Some("main"));
+    }
+
     // ── Bitbucket ─────────────────────────────────────────────────
 
     #[test]
