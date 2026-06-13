@@ -111,11 +111,17 @@ pub fn resolve(env: &HashMap<String, String>, working_dir: &Path) -> VcsMetadata
                 }
             }
         } else {
-            // Push event: GITHUB_REF carries `refs/heads/<branch>`; strip
-            // the prefix so the back-end sees a clean branch name.
+            // Push event: GITHUB_REF carries `refs/heads/<branch>` for
+            // a branch push, `refs/tags/<tag>` for a tag push. Only
+            // emit `branch` when the ref is a head ref. Tag-triggered
+            // builds previously stored the literal `refs/tags/v1.0.0`
+            // in the branch column — the Android Gradle plugin's
+            // canonical Kotlin VcsMetadataResolver does NOT do that
+            // (`removePrefix("refs/heads/").takeIf { it != ref }`).
             if let Some(refs) = env.get("GITHUB_REF") {
-                let branch = refs.strip_prefix("refs/heads/").unwrap_or(refs);
-                set_if_present_raw(&mut out.branch, Some(branch));
+                if let Some(branch) = refs.strip_prefix("refs/heads/") {
+                    set_if_present_raw(&mut out.branch, Some(branch));
+                }
             }
         }
         return out;
@@ -340,6 +346,31 @@ mod tests {
         // build", which would mis-render every push.
         assert_eq!(m.pr_number, None);
         assert_eq!(m.base_branch, None);
+    }
+
+    #[test]
+    fn github_actions_tag_push_leaves_branch_absent() {
+        // Tag pushes set `GITHUB_REF=refs/tags/<tag>` with
+        // `GITHUB_EVENT_NAME=push`. Pre-fix the unwrap-or-raw
+        // fallback would emit `branch: "refs/tags/v1.0.0"` and the
+        // dashboard would render the literal ref string in the
+        // branch column. The Kotlin canonical resolver (Android
+        // Gradle plugin) leaves branch absent on tag pushes; this
+        // pins the Rust port to the same behaviour.
+        let env = env_with(&[
+            ("GITHUB_ACTIONS", "true"),
+            ("GITHUB_SHA", "tag-sha"),
+            ("GITHUB_REPOSITORY", "org/repo"),
+            ("GITHUB_REF", "refs/tags/v1.0.0"),
+            ("GITHUB_EVENT_NAME", "push"),
+        ]);
+        let m = resolve(&env, Path::new("/no/such/dir"));
+        assert_eq!(m.provider, Some("github"));
+        assert_eq!(m.commit_sha.as_deref(), Some("tag-sha"));
+        assert_eq!(
+            m.branch, None,
+            "tag-pushed branch must be None, not the literal ref string",
+        );
     }
 
     #[test]

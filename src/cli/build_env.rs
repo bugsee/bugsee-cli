@@ -96,23 +96,48 @@ pub fn resolve_xcode_version() -> Option<String> {
     if version.is_empty() {
         return None;
     }
-    Some(version.to_string())
+    // Normalise to 3-part dotted to match the `XCODE_VERSION_ACTUAL`
+    // path. xcodebuild typically prints `Xcode 16.2` (2 components);
+    // the env-var path always produces `16.2.0`. Without this pad,
+    // the dashboard splits telemetry for the same Xcode install
+    // depending on which resolver path ran (env var inside a Run
+    // Script vs xcodebuild outside one).
+    Some(normalise_dotted_three_parts(version))
+}
+
+/// Pad a dotted version string to exactly 3 components by appending
+/// `.0` for each missing trailing field, or truncating any extras.
+/// `"16.2"` → `"16.2.0"`; `"16"` → `"16.0.0"`; `"16.2.0"` stays;
+/// `"16.2.0.42"` → `"16.2.0"`. Non-numeric components are passed
+/// through verbatim — the only goal is shape parity.
+fn normalise_dotted_three_parts(s: &str) -> String {
+    let mut parts: Vec<String> = s.split('.').map(|p| p.to_string()).collect();
+    while parts.len() < 3 {
+        parts.push("0".to_string());
+    }
+    parts.truncate(3);
+    parts.join(".")
 }
 
 /// `"1620"` → `"16.2.0"`. Last digit is patch, second-to-last is
 /// minor, prefix is major. So `"1543"` → `15.4.3`. Each component
 /// drops leading zeros but a fully-zero component stays as `"0"`.
+///
+/// 1-digit inputs are treated as patch-only: `"6"` → `"0.0.6"`.
+/// (Pre-fix the off-by-one in the slicing dropped the digit
+/// entirely and returned `"0.0.0"`.) 2-digit inputs are
+/// minor+patch: `"06"` → `"0.0.6"`, `"15"` → `"0.1.5"`.
 fn format_xcode_actual(s: &str) -> String {
     let len = s.len();
-    let major_end = if len >= 2 { len - 2 } else { 0 };
-    let minor_end = len.saturating_sub(1);
-    let major = if major_end > 0 { &s[..major_end] } else { "0" };
-    let minor = if minor_end > major_end {
-        &s[major_end..minor_end]
-    } else {
-        "0"
-    };
-    let patch = if minor_end > 0 { &s[minor_end..] } else { "0" };
+    // Anchor on patch (always the last char when len>=1). Then
+    // minor is the next char to the left (or "0"); major is
+    // everything else (or "0").
+    if len == 0 {
+        return "0.0.0".to_string();
+    }
+    let patch = &s[len - 1..];
+    let minor = if len >= 2 { &s[len - 2..len - 1] } else { "0" };
+    let major = if len >= 3 { &s[..len - 2] } else { "0" };
     format!("{}.{}.{}", strip_lead(major), strip_lead(minor), strip_lead(patch))
 }
 
@@ -335,6 +360,40 @@ mod tests {
         assert_eq!(format_xcode_actual("1543"), "15.4.3");
         // `"800"` → 8.0.0 — leading-major case.
         assert_eq!(format_xcode_actual("800"), "8.0.0");
+    }
+
+    #[test]
+    fn format_xcode_actual_short_inputs_preserve_digits() {
+        // Off-by-one regression pin. Pre-fix, the slicing math
+        // returned `"0.0.0"` for any 1-character input — the
+        // digit was dropped entirely. The new patch-anchored
+        // computation places single digits in the patch slot.
+        assert_eq!(format_xcode_actual("6"), "0.0.6");
+        // 2-digit input: patch is last digit, minor is first.
+        assert_eq!(format_xcode_actual("06"), "0.0.6");
+        assert_eq!(format_xcode_actual("15"), "0.1.5");
+        // 0-length input edge case: synthesise a placeholder
+        // rather than panic.
+        assert_eq!(format_xcode_actual(""), "0.0.0");
+    }
+
+    // ── normalise_dotted_three_parts ──────────────────────────────
+
+    #[test]
+    fn normalise_dotted_pads_to_three_parts() {
+        // The fix the resolve_xcode_version normalisation closes.
+        // Without padding, the same Xcode install yields different
+        // bucket strings depending on whether XCODE_VERSION_ACTUAL
+        // is in env (env-path → "16.2.0") or xcodebuild was
+        // shelled to (fallback path → "16.2"). The dashboard's
+        // string-typed version column then double-counts.
+        assert_eq!(normalise_dotted_three_parts("16.2"), "16.2.0");
+        assert_eq!(normalise_dotted_three_parts("16"), "16.0.0");
+        assert_eq!(normalise_dotted_three_parts("16.2.0"), "16.2.0");
+        // Extras truncated. Apple's xcodebuild has never emitted
+        // four parts, but pin the behaviour anyway so a future
+        // toolchain change can't silently re-split telemetry.
+        assert_eq!(normalise_dotted_three_parts("16.2.0.42"), "16.2.0");
     }
 
     // ── resolve_xcode_version ────────────────────────────────────
