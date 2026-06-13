@@ -52,11 +52,46 @@
 //! `library::Name` form by coincidence).
 
 use clap::{Args, Subcommand};
+use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
+
+// ─── Lazy regex initialisation ──────────────────────────────────────
+//
+// Each `Regex::new` call recompiles the regex at call time. The three
+// regexes the parsers use are all known-good constant patterns, so
+// compile once per process via `OnceLock`. Avoids recompilation cost
+// on every CLI invocation (the parsers run once per `ios-deps collect`
+// today, but on a future `--repeat`-style benchmark or batching path
+// these would otherwise show up as warm-loop overhead).
+
+fn cartfile_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r#"^\s*(\S+)\s+["']([^"']+)["']\s+["']([^"']+)["']\s*$"#)
+            .expect("known-valid cartfile line regex")
+    })
+}
+
+fn otool_framework_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"/([^/]+\.framework)/")
+            .expect("known-valid otool framework regex")
+    })
+}
+
+fn otool_line_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"^\s*([^\s]+)\s+\(compatibility version")
+            .expect("known-valid otool line regex")
+    })
+}
 
 /// Default truncation cap. Matches the Android Gradle plugin's
 /// `DependencyPayloadSerializer.MAX_ENTRIES` and the Python
@@ -459,10 +494,7 @@ pub fn parse_cartfile_resolved(path: &Path) -> Vec<DepEntry> {
         Ok(s) => s,
         Err(_) => return Vec::new(),
     };
-    let line_re = regex::Regex::new(
-        r#"^\s*(\S+)\s+["']([^"']+)["']\s+["']([^"']+)["']\s*$"#,
-    )
-    .unwrap();
+    let line_re = cartfile_line_regex();
 
     let mut out = Vec::new();
     for line in content.lines() {
@@ -517,8 +549,8 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
         _ => return Vec::new(),
     };
     let stdout = String::from_utf8_lossy(&output);
-    let framework_re = regex::Regex::new(r"/([^/]+\.framework)/").unwrap();
-    let line_re = regex::Regex::new(r"^\s*([^\s]+)\s+\(compatibility version").unwrap();
+    let framework_re = otool_framework_regex();
+    let line_re = otool_line_regex();
 
     let mut seen: HashSet<String> = HashSet::new();
     let mut entries = Vec::new();
