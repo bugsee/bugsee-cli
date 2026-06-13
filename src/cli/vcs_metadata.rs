@@ -439,6 +439,13 @@ mod tests {
             ("CI_COMMIT_REF_NAME", "master"),
         ]);
         let m = resolve(&env, Path::new("/no/such/dir"));
+        // Provider pin — pre-fix this assertion was missing, so a
+        // mutation that returned `Some("github")` (wrong provider
+        // label) would have slipped through. The dashboard groups
+        // builds by provider; a wrong label silently buckets them
+        // under the wrong CI system.
+        assert_eq!(m.provider, Some("gitlab"));
+        assert_eq!(m.commit_sha.as_deref(), Some("gl-push-sha"));
         assert_eq!(m.branch.as_deref(), Some("master"));
         assert_eq!(m.pr_number, None);
         assert_eq!(m.base_branch, None);
@@ -506,6 +513,67 @@ mod tests {
         assert_eq!(m.commit_sha.as_ref().unwrap().len(), 40); // full SHA-1
         assert_eq!(m.branch.as_deref(), Some("main"));
         assert_eq!(m.provider, None);
+    }
+
+    #[test]
+    fn git_fallback_omits_branch_when_head_is_detached() {
+        // `git rev-parse --abbrev-ref HEAD` prints the literal string
+        // "HEAD" when the repository is in detached-HEAD state
+        // (after `git checkout <sha>`, or a CI build that checked out
+        // a tag/commit). git_fallback already filters this with
+        // `branch != "HEAD"` (line 219); pin the filter so a future
+        // refactor can't silently start emitting the literal "HEAD"
+        // in the dashboard's branch column.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path();
+        for args in [
+            ["init", "-q", "-b", "main"].as_slice(),
+            ["config", "user.email", "test@example.com"].as_slice(),
+            ["config", "user.name", "Test"].as_slice(),
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+        fs::write(repo.join("a.txt"), "hi").unwrap();
+        for args in [
+            ["add", "."].as_slice(),
+            ["commit", "-q", "-m", "init"].as_slice(),
+        ] {
+            assert!(Command::new("git")
+                .args(args)
+                .current_dir(repo)
+                .status()
+                .unwrap()
+                .success());
+        }
+
+        // Detach HEAD by checking out the commit by sha.
+        let sha_out = Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(repo)
+            .output()
+            .unwrap();
+        let sha = String::from_utf8(sha_out.stdout).unwrap().trim().to_string();
+        assert!(Command::new("git")
+            .args(["checkout", "-q", "--detach", &sha])
+            .current_dir(repo)
+            .status()
+            .unwrap()
+            .success());
+
+        let env = HashMap::new();
+        let m = resolve(&env, repo);
+        // Commit sha still present.
+        assert_eq!(m.commit_sha.as_ref().unwrap().len(), 40);
+        // Branch must be None — NOT the literal "HEAD".
+        assert_eq!(
+            m.branch, None,
+            "detached HEAD must produce branch=None, not literal HEAD",
+        );
     }
 
     #[test]

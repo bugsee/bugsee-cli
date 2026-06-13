@@ -506,6 +506,42 @@ mod tests {
     }
 
     #[test]
+    fn xcode_cloud_empty_workflow_does_not_trigger_xcode_cloud_branch() {
+        // CI_WORKFLOW="" + CI=true must fall through to the generic
+        // CI branch, NOT emit `xcode-cloud:`. An empty string from
+        // env-vars is conceptually "absent" — the original code
+        // path treated absent vs empty differently and would have
+        // emitted `xcode-cloud` for empty inputs. The fix gates on
+        // non-empty trimmed values; this pin catches future
+        // regression.
+        let env = env_with(&[
+            ("CI", "true"),
+            ("CI_WORKFLOW", ""),
+            ("HOSTNAME", "runner-7"),
+        ]);
+        assert_eq!(
+            resolve_machine_label(&env).as_deref(),
+            Some("ci:runner-7"),
+            "empty CI_WORKFLOW must not trigger the xcode-cloud branch",
+        );
+    }
+
+    #[test]
+    fn xcode_cloud_whitespace_workflow_does_not_trigger_xcode_cloud_branch() {
+        // Whitespace-only is also "effectively empty". Same pin as
+        // above but covers the trim path.
+        let env = env_with(&[
+            ("CI", "true"),
+            ("CI_WORKFLOW", "   \t\n"),
+            ("HOSTNAME", "runner-8"),
+        ]);
+        assert_eq!(
+            resolve_machine_label(&env).as_deref(),
+            Some("ci:runner-8"),
+        );
+    }
+
+    #[test]
     fn generic_ci_uses_hostname_from_env() {
         let env = env_with(&[("CI", "true"), ("HOSTNAME", "ci-runner-42")]);
         assert_eq!(
