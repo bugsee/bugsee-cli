@@ -187,8 +187,17 @@ pub fn find_first_above(start_dir: &Path, filename: &str) -> Option<PathBuf> {
     if start_dir.as_os_str().is_empty() {
         return None;
     }
-    let mut current = start_dir
-        .canonicalize()
+    // Use `absolute()` semantics — preserve symlinks, only resolve
+    // `.` / `..` segments. The historic `canonicalize()` resolved
+    // symlinks too, which diverged from the Python BugseeAgents'
+    // `os.path.abspath` (symlink-preserving). For projects whose
+    // `<root>` is a symlink (Bazel-style external repos, CI checkouts
+    // mirrored under `~/work/`), the two halves of the cross-language
+    // contract walked DIFFERENT parent chains and could pick
+    // different lockfiles. Now both walk the path as the user
+    // supplied it. Falls back to the input path verbatim if
+    // `absolute()` errors (Windows-only edge case).
+    let mut current = std::path::absolute(start_dir)
         .unwrap_or_else(|_| start_dir.to_path_buf());
     for _ in 0..6 {
         let candidate = current.join(filename);
@@ -537,6 +546,16 @@ const SYSTEM_DYLIB_PREFIXES: &[&str] = &[
 
 /// Run `otool -L` on the linked product binary and emit `file`-type
 /// entries for each embedded framework reference.
+/// Cap on otool stdout we'll consume. The tool typically emits a few
+/// kB even on large fat binaries (one line per linked dylib); a
+/// pathological Mach-O with thousands of LC_LOAD_DYLIB entries could
+/// in principle emit several MB. Treat output beyond this cap as
+/// "nothing parseable" (empty list) — same fallback posture as a
+/// non-zero otool exit. Generous enough that real iOS apps fit
+/// comfortably, bounded enough that an adversarial binary can't drive
+/// the CLI into swap.
+const MAX_OTOOL_STDOUT_BYTES: usize = 16 * 1024 * 1024; // 16 MiB
+
 pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
     if !binary_path.is_file() {
         return Vec::new();
@@ -548,6 +567,9 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
         Ok(o) if o.status.success() => o.stdout,
         _ => return Vec::new(),
     };
+    if output.len() > MAX_OTOOL_STDOUT_BYTES {
+        return Vec::new();
+    }
     let stdout = String::from_utf8_lossy(&output);
     let framework_re = otool_framework_regex();
     let line_re = otool_line_regex();

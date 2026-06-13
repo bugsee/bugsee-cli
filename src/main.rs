@@ -13,6 +13,20 @@ use exit_code::ExitCode;
 
 #[tokio::main]
 async fn main() {
+    // Tracing emits to stderr only — stdout is RESERVED for the
+    // subcommand's structured output (JSON for metadata subcommands,
+    // upload progress text for debug-files). The Python integrators
+    // (fastlane plugin's `BugseeAgent`, iOS SDK's
+    // `tools.bundle/BugseeAgent`) parse stdout exclusively, so info-
+    // level chatter on stderr is invisible to them.
+    //
+    // CONTRACT for future subcommand authors: never emit `println!`,
+    // `print!`, or `tracing::*` to stdout from a metadata subcommand
+    // (vcs-metadata / ios-deps / build-env / dsym / sourcemaps).
+    // Their stdout is parsed by `json.loads(result.stdout)` on the
+    // Python side; a stray line would break that. debug-files is the
+    // only subcommand intended for interactive use and may emit
+    // progress text to stdout — it has no Python parser to break.
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "bugsee_cli=info".into()),

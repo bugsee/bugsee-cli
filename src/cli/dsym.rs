@@ -140,7 +140,24 @@ pub fn extract_slices(path: &Path) -> Vec<DsymSliceView> {
     out
 }
 
+/// Hard cap on the size of a single Mach-O file we will read into
+/// memory. Real production dSYMs (large iOS apps + Swift stdlib +
+/// extensions) typically sit between 200 MB and 1 GB per slice. The
+/// cap is a generous-but-bounded safety net against a corrupt or
+/// adversarial input (a "dSYM" that is actually a 10 GB random file
+/// would otherwise drive the build host into swap). Skip rather than
+/// fail — the empty-fallback contract still applies.
+const MAX_MACHO_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
+
 fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
+    // Stat the file first so a runaway-size input is rejected without
+    // allocating gigabytes. `std::fs::read` would otherwise sequentially
+    // grow the Vec until the kernel says no.
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.len() > MAX_MACHO_FILE_BYTES {
+            return;
+        }
+    }
     let data = match std::fs::read(path) {
         Ok(d) => d,
         Err(_) => return,

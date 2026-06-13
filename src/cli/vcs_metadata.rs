@@ -207,17 +207,34 @@ fn git_fallback(working_dir: &Path) -> VcsMetadata {
     if !working_dir.is_dir() {
         return out;
     }
-    if let Some(commit) = run_git(working_dir, &["rev-parse", "HEAD"]) {
+    // Single `git rev-parse` invocation that prints BOTH the full SHA
+    // and the abbrev-ref on separate lines, instead of forking `git`
+    // twice. `git rev-parse HEAD --abbrev-ref HEAD` emits two lines:
+    //   <40-char SHA>
+    //   <branch or "HEAD">
+    // Cuts the process-fork cost in half on every build that lacks a
+    // CI provider env var (local dev + bare-metal CI).
+    let combined = match run_git(
+        working_dir,
+        &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
+    ) {
+        Some(s) => s,
+        None => return out,
+    };
+    let mut lines = combined.lines();
+    if let Some(commit) = lines.next() {
+        let commit = commit.trim();
         if !commit.is_empty() {
-            out.commit_sha = Some(commit);
+            out.commit_sha = Some(commit.to_string());
         }
     }
-    if let Some(branch) = run_git(working_dir, &["rev-parse", "--abbrev-ref", "HEAD"]) {
+    if let Some(branch) = lines.next() {
+        let branch = branch.trim();
         // Detached HEAD surfaces as the literal string "HEAD" — not a
         // meaningful branch name; treat as absent so the back-end
         // doesn't display "HEAD" as the branch.
         if !branch.is_empty() && branch != "HEAD" {
-            out.branch = Some(branch);
+            out.branch = Some(branch.to_string());
         }
     }
     out
