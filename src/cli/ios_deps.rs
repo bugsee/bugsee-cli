@@ -564,6 +564,16 @@ const SYSTEM_DYLIB_PREFIXES: &[&str] = &[
 
 /// Run `otool -L` on the linked product binary and emit `file`-type
 /// entries for each embedded framework reference.
+/// Drain up to `cap + 1` bytes from `reader` into `out`. Returns
+/// true on success (EOF reached or cap+1 bytes accumulated), false
+/// on any I/O error. Out-of-band from the otool-specific spawn
+/// machinery so the bounded-read invariant has a unit test that
+/// doesn't need a real process.
+fn bounded_read_to_end<R: Read>(reader: R, out: &mut Vec<u8>, cap: usize) -> bool {
+    let limit = (cap as u64).saturating_add(1);
+    reader.take(limit).read_to_end(out).is_ok()
+}
+
 /// Cap on otool stdout we'll consume. The tool typically emits a few
 /// kB even on large fat binaries (one line per linked dylib); a
 /// pathological Mach-O with thousands of LC_LOAD_DYLIB entries could
@@ -596,12 +606,9 @@ pub fn parse_vendored_frameworks(binary_path: &Path) -> Vec<DepEntry> {
         Err(_) => return Vec::new(),
     };
     let mut buf = Vec::with_capacity(64 * 1024);
-    if let Some(mut stdout) = child.stdout.take() {
-        // `take` from std::io::Read caps the bytes read from the
-        // handle; +1 so we can detect overflow (read > cap).
-        let cap = MAX_OTOOL_STDOUT_BYTES as u64 + 1;
-        if stdout.take(cap).read_to_end(&mut buf).is_err() {
-            // Kill the child so it doesn't dangle if our read failed.
+    if let Some(stdout) = child.stdout.take() {
+        if !bounded_read_to_end(stdout, &mut buf, MAX_OTOOL_STDOUT_BYTES) {
+            // Read failure — kill the child so it doesn't dangle.
             let _ = child.kill();
             let _ = child.wait();
             return Vec::new();
@@ -764,8 +771,25 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
                     //   reliable graph signal.
                     if prev.url.is_none() && entry.url.is_some() {
                         prev.url = entry.url;
+                        // Url + version travel together — the OSV
+                        // ecosystem keys vuln scans off
+                        // (url, version). When we adopt the incoming
+                        // url, the version must come from the SAME
+                        // source. Three sub-cases:
+                        //   (a) entry has a version → take it.
+                        //   (b) entry has no version AND prev had no
+                        //       version → nothing to do.
+                        //   (c) entry has no version AND prev HAD a
+                        //       version → DROP prev's version. It
+                        //       belonged to a different source and
+                        //       would advertise the new url against
+                        //       a stale, unverified version pin.
+                        //       Better to scan against (url, None)
+                        //       than (url, wrong-version).
                         if entry.version.is_some() {
                             prev.version = entry.version;
+                        } else {
+                            prev.version = None;
                         }
                     } else if prev.version.is_none() && entry.version.is_some() {
                         // Only backfill version if the prev record has
@@ -1334,6 +1358,39 @@ mod tests {
     }
 
     #[test]
+    fn merger_url_promotion_drops_stale_version_when_incoming_has_none() {
+        // Asymmetric case: prev = CocoaPods (version="1.0", url=None)
+        // collides with entry = SPM (url=Some, version=None — happens
+        // when state is malformed or has only `branch:`/`revision:`).
+        // Pre-fix: prev kept its stale "1.0" version paired with
+        // SPM's url → OSV scan keyed on (spm_url, "1.0") which would
+        // resolve to the wrong package release. Post-fix: when url
+        // is promoted but the incoming lacks a version, prev.version
+        // is DROPPED to None — better to scan against (url, None)
+        // than (url, wrong-version).
+        let mut cocoapods = dummy_entry("Alamofire");
+        cocoapods.version = Some("1.0".to_string());
+        let mut spm = dummy_entry_with_url(
+            "Alamofire", "https://github.com/Alamofire/Alamofire.git",
+        );
+        spm.version = None;
+        let (out, _) = merge_dep_entries(
+            vec![vec![cocoapods], vec![spm]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        assert_eq!(out.len(), 1);
+        assert_eq!(
+            out[0].url.as_deref(),
+            Some("https://github.com/Alamofire/Alamofire.git"),
+        );
+        assert_eq!(
+            out[0].version, None,
+            "stale CocoaPods version must be dropped when paired with \
+             a different-source url",
+        );
+    }
+
+    #[test]
     fn merger_dedup_url_bearing_entry_does_not_get_overwritten_by_url_less() {
         // Opposite order from the cross-manager case: SPM first,
         // CocoaPods second. The url-bearing entry MUST remain — a
@@ -1511,6 +1568,37 @@ mod tests {
     }
 
     // ── JSON wire shape ────────────────────────────────────────────
+
+    // ── bounded_read_to_end (otool deadlock guard) ──────────────────
+
+    #[test]
+    fn bounded_read_stops_at_cap_plus_one_on_oversized_input() {
+        // Otool deadlock guard. The parser caps allocation at
+        // MAX_OTOOL_STDOUT_BYTES; the take(MAX+1) bound is what
+        // signals overflow. Pin the contract: when the input
+        // exceeds MAX, exactly MAX+1 bytes are read (the +1 is the
+        // sentinel that triggers the kill-and-reap path upstream).
+        let cap = 16; // small for the test
+        let input = vec![b'A'; cap * 4]; // 4x the cap
+        let mut out = Vec::new();
+        let ok = bounded_read_to_end(input.as_slice(), &mut out, cap);
+        assert!(ok, "bounded_read_to_end must succeed on a valid stream");
+        assert_eq!(
+            out.len(),
+            cap + 1,
+            "bounded_read must stop at cap+1 to signal overflow",
+        );
+    }
+
+    #[test]
+    fn bounded_read_reads_full_input_when_under_cap() {
+        // Happy path: input shorter than the cap is fully consumed.
+        let input = b"hello otool".to_vec();
+        let mut out = Vec::new();
+        let ok = bounded_read_to_end(input.as_slice(), &mut out, 1024);
+        assert!(ok);
+        assert_eq!(out, input);
+    }
 
     // ── otool stdout parser (I9) ────────────────────────────────────
 

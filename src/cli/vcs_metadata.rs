@@ -498,17 +498,25 @@ mod tests {
     #[test]
     fn gitlab_push_prefers_ci_commit_branch_over_ref_name() {
         // Modern GitLab (>=12.6) sets CI_COMMIT_BRANCH on branch
-        // pipelines AND CI_COMMIT_REF_NAME (which equals the branch
-        // name). The branch-preferred gate must pick CI_COMMIT_BRANCH
-        // — not the ref-name fallback.
+        // pipelines AND CI_COMMIT_REF_NAME. The branch-preferred
+        // gate must pick CI_COMMIT_BRANCH — not the ref-name
+        // fallback. Use DISTINCT values for the two env vars so a
+        // mutation flipping the preference order is observable.
+        // (In real GitLab the two are normally equal, but the test
+        // uses sentinels to pin the gating logic itself.)
         let env = env_with(&[
             ("GITLAB_CI", "true"),
             ("CI_COMMIT_SHA", "gl-push-sha"),
             ("CI_COMMIT_BRANCH", "feature/x"),
-            ("CI_COMMIT_REF_NAME", "feature/x"),
+            ("CI_COMMIT_REF_NAME", "from-ref-name-sentinel"),
         ]);
         let m = resolve(&env, Path::new("/no/such/dir"));
-        assert_eq!(m.branch.as_deref(), Some("feature/x"));
+        assert_eq!(
+            m.branch.as_deref(),
+            Some("feature/x"),
+            "gate must prefer CI_COMMIT_BRANCH; got the ref-name sentinel \
+             instead — preference order regressed",
+        );
     }
 
     #[test]
