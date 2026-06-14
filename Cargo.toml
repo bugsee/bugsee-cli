@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 rust-version = "1.79"
 authors = ["Bugsee"]
@@ -114,3 +114,7 @@ tempfile = "3"
 [dev-dependencies]
 assert_cmd = "2"
 predicates = "3"
+# In-process HTTP mock for the upload subcommands' integration + unit tests.
+# Lets us pin the registration POST body and the presigned PUT contract
+# (entry names, zstd method, request flags) without a live appserver.
+wiremock = "0.6"

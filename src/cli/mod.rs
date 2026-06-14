@@ -5,6 +5,7 @@ pub mod debug_files;
 pub mod dsym;
 pub mod ios_deps;
 pub mod sourcemaps;
+pub mod upload;
 pub mod vcs_metadata;
 
 #[derive(Parser, Debug)]
@@ -47,6 +48,13 @@ pub enum Command {
     #[command(subcommand)]
     Sourcemaps(sourcemaps::SourcemapsCommand),
 
+    /// Build-time upload command tree — the single canonical origin for
+    /// Bugsee build-time uploads. Phase A: `upload build-info` (per-build
+    /// metadata bundle). Producers shell to this instead of maintaining their
+    /// own HTTP client, compression, retry, and presigned-URL handshake.
+    #[command(subcommand)]
+    Upload(upload::UploadCommand),
+
     /// Resolve VCS metadata (provider, commit_sha, branch, PR number, repo)
     /// from CI provider env vars or a `git` fallback. Outputs JSON to stdout.
     ///
@@ -86,6 +94,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::DebugFiles(cmd) => debug_files::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::Sourcemaps(cmd) => sourcemaps::dispatch(cmd, cli.endpoint, cli.app_token).await,
+        Command::Upload(cmd) => upload::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
         Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),

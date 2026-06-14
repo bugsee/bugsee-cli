@@ -239,6 +239,57 @@ Each producer ships its cutover behind `BUGSEE_LEGACY_BUILDINFO_GZIP=1` escape h
 
 **Viewer: zero changes** at any phase. The dashboard fetches parsed JSON via presigned S3 URLs with `Content-Encoding: gzip`; the browser transparently decompresses; no client-side codec code anywhere. Wire-format migration is fully invisible.
 
+## Cross-platform readiness
+
+Build-info collection ships first for **bare Android (Gradle) and iOS (Xcode)** builds. The cross-platform producers — **React Native, Flutter, Unity, Cordova, Kotlin Multiplatform, .NET (MAUI/Xamarin)** — are built *on top of* this foundation rather than alongside it. This section records why the foundation generalizes and the few items to settle before those producers are written.
+
+### Why the foundation already generalizes
+
+The transport, storage, and diff layers are platform-agnostic by construction, and the dependency model is already ecosystem-aware:
+
+- **Dependency identity is `(type, group, name)`** with `group` optional and `version` nullable (`worker/builds/dependencies_diff.py`). `type` is the ecosystem discriminator — Maven (`group:name:version`), CocoaPods / SPM / Carthage (url-keyed, often no group), npm (no group), NuGet, pub, Cargo all fit. Entries of different `type` never collide, so a single list can mix ecosystems.
+- **It is already multi-ecosystem in production.** iOS deps (CocoaPods / SPM / Carthage, parsed by `bugsee-cli ios-deps`) flow through the *same* `dependencies.json` → `dependencies.process` path as Android Gradle/Maven deps. Multi-ecosystem-through-one-schema is proven, not aspirational.
+- **The worker fans out by entry *name*, not platform** (`jobs.build_info_bundle.Process` dispatches on `dependencies.json` / `timings.json`). A new platform reuses the same handlers unchanged.
+- **The bundle is additive.** A platform can introduce its own sidecar (`metro-stats.json`, `il2cpp.json`, …) and the worker tolerates the unknown entry with zero changes until a handler is added.
+- **`bugsee-cli upload build-info` is pure pack-and-PUT** — it neither knows nor cares which platform produced the inputs.
+
+Net: cross-platform is mostly **more `type` values + more producers**, not new architecture.
+
+### What must be handled (additive, not rework)
+
+| Item | Detail |
+|---|---|
+| **Caps at npm / Unity scale** | npm transitive trees (React Native) are the largest dependency graphs in existence (tens of thousands of packages); Unity asset / dependency graphs are also large. A big RN monorepo can approach the current `8 MiB`-compressed / `100k`-entry deps caps that are generous for bare mobile. **Resolved by the native/wrapper split below** — each layer gets its own cap, so the npm-scale graph (wrapper) no longer shares a ceiling with the bounded native graph. |
+| **Producer parsers** | Each platform must *emit* `dependencies.json` / `timings.json` in the schema. Extend the `bugsee-cli ios-deps` pattern (`npm-deps`, `pub-deps`, `nuget-deps`, Unity manifest) or produce it per-wrapper. Net-new, purely additive — does not touch the bundle/worker foundation. |
+| **Schema evolution** | The worker validators are permissive on *entry fields* (only `schema_version` + array shape are checked), so new ecosystem-specific fields are free. A `schema_version` **bump**, however, requires a coordinated worker update (`_SUPPORTED_SCHEMA_VERSIONS`) and per-`type` viewer rendering. Grow the schema additively; bump the version only when unavoidable. |
+
+### Multi-ecosystem layout (settled): `native-deps.json` + `wrapper-deps.json`
+
+Cross-platform builds have two distinct dependency layers, and the bundle keeps them in **two files** rather than merging into one:
+
+- **`native-deps.json`** — the underlying native build's dependencies: Maven/Gradle (Android), CocoaPods / SPM / Carthage (iOS). Present for **every** build, bare or cross-platform. This *is* today's deps blob — the existing pipeline (schema, validator `dependencies_helpers`, `dependencies_diff`, store key, `dependencies_*` build-doc fields) is reused unchanged; `native-deps.json` is the bundle entry name that feeds it.
+- **`wrapper-deps.json`** — the cross-platform framework's own dependencies: npm/yarn (React Native, Cordova), pub (Flutter), NuGet (.NET MAUI / Xamarin), Unity Package Manager (Unity), Kotlin/Gradle (KMP shared). Absent for bare Android/iOS. A new parallel pipeline that **reuses the same schema, validator, and diff code** as native — only the store key (`wrapper-deps.json`) and build-doc fields (`wrapper_deps_ref` / `wrapper_deps_status` / `wrapper_deps_diff_*`) are new.
+
+Both files carry the identical `{schema_version, dependencies: [{type, group, name, version}, …]}` shape, so `type` still discriminates ecosystems **within** each layer. Native/wrapper is a *layer* grouping on top of the existing type-tagged identity, not a replacement for it. `timings.json` stays a single per-build timeline (not split by layer).
+
+**Why two files, not one merged list** (this revises the earlier "(A) merged" recommendation):
+
+- **Per-layer caps — the decisive reason.** npm trees (wrapper) are the largest dependency graphs in existence; native graphs are bounded. Two files let `wrapper-deps.json` carry a large cap (and be the disk-streaming candidate) while `native-deps.json` keeps the tight bare-mobile cap. A single merged list forces one cap across both — exactly the cross-platform cap problem. **This split resolves the cap question.**
+- **Meaningful UX boundary.** "The packages I manage" (wrapper / `package.json`) vs. "the native libraries that actually ship in the binary" (native) are different mental models for size analysis and vuln scanning; two files map cleanly to two viewer sections.
+- **Zero migration for native.** Bare Android/iOS and the native half of cross-platform stay byte-identical to today.
+
+**Layer classification is producer-decided** at collection time. The mapping above is unambiguous for RN / Flutter / Cordova / .NET / Unity. **KMP is the fuzzy case** — its shared Kotlin/Gradle deps are arguably "wrapper", the per-platform resolved artifacts "native"; the KMP producer owns that call and documents it when built.
+
+(Naming note: the wrapper layer uses fully symmetric `wrapper_deps_*` storage + fields; the native layer keeps its existing `dependencies_*` storage/fields internally — `native-deps.json` is the bundle *entry* name mapping onto them, so no viewer/appserver migration is forced. Renaming native storage to `native_deps_*` for full symmetry is an optional cosmetic follow-up.)
+
+### Action items
+
+- [x] **Multi-ecosystem layout** — settled: two files, `native-deps.json` (existing native pipeline) + `wrapper-deps.json` (new parallel pipeline, same schema/validator/diff).
+- [ ] **Build the `wrapper-deps.json` pipeline.** worker: `report_store.put_wrapper_deps` + keys + a layer-parameterised variant of `builds/diff_helpers.py` + a `wrapper-deps.json` arm in `build_info_bundle._process_entries`; appserver: `wrapper_deps_ref` / `wrapper_deps_status` build-doc fields; viewer: a wrapper-deps section. *Gate: first cross-platform producer.*
+- [ ] **Re-tune caps per layer.** `native-deps.json` keeps the tight cap; `wrapper-deps.json` gets the npm/Unity-scale cap and is the candidate for `download_file()`-to-disk on large bundles. Folds into Open Question #2. *Gate: before React Native / Unity producers ship.*
+- [ ] **Add per-platform producers** emitting `native-deps.json` + `wrapper-deps.json` (and `timings.json`), following the `bugsee-cli ios-deps` pattern (`npm-deps`, `pub-deps`, `nuget-deps`, Unity manifest). *Gate: per-platform rollout.*
+- [ ] **Keep schema growth additive**; bump `schema_version` only with a paired worker `_SUPPORTED_SCHEMA_VERSIONS` + viewer update.
+
 ## Open questions
 
 1. **Mapping wire format upgrade**: today the mapping ZIP from the Gradle plugin uses DEFLATE. Migrating to zstd-93 is in scope, but is it on the same rollout schedule, or a separate sub-track? Recommendation: bundle with Phase A (the CLI's new symbol-upload subcommand emits zstd by default; the Gradle plugin's existing CLI fallback path picks it up for free).

@@ -129,7 +129,7 @@ pub async fn dispatch(
                 }
             }
 
-            let strategy = resolve_strategy(no_zstd, zstd_level)?;
+            let strategy = compress::resolve_strategy(no_zstd, zstd_level)?;
 
             let parsed_override = match uuid_override.as_deref() {
                 None => None,
@@ -225,31 +225,6 @@ pub async fn dispatch(
     }
 }
 
-fn resolve_strategy(no_zstd: bool, zstd_level: Option<i64>) -> anyhow::Result<Strategy> {
-    if no_zstd {
-        if zstd_level.is_some() {
-            return Err(config_invalid(
-                "--zstd-level is incompatible with --no-zstd",
-            ));
-        }
-        return Ok(Strategy::Deflate);
-    }
-    let level = zstd_level.unwrap_or(compress::DEFAULT_ZSTD_LEVEL);
-    if !(1..=22).contains(&level) {
-        return Err(config_invalid(format!(
-            "--zstd-level must be in 1..=22, got {level}"
-        )));
-    }
-    if level < compress::MIN_PRODUCTION_ZSTD_LEVEL {
-        return Err(config_invalid(format!(
-            "--zstd-level {} is below the production floor of {}; pass --no-zstd if intentional",
-            level,
-            compress::MIN_PRODUCTION_ZSTD_LEVEL,
-        )));
-    }
-    Ok(Strategy::Zstd(level))
-}
-
 #[allow(clippy::too_many_arguments)]
 async fn run_proguard_upload(
     paths: &[PathBuf],
@@ -324,20 +299,11 @@ async fn run_proguard_upload(
                 .unwrap_or("bin");
             icon_entry_name = format!("icon.{ext}");
             vec![
-                ZipEntry {
-                    name: "mapping.txt",
-                    source: &mapping,
-                },
-                ZipEntry {
-                    name: &icon_entry_name,
-                    source: icon_path,
-                },
+                ZipEntry::compressed("mapping.txt", &mapping),
+                ZipEntry::compressed(&icon_entry_name, icon_path),
             ]
         } else {
-            vec![ZipEntry {
-                name: "mapping.txt",
-                source: &mapping,
-            }]
+            vec![ZipEntry::compressed("mapping.txt", &mapping)]
         };
 
         let zip_size = compress::pack_entries(&entries, &zip_path, strategy)?;
@@ -551,10 +517,7 @@ async fn run_dsym_upload(
         let entries = dsym::enumerate_bundle_entries(dsym_path)?;
         let zip_entries: Vec<ZipEntry<'_>> = entries
             .iter()
-            .map(|(name, path)| ZipEntry {
-                name: name.as_str(),
-                source: path.as_path(),
-            })
+            .map(|(name, path)| ZipEntry::compressed(name.as_str(), path.as_path()))
             .collect();
 
         let tmpdir = tempfile::tempdir()?;

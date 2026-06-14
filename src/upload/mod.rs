@@ -13,6 +13,14 @@
 //! Both paths key uploads by debug-id on the server (see `symbols::debug_id`).
 //! The presigned path also accepts the older `(uuid, version, build, hash)` tuple
 //! during the migration window.
+//!
+//! `http` is the shared client + retry/backoff + telemetry layer that the
+//! build-time upload classes build on (the design's "bugsee-cli as the common
+//! origin" guarantee: one HTTP implementation, tested in one place). `presigned`
+//! predates it and keeps its own single-shot client for now; folding it in is
+//! deferred to the symbols-consolidation pass.
 
+pub mod build_info;
 pub mod chunked;
+pub mod http;
 pub mod presigned;

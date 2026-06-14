@@ -16,6 +16,8 @@ use std::path::Path;
 use zip::write::SimpleFileOptions;
 use zip::{CompressionMethod, ZipWriter};
 
+use crate::error::config_invalid;
+
 /// Default Zstd compression level used for symbol uploads.
 pub const DEFAULT_ZSTD_LEVEL: i64 = 11;
 
@@ -50,6 +52,40 @@ impl Strategy {
     }
 }
 
+/// Resolve a compression [`Strategy`] from the shared `--no-zstd` / `--zstd-level`
+/// flags. Centralised here so every upload subcommand applies the SAME
+/// production floor — drifting the floor across subcommands would let a
+/// caller silently ship under-compressed (or accidentally DEFLATE) payloads
+/// the worker has to handle differently.
+///
+/// - `--no-zstd` selects DEFLATE (diagnostic only) and is incompatible with
+///   an explicit level.
+/// - Otherwise the level defaults to [`DEFAULT_ZSTD_LEVEL`], must be in
+///   `1..=22`, and is rejected below [`MIN_PRODUCTION_ZSTD_LEVEL`].
+pub fn resolve_strategy(no_zstd: bool, zstd_level: Option<i64>) -> anyhow::Result<Strategy> {
+    if no_zstd {
+        if zstd_level.is_some() {
+            return Err(config_invalid(
+                "--zstd-level is incompatible with --no-zstd",
+            ));
+        }
+        return Ok(Strategy::Deflate);
+    }
+    let level = zstd_level.unwrap_or(DEFAULT_ZSTD_LEVEL);
+    if !(1..=22).contains(&level) {
+        return Err(config_invalid(format!(
+            "--zstd-level must be in 1..=22, got {level}"
+        )));
+    }
+    if level < MIN_PRODUCTION_ZSTD_LEVEL {
+        return Err(config_invalid(format!(
+            "--zstd-level {level} is below the production floor of {MIN_PRODUCTION_ZSTD_LEVEL}; \
+             pass --no-zstd if intentional"
+        )));
+    }
+    Ok(Strategy::Zstd(level))
+}
+
 /// A single entry to embed in the archive.
 #[derive(Debug, Clone, Copy)]
 pub struct ZipEntry<'a> {
@@ -57,6 +93,35 @@ pub struct ZipEntry<'a> {
     pub name: &'a str,
     /// Path to the file on disk whose bytes go into this entry.
     pub source: &'a Path,
+    /// When `true`, this entry is written with STORE (method 0) regardless of
+    /// the archive [`Strategy`] — the wire-format contract's "STORE-93 for
+    /// already-compressed entries" rule. Re-compressing an entry that is
+    /// itself a compressed container (`.aab`/`.apk`/`.ipa`, `.png`/`.mp4`)
+    /// only burns CPU and can grow the entry, so such entries are stored verbatim.
+    pub store: bool,
+}
+
+impl<'a> ZipEntry<'a> {
+    /// An entry compressed with the archive's [`Strategy`]. Use for text /
+    /// uncompressed sources (mapping.txt, dependencies.json, DWARF, …).
+    pub fn compressed(name: &'a str, source: &'a Path) -> Self {
+        Self {
+            name,
+            source,
+            store: false,
+        }
+    }
+
+    /// An entry written with STORE (method 0). Use for already-compressed
+    /// containers where re-compression is wasted work.
+    #[allow(dead_code)]
+    pub fn stored(name: &'a str, source: &'a Path) -> Self {
+        Self {
+            name,
+            source,
+            store: true,
+        }
+    }
 }
 
 /// Pack a single file as one ZIP entry. Thin wrapper around [`pack_entries`].
@@ -70,14 +135,7 @@ pub fn pack_single_entry(
     output: &Path,
     strategy: Strategy,
 ) -> std::io::Result<u64> {
-    pack_entries(
-        &[ZipEntry {
-            name: entry_name,
-            source: input,
-        }],
-        output,
-        strategy,
-    )
+    pack_entries(&[ZipEntry::compressed(entry_name, input)], output, strategy)
 }
 
 /// Pack one or more files into a ZIP archive. Each entry streams through a
@@ -92,10 +150,16 @@ pub fn pack_entries(
 ) -> std::io::Result<u64> {
     let out_file = File::create(output)?;
     let mut zip = ZipWriter::new(BufWriter::new(out_file));
-    let options = strategy.file_options();
+    let compressed_options = strategy.file_options();
+    let stored_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
 
     let mut buf = [0u8; 64 * 1024];
     for entry in entries {
+        let options = if entry.store {
+            stored_options
+        } else {
+            compressed_options
+        };
         zip.start_file(entry.name, options)?;
         let mut reader = BufReader::new(File::open(entry.source)?);
         loop {
@@ -159,14 +223,8 @@ mod tests {
 
         pack_entries(
             &[
-                ZipEntry {
-                    name: "mapping.txt",
-                    source: &mapping_path,
-                },
-                ZipEntry {
-                    name: "icon.png",
-                    source: &icon_path,
-                },
+                ZipEntry::compressed("mapping.txt", &mapping_path),
+                ZipEntry::compressed("icon.png", &icon_path),
             ],
             &output_path,
             Strategy::Zstd(11),
@@ -197,5 +255,69 @@ mod tests {
             .read_to_end(&mut icon_bytes)
             .unwrap();
         assert_eq!(icon_bytes, b"\x89PNG\r\n\x1a\n");
+    }
+
+    #[test]
+    fn stored_entry_uses_method_zero_and_mixes_with_zstd() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("dependencies.json");
+        let blob_path = dir.path().join("already.zip");
+        let output_path = dir.path().join("packed.zip");
+
+        // Highly compressible text → zstd entry.
+        let json = "{\"deps\":[".to_string() + &"\"a\",".repeat(200) + "\"z\"]}";
+        std::fs::write(&json_path, json.as_bytes()).unwrap();
+        // Pretend-already-compressed container → stored entry.
+        std::fs::write(&blob_path, b"PK\x03\x04 pretend zip bytes").unwrap();
+
+        pack_entries(
+            &[
+                ZipEntry::compressed("dependencies.json", &json_path),
+                ZipEntry::stored("already.zip", &blob_path),
+            ],
+            &output_path,
+            Strategy::Zstd(11),
+        )
+        .unwrap();
+
+        let mut archive = ZipArchive::new(File::open(&output_path).unwrap()).unwrap();
+
+        let json_entry = archive.by_name("dependencies.json").unwrap();
+        assert_eq!(json_entry.compression(), CompressionMethod::Zstd);
+        drop(json_entry);
+
+        let mut stored = archive.by_name("already.zip").unwrap();
+        assert_eq!(stored.compression(), CompressionMethod::Stored);
+        let mut bytes = Vec::new();
+        stored.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, b"PK\x03\x04 pretend zip bytes");
+    }
+
+    #[test]
+    fn resolve_strategy_applies_production_floor_and_flag_rules() {
+        // Default is zstd at the documented default level.
+        assert!(matches!(
+            resolve_strategy(false, None).unwrap(),
+            Strategy::Zstd(level) if level == DEFAULT_ZSTD_LEVEL
+        ));
+        // Explicit in-range level is honoured.
+        assert!(matches!(
+            resolve_strategy(false, Some(15)).unwrap(),
+            Strategy::Zstd(15)
+        ));
+        // --no-zstd selects DEFLATE.
+        assert!(matches!(
+            resolve_strategy(true, None).unwrap(),
+            Strategy::Deflate
+        ));
+        // Below the production floor is rejected.
+        assert!(resolve_strategy(false, Some(MIN_PRODUCTION_ZSTD_LEVEL - 1)).is_err());
+        // At the floor is allowed.
+        assert!(resolve_strategy(false, Some(MIN_PRODUCTION_ZSTD_LEVEL)).is_ok());
+        // Out of the 1..=22 range is rejected.
+        assert!(resolve_strategy(false, Some(0)).is_err());
+        assert!(resolve_strategy(false, Some(23)).is_err());
+        // --no-zstd with an explicit level is a contradiction.
+        assert!(resolve_strategy(true, Some(11)).is_err());
     }
 }
