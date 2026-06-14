@@ -1391,6 +1391,61 @@ mod tests {
     }
 
     #[test]
+    fn merger_url_promotion_drops_version_while_preserving_parents_and_direct_false() {
+        // Variant of the cross-source test above, but with the
+        // CocoaPods side carrying transitive-graph info (direct=false,
+        // parents=[umbrella]). The url-promotion branch must:
+        //   - drop prev.version (stale)
+        //   - take entry.url
+        //   - preserve prev.parents (CocoaPods has the graph signal)
+        //   - leave prev.direct=false because entry.direct=true
+        //     would promote it (OR-merge rule from earlier fixes,
+        //     unchanged) — but only if entry actually says direct=true.
+        // dummy_entry_with_url defaults to direct=true, so we
+        // expect the OR-merge to flip direct to true. The parents
+        // and version-drop pins are the load-bearing ones here.
+        let umbrella = dummy_entry("Braintree");
+        let mut cocoapods_subspec = dummy_transitive("Braintree/Core");
+        cocoapods_subspec.version = Some("5.26.0".to_string());
+        cocoapods_subspec.parents = vec![make_dep_id("library", "", "Braintree")];
+        let mut spm = dummy_entry_with_url(
+            "Braintree/Core",
+            "https://github.com/braintree/braintree_ios.git",
+        );
+        spm.version = None;
+        let (out, _) = merge_dep_entries(
+            vec![vec![umbrella, cocoapods_subspec], vec![spm]],
+            DEPENDENCIES_MAX_COUNT,
+        );
+        let core = out.iter().find(|e| e.name == "Braintree/Core")
+            .expect("Core kept");
+        // url comes from SPM.
+        assert_eq!(
+            core.url.as_deref(),
+            Some("https://github.com/braintree/braintree_ios.git"),
+        );
+        // version DROPPED — was stale CocoaPods "5.26.0" paired with
+        // a different-source url.
+        assert_eq!(
+            core.version, None,
+            "stale CocoaPods version must be dropped on cross-source \
+             url promotion regardless of graph context",
+        );
+        // parents preserved — load-bearing for reachability analysis.
+        assert_eq!(
+            core.parents,
+            vec![make_dep_id("library", "", "Braintree")],
+            "CocoaPods parent edges must survive url promotion",
+        );
+        // direct OR-merged: prev had false (transitive), entry has
+        // true (dummy_entry_with_url default) → result is true.
+        assert!(
+            core.direct,
+            "direct must OR-merge to true when entry brings direct=true",
+        );
+    }
+
+    #[test]
     fn merger_dedup_url_bearing_entry_does_not_get_overwritten_by_url_less() {
         // Opposite order from the cross-manager case: SPM first,
         // CocoaPods second. The url-bearing entry MUST remain — a
@@ -1598,6 +1653,27 @@ mod tests {
         let ok = bounded_read_to_end(input.as_slice(), &mut out, 1024);
         assert!(ok);
         assert_eq!(out, input);
+    }
+
+    #[test]
+    fn bounded_read_returns_false_on_io_error() {
+        // Production code's failure path: when reading from the
+        // child stdout pipe returns Err, `bounded_read_to_end` must
+        // return false so the caller can kill+reap the child.
+        // Previously this branch had zero coverage — a mutation
+        // that conflated Err with Ok would have slipped through.
+        use std::io::ErrorKind;
+
+        struct FailingReader;
+        impl std::io::Read for FailingReader {
+            fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(ErrorKind::Other, "boom"))
+            }
+        }
+
+        let mut out = Vec::new();
+        let ok = bounded_read_to_end(FailingReader, &mut out, 1024);
+        assert!(!ok, "I/O error must surface as false");
     }
 
     // ── otool stdout parser (I9) ────────────────────────────────────

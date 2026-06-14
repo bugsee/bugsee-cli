@@ -522,22 +522,50 @@ mod tests {
     #[test]
     fn gitlab_tag_pipeline_omits_branch() {
         // Tag pipelines set CI_COMMIT_TAG (NOT CI_COMMIT_BRANCH) +
-        // CI_COMMIT_REF_NAME (which equals the tag name). The
-        // historic `_set_if_present(branch, CI_COMMIT_REF_NAME)`
-        // leaked the tag into the branch column verbatim — same bug
-        // class as the GitHub `refs/tags/<tag>` leak fixed earlier.
-        // Post-fix: branch must be absent on tag pipelines.
+        // CI_COMMIT_REF_NAME. The historic
+        // `_set_if_present(branch, CI_COMMIT_REF_NAME)` leaked the
+        // tag into the branch column — same bug class as the GitHub
+        // `refs/tags/<tag>` leak fixed earlier. Post-fix: branch is
+        // absent on tag pipelines.
+        //
+        // Use DISTINCT sentinel values for CI_COMMIT_TAG and
+        // CI_COMMIT_REF_NAME so a mutation that read REF_NAME
+        // instead of checking TAG absence would surface the
+        // ref-name sentinel in the output — currently asserted only
+        // that `branch == None`, but that alone wouldn't distinguish
+        // "gate read CI_COMMIT_TAG correctly" from "gate accidentally
+        // returned None for the wrong reason". The sentinel makes
+        // any leak observable.
         let env = env_with(&[
             ("GITLAB_CI", "true"),
             ("CI_COMMIT_SHA", "gl-tag-sha"),
             ("CI_COMMIT_TAG", "v1.0.0"),
-            ("CI_COMMIT_REF_NAME", "v1.0.0"),
+            ("CI_COMMIT_REF_NAME", "ref-name-leak-sentinel"),
         ]);
         let m = resolve(&env, Path::new("/no/such/dir"));
         assert_eq!(
             m.branch, None,
-            "tag pipeline must omit `branch`, not echo the tag name",
+            "tag pipeline must omit `branch`, not echo any sentinel",
         );
+        // Negative-leak pin: the ref-name sentinel must NOT surface
+        // in ANY output field. Catches a mutation that read
+        // CI_COMMIT_REF_NAME and surfaced it (for branch OR any
+        // other field).
+        for field in [
+            m.branch.as_deref(),
+            m.base_branch.as_deref(),
+            m.commit_sha.as_deref(),
+            m.repo.as_deref(),
+            m.provider,
+        ] {
+            if let Some(val) = field {
+                assert!(
+                    !val.contains("ref-name-leak-sentinel"),
+                    "ref-name sentinel leaked into output field: {:?}",
+                    val,
+                );
+            }
+        }
     }
 
     #[test]
