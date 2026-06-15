@@ -14,11 +14,10 @@
 //!   - `presigned` — legacy two-stage symbol flow (`POST /apps/:app_id/symbols`
 //!     → presigned PUT). Keyed by debug-id on the server.
 //!
-//! `http` is the shared client + retry/backoff + telemetry layer the build-time
-//! classes build on (the design's "bugsee-cli as the common origin" guarantee:
-//! one HTTP implementation, tested in one place). `presigned` predates it and
-//! keeps its own single-shot client for now; folding it in is deferred to the
-//! symbols-consolidation pass.
+//! `http` is the shared client + retry/backoff + telemetry layer ALL of the
+//! above build on (the design's "bugsee-cli as the common origin" guarantee:
+//! one HTTP implementation, tested in one place). `presigned` was folded onto
+//! it too — no module keeps its own HTTP client anymore.
 
 pub mod build;
 pub mod build_info;

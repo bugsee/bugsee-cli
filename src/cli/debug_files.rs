@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
 use crate::symbols::{dsym, elf, proguard};
+use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
 
 const DEFAULT_ENDPOINT: &str = "https://api.bugsee.com";
@@ -252,7 +253,7 @@ async fn run_proguard_upload(
     let client = if dry_run {
         None
     } else {
-        Some(presigned::build_client()?)
+        Some(http::build_client()?)
     };
 
     let mut uploaded = 0u32;
@@ -327,7 +328,15 @@ async fn run_proguard_upload(
             transform: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(client, endpoint, app_token, &metadata, &zip_path).await?;
+        let outcome = presigned::upload(
+            client,
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            &zip_path,
+        )
+        .await?;
         match outcome {
             presigned::Outcome::Uploaded => {
                 uploaded += 1;
@@ -412,7 +421,7 @@ async fn run_elf_upload(
     let client = if dry_run {
         None
     } else {
-        Some(presigned::build_client()?)
+        Some(http::build_client()?)
     };
 
     let build_uuid_str = build_uuid.to_string();
@@ -445,7 +454,15 @@ async fn run_elf_upload(
             transform: Some("breakpad"),
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(client, endpoint, app_token, &metadata, archive).await?;
+        let outcome = presigned::upload(
+            client,
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            archive,
+        )
+        .await?;
         match outcome {
             presigned::Outcome::Uploaded => {
                 uploaded += 1;
@@ -497,7 +514,7 @@ async fn run_dsym_upload(
     let client = if dry_run {
         None
     } else {
-        Some(presigned::build_client()?)
+        Some(http::build_client()?)
     };
 
     let mut uploaded = 0u32;
@@ -557,7 +574,15 @@ async fn run_dsym_upload(
             transform: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(client, endpoint, app_token, &metadata, &zip_path).await?;
+        let outcome = presigned::upload(
+            client,
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            &zip_path,
+        )
+        .await?;
         match outcome {
             presigned::Outcome::Uploaded => {
                 uploaded += 1;
