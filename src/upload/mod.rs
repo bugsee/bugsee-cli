@@ -1,24 +1,24 @@
-//! Upload protocols.
+//! Upload protocols — the build-time upload classes the design routes through
+//! `bugsee-cli`.
 //!
-//! Two paths exist:
-//!   - `chunked` — modern protocol: `GET /v2/files/chunk-upload` returns server caps
-//!     (chunk size, max parallelism, accepted compression set), client computes sha1
-//!     of each chunk and uploads only missing ones, then calls an assemble endpoint
-//!     with `{checksum, chunks: [sha1, ...]}`. Default for all new uploads.
-//!   - `presigned` — legacy two-stage flow: `POST /apps/:app_id/symbols` with metadata
-//!     JSON, server returns a presigned PUT URL, client PUTs the binary. Retained for
-//!     backward compatibility with deployments that haven't picked up the chunked
-//!     endpoint yet.
+//!   - `build` — artefact upload (single-PUT): register the build
+//!     (`POST /v2/apps/<token>/builds`), PUT the normalized upload ZIP
+//!     (artefact + zstd mapping), and drive the build-info bundle from the same
+//!     registration.
+//!   - `chunked` — artefact upload (chunked) for large artefacts: the BUILDS
+//!     chunked protocol (`GET /builds/chunk-options` → SHA-1 slice →
+//!     `POST /builds/chunks/check` → PUT missing chunks → `POST /builds/chunked`).
+//!     The server stitches the chunks server-side via S3 UploadPartCopy.
+//!   - `build_info` — the per-build metadata bundle (deps/timings sidecars) as
+//!     one zstd ZIP; self-contained or pre-signed registration.
+//!   - `presigned` — legacy two-stage symbol flow (`POST /apps/:app_id/symbols`
+//!     → presigned PUT). Keyed by debug-id on the server.
 //!
-//! Both paths key uploads by debug-id on the server (see `symbols::debug_id`).
-//! The presigned path also accepts the older `(uuid, version, build, hash)` tuple
-//! during the migration window.
-//!
-//! `http` is the shared client + retry/backoff + telemetry layer that the
-//! build-time upload classes build on (the design's "bugsee-cli as the common
-//! origin" guarantee: one HTTP implementation, tested in one place). `presigned`
-//! predates it and keeps its own single-shot client for now; folding it in is
-//! deferred to the symbols-consolidation pass.
+//! `http` is the shared client + retry/backoff + telemetry layer the build-time
+//! classes build on (the design's "bugsee-cli as the common origin" guarantee:
+//! one HTTP implementation, tested in one place). `presigned` predates it and
+//! keeps its own single-shot client for now; folding it in is deferred to the
+//! symbols-consolidation pass.
 
 pub mod build;
 pub mod build_info;

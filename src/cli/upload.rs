@@ -102,6 +102,11 @@ pub enum UploadCommand {
         #[arg(long)]
         zstd_level: Option<i64>,
 
+        /// Upload the artefact via the chunked protocol (for large artefacts)
+        /// instead of a single PUT.
+        #[arg(long)]
+        chunked: bool,
+
         /// With --dry-run, write the would-be-uploaded artefact ZIP to this path.
         #[arg(long)]
         out: Option<PathBuf>,
@@ -209,6 +214,7 @@ pub async fn dispatch(
             timings,
             no_zstd,
             zstd_level,
+            chunked,
             out,
             dry_run,
         } => {
@@ -246,6 +252,7 @@ pub async fn dispatch(
                 deps: deps.as_deref(),
                 timings: timings.as_deref(),
                 strategy,
+                chunked,
                 dry_run,
                 out: out.as_deref(),
             };

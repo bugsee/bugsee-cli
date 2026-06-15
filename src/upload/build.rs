@@ -21,8 +21,8 @@ use serde_json::{Map, Value};
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{Error, Result};
-use crate::upload::build_info;
 use crate::upload::http::{self, RetryPolicy};
+use crate::upload::{build_info, chunked};
 
 /// Outcome of a build upload.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -50,6 +50,10 @@ pub struct Params<'a> {
     pub timings: Option<&'a Path>,
     /// Compression strategy for the mapping entry + the build-info bundle.
     pub strategy: Strategy,
+    /// Upload the artefact via the chunked protocol (`/builds/chunked`) instead
+    /// of a single PUT — for large artefacts. Both paths produce the same build
+    /// record + build-info handling.
+    pub chunked: bool,
     /// Pack the upload ZIP but skip all network I/O.
     pub dry_run: bool,
     /// In `--dry-run`, write the packed upload ZIP here for inspection.
@@ -117,49 +121,70 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
 
     let client = http::build_client()?;
 
-    // 2. Register: one POST yields the artefact + build-info endpoints.
-    let reg = register(
-        &client,
-        policy,
-        &params,
-        params.deps.is_some() || params.timings.is_some(),
-    )
-    .await?;
-    if reg.artifact_endpoint.is_empty() {
-        return Err(Error::UploadServer {
-            status: 0,
-            message: "registration returned no artefact `endpoint` \
-                      (was request_artifact_upload set?)"
-                .into(),
-        });
-    }
+    // Registration metadata, built once and shared by both transports: the
+    // producer's JSON + the `request_*_upload` flags the CLI owns.
+    let want_build_info = params.deps.is_some() || params.timings.is_some();
+    let metadata = build_metadata(&params, want_build_info).await?;
 
-    // 3. PUT the artefact ZIP to the presigned URL. Idempotent overwrite of the
-    //    same S3 key, so a retriable 5xx is safe to retry.
-    let body = tokio::fs::read(&zip_path).await?;
-    tracing::debug!(endpoint = %reg.artifact_endpoint, body_len = body.len(), "PUT artefact");
-    let put = http::send_with_retry(policy, "artefact PUT", true, || {
-        client
-            .put(&reg.artifact_endpoint)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body.clone())
-    })
-    .await?;
-    let put_status = put.status();
-    if !put_status.is_success() {
-        let text = put.text().await.unwrap_or_default();
-        return Err(Error::UploadServer {
-            status: put_status.as_u16(),
-            message: http::truncate_for_log(&text, 512),
-        });
-    }
-    tracing::info!(build_id = %reg.build_id, "artefact uploaded");
+    // 2. Upload the artefact — chunked (large) or single-PUT — and learn the
+    //    build id + the signed build-info endpoint. Both transports yield the
+    //    same two facts, so step 3 is identical for either.
+    let (build_id, build_info_endpoint) = if params.chunked {
+        let out = chunked::upload(
+            &client,
+            policy,
+            params.endpoint,
+            params.app_token,
+            &zip_path,
+            &metadata,
+        )
+        .await?;
+        (out.build_id, out.build_info_endpoint)
+    } else {
+        let reg = register_single(
+            &client,
+            policy,
+            params.endpoint,
+            params.app_token,
+            &metadata,
+        )
+        .await?;
+        if reg.artifact_endpoint.is_empty() {
+            return Err(Error::UploadServer {
+                status: 0,
+                message: "registration returned no artefact `endpoint` \
+                          (was request_artifact_upload set?)"
+                    .into(),
+            });
+        }
+        // PUT the artefact ZIP. Idempotent overwrite of the same S3 key, so a
+        // retriable 5xx is safe to retry.
+        let body = tokio::fs::read(&zip_path).await?;
+        tracing::debug!(endpoint = %reg.artifact_endpoint, body_len = body.len(), "PUT artefact");
+        let put = http::send_with_retry(policy, "artefact PUT", true, || {
+            client
+                .put(&reg.artifact_endpoint)
+                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+                .body(body.clone())
+        })
+        .await?;
+        if !put.status().is_success() {
+            let s = put.status().as_u16();
+            let text = put.text().await.unwrap_or_default();
+            return Err(Error::UploadServer {
+                status: s,
+                message: http::truncate_for_log(&text, 512),
+            });
+        }
+        (reg.build_id, reg.build_info_endpoint)
+    };
+    tracing::info!(%build_id, chunked = params.chunked, "artefact uploaded");
 
-    // 4. Build-info bundle, from the SAME registration (pre-signed mode) — no
+    // 3. Build-info bundle, from the SAME registration (pre-signed mode) — no
     //    second build registration. Only when sidecars were supplied AND the
     //    server signed the endpoint (the org's build-info flag is on);
     //    otherwise the producer's native/legacy path covers deps/timings.
-    if (params.deps.is_some() || params.timings.is_some()) && !reg.build_info_endpoint.is_empty() {
+    if want_build_info && !build_info_endpoint.is_empty() {
         let mut bi_entries: Vec<build_info::Entry> = Vec::new();
         if let Some(d) = params.deps {
             bi_entries.push(build_info::Entry {
@@ -177,7 +202,7 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
             endpoint: params.endpoint,
             app_token: Some(params.app_token),
             payload_json: None,
-            upload_url: Some(reg.build_info_endpoint.as_str()),
+            upload_url: Some(build_info_endpoint.as_str()),
             entries: &bi_entries,
             strategy: params.strategy,
             out: None,
@@ -185,31 +210,20 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         };
         build_info::run(bi, policy).await?;
         tracing::info!("build-info bundle uploaded (same registration)");
-    } else if params.deps.is_some() || params.timings.is_some() {
+    } else if want_build_info {
         tracing::info!(
             "build-info sidecars supplied but no signed build_info_upload_endpoint; \
              leaving deps/timings to the producer's legacy path"
         );
     }
 
-    Ok(Outcome::Uploaded {
-        build_id: reg.build_id,
-    })
+    Ok(Outcome::Uploaded { build_id })
 }
 
-/// POST the producer metadata to `/v2/apps/<token>/builds`, ensuring
-/// `request_artifact_upload: true` (and `request_build_info_upload: true` when
-/// sidecars are present), and read back the signed endpoints + `build_id`.
-///
-/// Not retried on a retriable HTTP status (a 5xx means the server saw it —
-/// status-retry could double-register); IS retried on transport errors, which
-/// is safe because the appserver dedups on the build `uuid` (replace-then-create).
-async fn register(
-    client: &reqwest::Client,
-    policy: RetryPolicy,
-    params: &Params<'_>,
-    want_build_info: bool,
-) -> Result<Registration> {
+/// Build the registration metadata body: the producer's JSON plus the
+/// `request_*_upload` flags the CLI owns (it is uploading an artefact, and a
+/// build-info bundle when sidecars are present). Shared by both transports.
+async fn build_metadata(params: &Params<'_>, want_build_info: bool) -> Result<Map<String, Value>> {
     let raw = tokio::fs::read(params.payload_json).await?;
     let mut body: Map<String, Value> = serde_json::from_slice(&raw).map_err(|e| {
         Error::InputInvalid(format!(
@@ -217,19 +231,33 @@ async fn register(
             params.payload_json.display()
         ))
     })?;
-    // The CLI owns the "how": we are uploading an artefact (+ optional bundle).
     body.insert("request_artifact_upload".into(), Value::Bool(true));
     if want_build_info {
         body.insert("request_build_info_upload".into(), Value::Bool(true));
     }
+    Ok(body)
+}
 
-    let url = build_info::builds_url(params.endpoint, params.app_token);
+/// POST the metadata to `/v2/apps/<token>/builds` and read back the signed
+/// endpoints + `build_id` (single-PUT path).
+///
+/// Not retried on a retriable HTTP status (a 5xx means the server saw it —
+/// status-retry could double-register); IS retried on transport errors, which
+/// is safe because the appserver dedups on the build `uuid` (replace-then-create).
+async fn register_single(
+    client: &reqwest::Client,
+    policy: RetryPolicy,
+    endpoint: &str,
+    app_token: &str,
+    metadata: &Map<String, Value>,
+) -> Result<Registration> {
+    let url = build_info::builds_url(endpoint, app_token);
     tracing::debug!(%url, "POST build registration");
     let resp = http::send_with_retry(policy, "build registration POST", false, || {
         client
             .post(&url)
             .header(http::TELEMETRY_HEADER, http::TELEMETRY_VALUE)
-            .json(&body)
+            .json(metadata)
     })
     .await?;
 
@@ -319,6 +347,7 @@ mod tests {
             deps: None,
             timings: None,
             strategy: Strategy::Zstd(11),
+            chunked: false,
             dry_run: false,
             out: None,
         }
