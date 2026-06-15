@@ -39,15 +39,28 @@ impl Default for Strategy {
     }
 }
 
+/// Fixed ZIP entry timestamp (DOS epoch, 1980-01-01 00:00:00).
+///
+/// Pins byte-output determinism INDEPENDENT of the `zip` crate's optional
+/// `time` feature — when that feature is enabled the crate stamps each entry
+/// with `OffsetDateTime::now_utc()` (wall clock), which would make two packs of
+/// identical inputs differ. The artefact upload is chunk-deduplicated, so
+/// identical inputs MUST produce byte-identical archives across runs and
+/// machines; setting the timestamp explicitly removes the dependency on which
+/// `zip` features happen to be resolved in the dependency graph.
+fn fixed_mtime() -> zip::DateTime {
+    zip::DateTime::from_date_and_time(1980, 1, 1, 0, 0, 0)
+        .expect("1980-01-01 00:00:00 is a valid DOS timestamp")
+}
+
 impl Strategy {
     fn file_options(self) -> SimpleFileOptions {
+        let base = SimpleFileOptions::default().last_modified_time(fixed_mtime());
         match self {
-            Strategy::Zstd(level) => SimpleFileOptions::default()
+            Strategy::Zstd(level) => base
                 .compression_method(CompressionMethod::Zstd)
                 .compression_level(Some(level)),
-            Strategy::Deflate => {
-                SimpleFileOptions::default().compression_method(CompressionMethod::Deflated)
-            }
+            Strategy::Deflate => base.compression_method(CompressionMethod::Deflated),
         }
     }
 }
@@ -113,8 +126,7 @@ impl<'a> ZipEntry<'a> {
     }
 
     /// An entry written with STORE (method 0). Use for already-compressed
-    /// containers where re-compression is wasted work.
-    #[allow(dead_code)]
+    /// containers where re-compression is wasted work (`.aab`/`.apk`/`.ipa`).
     pub fn stored(name: &'a str, source: &'a Path) -> Self {
         Self {
             name,
@@ -151,7 +163,9 @@ pub fn pack_entries(
     let out_file = File::create(output)?;
     let mut zip = ZipWriter::new(BufWriter::new(out_file));
     let compressed_options = strategy.file_options();
-    let stored_options = SimpleFileOptions::default().compression_method(CompressionMethod::Stored);
+    let stored_options = SimpleFileOptions::default()
+        .compression_method(CompressionMethod::Stored)
+        .last_modified_time(fixed_mtime());
 
     let mut buf = [0u8; 64 * 1024];
     for entry in entries {
@@ -291,6 +305,55 @@ mod tests {
         let mut bytes = Vec::new();
         stored.read_to_end(&mut bytes).unwrap();
         assert_eq!(bytes, b"PK\x03\x04 pretend zip bytes");
+    }
+
+    #[test]
+    fn pack_entries_is_byte_deterministic_across_runs() {
+        // The artefact upload is chunk-deduplicated: packing the same inputs
+        // on the same machine must yield byte-identical archives, or every
+        // re-run/retry re-uploads every chunk. Guard the whole packer (entry
+        // order + compression + ZIP metadata/timestamps) against drift.
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("app.apk");
+        let mapping = dir.path().join("mapping.txt");
+        std::fs::write(&artifact, b"PK\x03\x04 fake apk container bytes").unwrap();
+        std::fs::write(
+            &mapping,
+            "com.example.Foo -> a.b.C:\n".repeat(500).as_bytes(),
+        )
+        .unwrap();
+
+        let entries = [
+            ZipEntry::stored("app.apk", &artifact),
+            ZipEntry::compressed("mapping.txt", &mapping),
+        ];
+        let out1 = dir.path().join("one.zip");
+        let out2 = dir.path().join("two.zip");
+        pack_entries(&entries, &out1, Strategy::Zstd(11)).unwrap();
+        pack_entries(&entries, &out2, Strategy::Zstd(11)).unwrap();
+
+        let b1 = std::fs::read(&out1).unwrap();
+        let b2 = std::fs::read(&out2).unwrap();
+        assert_eq!(
+            b1, b2,
+            "packing identical inputs must be byte-deterministic (chunk-dedup contract)"
+        );
+
+        // Directly pin the timestamp source: both entries must carry the fixed
+        // DOS epoch, not the wall clock. A back-to-back byte-equality check
+        // alone can't catch wall-clock stamping (both packs land in the same
+        // 2-second tick), so assert the year explicitly — this fails the
+        // instant the explicit `last_modified_time` pin is dropped while the
+        // `zip/time` feature is on.
+        let mut archive = ZipArchive::new(File::open(&out1).unwrap()).unwrap();
+        for name in ["app.apk", "mapping.txt"] {
+            let entry = archive.by_name(name).unwrap();
+            assert_eq!(
+                entry.last_modified().map(|d| d.year()),
+                Some(1980),
+                "entry {name} must carry the fixed DOS-epoch timestamp, not the wall clock"
+            );
+        }
     }
 
     #[test]

@@ -4,6 +4,7 @@ pub mod build_env;
 pub mod debug_files;
 pub mod dsym;
 pub mod ios_deps;
+pub mod pack;
 pub mod sourcemaps;
 pub mod upload;
 pub mod vcs_metadata;
@@ -55,6 +56,13 @@ pub enum Command {
     #[command(subcommand)]
     Upload(upload::UploadCommand),
 
+    /// Pack a build artefact (+ optional R8/ProGuard mapping) into the
+    /// normalized upload ZIP the worker's size-analysis job consumes. The
+    /// artefact is STORED verbatim; the mapping is zstd-compressed (method 93).
+    /// Local-only — the producer uploads the resulting ZIP itself. Lets the
+    /// Gradle plugin delegate compression here instead of bundling zstd-jni.
+    Pack(pack::PackArgs),
+
     /// Resolve VCS metadata (provider, commit_sha, branch, PR number, repo)
     /// from CI provider env vars or a `git` fallback. Outputs JSON to stdout.
     ///
@@ -95,6 +103,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::DebugFiles(cmd) => debug_files::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::Sourcemaps(cmd) => sourcemaps::dispatch(cmd, cli.endpoint, cli.app_token).await,
         Command::Upload(cmd) => upload::dispatch(cmd, cli.endpoint, cli.app_token).await,
+        Command::Pack(args) => pack::dispatch(args),
         Command::VcsMetadata(args) => vcs_metadata::dispatch(args),
         Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),
