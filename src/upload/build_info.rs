@@ -259,7 +259,7 @@ async fn register(
 
 /// Construct the build-registration URL, tolerating an `endpoint` that already
 /// carries the `/v2` suffix (mirrors the Gradle plugin's ApiEndpoint).
-fn builds_url(endpoint: &str, app_token: &str) -> String {
+pub(crate) fn builds_url(endpoint: &str, app_token: &str) -> String {
     let base = endpoint.trim_end_matches('/');
     let base = base.strip_suffix("/v2").unwrap_or(base);
     format!("{base}/v2/apps/{app_token}/builds")

@@ -20,6 +20,7 @@
 //! predates it and keeps its own single-shot client for now; folding it in is
 //! deferred to the symbols-consolidation pass.
 
+pub mod build;
 pub mod build_info;
 pub mod chunked;
 pub mod http;

@@ -10,6 +10,7 @@ use std::path::PathBuf;
 
 use crate::compress;
 use crate::error::{config_invalid, input_not_found};
+use crate::upload::build;
 use crate::upload::build_info::{self, Entry, Params};
 use crate::upload::http::RetryPolicy;
 
@@ -60,6 +61,52 @@ pub enum UploadCommand {
 
         /// Pack the bundle but skip all network I/O. Combine with --out to
         /// inspect the exact bytes that would be uploaded.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Register a build and upload its artefact in one flow: POST the metadata
+    /// to /v2/apps/<token>/builds, then PUT the artefact (STORED) + optional
+    /// zstd mapping as the normalized upload ZIP. When --deps/--timings are
+    /// given AND the org's build-info flag signs the endpoint, the build-info
+    /// bundle ships from the same registration (no second POST). Single-PUT
+    /// only; large artefacts use the chunked path (added separately).
+    Build {
+        /// Registration metadata JSON — the POST body for
+        /// `/v2/apps/<token>/builds`. The CLI injects `request_artifact_upload`
+        /// (and `request_build_info_upload` when sidecars are present).
+        #[arg(long)]
+        payload_json: PathBuf,
+
+        /// Build artefact (`.aab`/`.apk`/`.ipa`), STORED verbatim in the ZIP.
+        #[arg(long)]
+        artifact: PathBuf,
+
+        /// Optional R8/ProGuard mapping.txt, zstd-packed alongside the artefact.
+        #[arg(long)]
+        mapping: Option<PathBuf>,
+
+        /// Optional dependencies.json sidecar (build-info bundle component).
+        #[arg(long)]
+        deps: Option<PathBuf>,
+
+        /// Optional timings.json sidecar (build-info bundle component).
+        #[arg(long)]
+        timings: Option<PathBuf>,
+
+        /// Disable Zstd compression (diagnostic only — default is Zstd level 11).
+        #[arg(long)]
+        no_zstd: bool,
+
+        /// Zstd level (1..=22). Defaults to 11; values below 9 are rejected.
+        #[arg(long)]
+        zstd_level: Option<i64>,
+
+        /// With --dry-run, write the would-be-uploaded artefact ZIP to this path.
+        #[arg(long)]
+        out: Option<PathBuf>,
+
+        /// Pack the upload ZIP but skip registration + all network I/O.
         #[arg(long)]
         dry_run: bool,
     },
@@ -151,6 +198,63 @@ pub async fn dispatch(
                 dry_run,
             };
             build_info::run(params, RetryPolicy::default()).await?;
+            Ok(())
+        }
+
+        UploadCommand::Build {
+            payload_json,
+            artifact,
+            mapping,
+            deps,
+            timings,
+            no_zstd,
+            zstd_level,
+            out,
+            dry_run,
+        } => {
+            let strategy = compress::resolve_strategy(no_zstd, zstd_level)?;
+            if out.is_some() && !dry_run {
+                return Err(config_invalid("--out is only valid with --dry-run"));
+            }
+            let app_token = app_token.as_deref().ok_or_else(|| {
+                config_invalid("--app-token (or BUGSEE_APP_TOKEN) is required for `upload build`")
+            })?;
+            // Fail fast on missing optional sidecars (artefact itself is checked
+            // in build::run); a missing file the producer named is a real error,
+            // not a silently-skipped upload.
+            for (label, p) in [
+                ("--mapping", &mapping),
+                ("--deps", &deps),
+                ("--timings", &timings),
+            ] {
+                if let Some(path) = p {
+                    if !path.is_file() {
+                        return Err(input_not_found(format!(
+                            "{label} does not exist or is not a file: {}",
+                            path.display()
+                        )));
+                    }
+                }
+            }
+            let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+            let params = build::Params {
+                endpoint: &endpoint,
+                app_token,
+                payload_json: &payload_json,
+                artifact: &artifact,
+                mapping: mapping.as_deref(),
+                deps: deps.as_deref(),
+                timings: timings.as_deref(),
+                strategy,
+                dry_run,
+                out: out.as_deref(),
+            };
+            if let build::Outcome::Uploaded { build_id } =
+                build::run(params, RetryPolicy::default()).await?
+            {
+                // stdout carries the build id so the producer can correlate.
+                println!("{build_id}");
+            }
             Ok(())
         }
     }
