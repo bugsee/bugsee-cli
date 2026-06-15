@@ -50,9 +50,10 @@ pub enum Command {
     Sourcemaps(sourcemaps::SourcemapsCommand),
 
     /// Build-time upload command tree — the single canonical origin for
-    /// Bugsee build-time uploads. Phase A: `upload build-info` (per-build
-    /// metadata bundle). Producers shell to this instead of maintaining their
-    /// own HTTP client, compression, retry, and presigned-URL handshake.
+    /// Bugsee build-time uploads: `build` (artefact: single-PUT or chunked,
+    /// + registration + build-info) and `build-info` (per-build metadata
+    /// bundle). Producers shell to this instead of maintaining their own HTTP
+    /// client, compression, retry, chunking, and presigned-URL handshake.
     #[command(subcommand)]
     Upload(upload::UploadCommand),
 

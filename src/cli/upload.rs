@@ -66,11 +66,12 @@ pub enum UploadCommand {
     },
 
     /// Register a build and upload its artefact in one flow: POST the metadata
-    /// to /v2/apps/<token>/builds, then PUT the artefact (STORED) + optional
-    /// zstd mapping as the normalized upload ZIP. When --deps/--timings are
-    /// given AND the org's build-info flag signs the endpoint, the build-info
-    /// bundle ships from the same registration (no second POST). Single-PUT
-    /// only; large artefacts use the chunked path (added separately).
+    /// to /v2/apps/<token>/builds, then upload the normalized upload ZIP
+    /// (artefact STORED + optional zstd mapping) — single-PUT, or via the
+    /// chunked protocol with --chunked (for large artefacts). When
+    /// --deps/--timings are given AND the org's build-info flag signs the
+    /// endpoint, the build-info bundle ships from the same registration (no
+    /// second POST).
     Build {
         /// Registration metadata JSON — the POST body for
         /// `/v2/apps/<token>/builds`. The CLI injects `request_artifact_upload`
