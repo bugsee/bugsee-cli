@@ -21,14 +21,14 @@ pub mod vcs_metadata;
 pub struct Cli {
     /// Bugsee API endpoint (defaults to https://api.bugsee.com).
     /// Used only by upload-flavoured subcommands (`debug-files
-    /// upload`, `sourcemaps upload`). Metadata-resolving subcommands
-    /// (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`) do no
-    /// network I/O and ignore this flag.
+    /// upload`, `upload build`, `upload build-info`). Metadata-resolving
+    /// subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`,
+    /// `sourcemaps inject`) do no network I/O and ignore this flag.
     #[arg(long, env = "BUGSEE_ENDPOINT", global = true)]
     pub endpoint: Option<String>,
 
-    /// Bugsee app token. Required by `debug-files upload` and
-    /// `sourcemaps upload`; ignored by every other subcommand. Kept
+    /// Bugsee app token. Required by `debug-files upload`, `upload build`,
+    /// and `upload build-info`; ignored by every other subcommand. Kept
     /// `global` so the same env-var-driven invocation shape works
     /// across all subcommands without per-call conditional plumbing
     /// in Python integrators.
@@ -45,7 +45,8 @@ pub enum Command {
     #[command(subcommand)]
     DebugFiles(debug_files::DebugFilesCommand),
 
-    /// Manage JavaScript source maps (inject debug IDs, upload).
+    /// Manage JavaScript source maps (inject debug IDs). Upload the injected
+    /// maps with `debug-files upload --type sourcemaps`.
     #[command(subcommand)]
     Sourcemaps(sourcemaps::SourcemapsCommand),
 

@@ -14,7 +14,7 @@ Built on the `symbolic` Rust crate family — the same crates the Bugsee worker 
 1. **BMF/BSF — keep for existing setups, drop for new ones.** Existing deployments continue to convert PDB/MDB → BMF/BSF via `bugsee-cli debug-files convert`. New deployments upload Portable PDB / dSYM directly and rely on `symbolic-debuginfo` server-side.
 2. **Zstd is the default wire format.** Default level **11**, minimum production level **9**. The worker already accepts ZIP files with Z_STANDARD (compression method 93) entries.
 3. **Debug ID is the universal identifier.** Native artifacts (Mach-O UUID, ELF GNU build-id, PE Timestamp+Size) carry it naturally. JS bundles get a deterministic UUIDv5 via `bugsee-cli sourcemaps inject`. Server lookup is by debug-id; the old `(uuid, version, build)` tuple stays as a backward-compat shim during fleet migration.
-4. **Chunked upload from v0.1.** `GET /v2/files/chunk-upload` → sha1-keyed chunks → assemble. Required for Flutter Dart `.symbols` and Unity IL2CPP artifacts that routinely exceed 50–100 MB.
+4. **Chunked upload for large artefacts.** `GET /v2/apps/<token>/builds/chunk-options` → `POST .../builds/chunks/check` (sha1-keyed) → PUT missing chunks → `POST .../builds/chunked`. Used by `upload build --chunked` for artefacts above the single-PUT threshold (e.g. Flutter Dart `.symbols`, Unity IL2CPP) that routinely exceed 50–100 MB.
 5. **Cross-language wire shape is a public contract.** Each subcommand's stdout JSON shape is consumed by at least one external Python script (see Subcommands § below). Breaking changes to field names, casing, types, or null-vs-omit semantics require a major version bump and a coordinated rollout across the fastlane plugin and the iOS SDK's BugseeAgent.
 
 ## Building
@@ -100,11 +100,16 @@ Extract Mach-O UUIDs from a `.dSYM` bundle directory OR a single Mach-O binary i
 
 Both return `[]` (exit 0) on any parseable failure. Uppercase casing matches `dwarfdump -u`'s historic output so cross-tool string comparisons don't break.
 
-### `sourcemaps inject` / `sourcemaps upload` (planned)
+### `sourcemaps inject`
+
+Embeds a deterministic, content-derived UUIDv5 debug-id into JS bundles
+(`//# debugId=` + a `globalThis._bugseeDebugIds` runtime stub) and into the
+paired `.map` (`debug_id` + `debugId`). Idempotent. Upload the injected maps
+through `debug-files upload --type sourcemaps`.
 
 ```
 bugsee-cli sourcemaps inject <paths>... [--dry-run]
-bugsee-cli sourcemaps upload <paths>...
+bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b>
 ```
 
 ### `debug-files convert` (planned)
@@ -115,7 +120,7 @@ bugsee-cli debug-files convert <input> --to bmf|bsf --output <path>
 
 ### Global flags
 
-`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `sourcemaps upload`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`) do no network I/O and ignore them.
+`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `upload build`, `upload build-info`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`, `sourcemaps inject`) do no network I/O and ignore them.
 
 ### Subcommand vocabulary
 
@@ -183,7 +188,7 @@ src/
   main.rs              entry point
   cli/                 clap command tree
     debug_files.rs       debug-files upload / convert
-    sourcemaps.rs        sourcemaps inject / upload
+    sourcemaps.rs        sourcemaps inject
     vcs_metadata.rs      vcs-metadata
     ios_deps.rs          ios-deps collect
     build_env.rs         build-env xcode-version / machine-label / read-plist

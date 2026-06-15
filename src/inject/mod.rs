@@ -260,14 +260,33 @@ mod tests {
     fn dry_run_writes_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let js = dir.path().join("app.mjs");
-        std::fs::write(&js, "export const x = 1\n").unwrap();
-        let before = std::fs::read_to_string(&js).unwrap();
+        // Pair it with a map so the dry-run also exercises write_map_debug_id's
+        // guard — a dropped `if !dry_run` on EITHER the bundle or the map write
+        // must be caught.
+        let map = dir.path().join("app.mjs.map");
+        std::fs::write(
+            &js,
+            "export const x = 1\n//# sourceMappingURL=app.mjs.map\n",
+        )
+        .unwrap();
+        std::fs::write(&map, r#"{"version":3,"sources":[],"mappings":""}"#).unwrap();
+        let js_before = std::fs::read_to_string(&js).unwrap();
+        let map_before = std::fs::read_to_string(&map).unwrap();
+
         let s = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
         assert_eq!(s.js_injected, 1);
+        // The map WOULD have changed (no debug_id yet), so the intent is tallied
+        // even though nothing is written to disk in dry-run.
+        assert_eq!(s.maps_updated, 1);
         assert_eq!(
             std::fs::read_to_string(&js).unwrap(),
-            before,
-            "dry-run left file unchanged"
+            js_before,
+            "dry-run left the bundle unchanged"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&map).unwrap(),
+            map_before,
+            "dry-run left the source map unchanged"
         );
     }
 
