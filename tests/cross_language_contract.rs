@@ -65,11 +65,20 @@ fn ios_deps_collect_emits_expected_top_level_keys() {
     // empty deps payloads on both sides.
     let root = fixture("ios_deps");
     let v = run_and_parse_json(&[
-        "ios-deps", "collect", "--project-root", root.to_str().unwrap(),
+        "ios-deps",
+        "collect",
+        "--project-root",
+        root.to_str().unwrap(),
     ]);
     assert!(v.get("entries").is_some(), "missing top-level `entries`");
-    assert!(v.get("scope_label").is_some(), "missing top-level `scope_label`");
-    assert!(v.get("truncated").is_some(), "missing top-level `truncated`");
+    assert!(
+        v.get("scope_label").is_some(),
+        "missing top-level `scope_label`"
+    );
+    assert!(
+        v.get("truncated").is_some(),
+        "missing top-level `truncated`"
+    );
     assert_eq!(v["scope_label"], "all");
     assert_eq!(v["truncated"], false);
     assert!(v["entries"].is_array(), "`entries` must be an array");
@@ -79,10 +88,16 @@ fn ios_deps_collect_emits_expected_top_level_keys() {
 fn ios_deps_collect_emits_expected_per_entry_keys() {
     let root = fixture("ios_deps");
     let v = run_and_parse_json(&[
-        "ios-deps", "collect", "--project-root", root.to_str().unwrap(),
+        "ios-deps",
+        "collect",
+        "--project-root",
+        root.to_str().unwrap(),
     ]);
     let entries = v["entries"].as_array().expect("entries is array");
-    assert!(!entries.is_empty(), "fixture should produce non-empty entries");
+    assert!(
+        !entries.is_empty(),
+        "fixture should produce non-empty entries"
+    );
     for e in entries {
         let obj = e.as_object().expect("entry is object");
         // Required lowercase keys. Drift on any of these = silent
@@ -112,7 +127,10 @@ fn ios_deps_collect_omits_none_valued_optional_fields() {
     // Pin omission explicitly.
     let root = fixture("ios_deps");
     let v = run_and_parse_json(&[
-        "ios-deps", "collect", "--project-root", root.to_str().unwrap(),
+        "ios-deps",
+        "collect",
+        "--project-root",
+        root.to_str().unwrap(),
     ]);
     for e in v["entries"].as_array().unwrap() {
         let obj = e.as_object().unwrap();
@@ -133,7 +151,10 @@ fn ios_deps_collect_extracts_spm_url_from_package_resolved() {
     // `swift-collections` fixture entry.
     let root = fixture("ios_deps");
     let v = run_and_parse_json(&[
-        "ios-deps", "collect", "--project-root", root.to_str().unwrap(),
+        "ios-deps",
+        "collect",
+        "--project-root",
+        root.to_str().unwrap(),
     ]);
     let swift_collections = v["entries"]
         .as_array()
@@ -142,8 +163,7 @@ fn ios_deps_collect_extracts_spm_url_from_package_resolved() {
         .find(|e| e["name"] == "swift-collections")
         .expect("swift-collections must surface in entries");
     assert_eq!(
-        swift_collections["url"],
-        "https://github.com/apple/swift-collections.git",
+        swift_collections["url"], "https://github.com/apple/swift-collections.git",
         "SPM url must be propagated from Package.resolved.location",
     );
 }
@@ -157,9 +177,7 @@ fn build_env_read_plist_emits_string_keyed_dict() {
     // Python wrappers `json.loads()` then index with the requested
     // key. A list-shaped output would break the index lookup.
     let plist = fixture("build_env/Info.plist");
-    let v = run_and_parse_json(&[
-        "build-env", "read-plist", plist.to_str().unwrap(),
-    ]);
+    let v = run_and_parse_json(&["build-env", "read-plist", plist.to_str().unwrap()]);
     let obj = v.as_object().expect("read-plist must emit an object");
     assert_eq!(obj["CFBundleIdentifier"], "com.example.app");
     assert_eq!(obj["CFBundleShortVersionString"], "1.2.3");
@@ -180,7 +198,10 @@ fn build_env_read_plist_returns_empty_object_on_missing_file() {
     let stdout = std::str::from_utf8(&assert.get_output().stdout)
         .unwrap()
         .trim();
-    assert_eq!(stdout, "{}", "missing plist must emit empty object on stdout");
+    assert_eq!(
+        stdout, "{}",
+        "missing plist must emit empty object on stdout"
+    );
 }
 
 #[test]

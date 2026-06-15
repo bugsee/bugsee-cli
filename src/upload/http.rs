@@ -334,7 +334,11 @@ mod tests {
         })
         .await
         .unwrap_err();
-        assert_eq!(calls.get(), 3, "all 3 attempts should be made on transport error");
+        assert_eq!(
+            calls.get(),
+            3,
+            "all 3 attempts should be made on transport error"
+        );
         assert_eq!(err.exit_code(), crate::exit_code::ExitCode::UploadTransport);
     }
 }

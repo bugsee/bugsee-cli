@@ -100,7 +100,10 @@ pub fn resolve(env: &HashMap<String, String>, working_dir: &Path) -> VcsMetadata
         };
         set_if_present(&mut out.commit_sha, env.get("GITHUB_SHA"));
         set_if_present(&mut out.repo, env.get("GITHUB_REPOSITORY"));
-        let event_name = env.get("GITHUB_EVENT_NAME").map(|s| s.as_str()).unwrap_or("");
+        let event_name = env
+            .get("GITHUB_EVENT_NAME")
+            .map(|s| s.as_str())
+            .unwrap_or("");
         if event_name == "pull_request" {
             set_if_present(&mut out.branch, env.get("GITHUB_HEAD_REF"));
             set_if_present(&mut out.base_branch, env.get("GITHUB_BASE_REF"));
@@ -144,7 +147,10 @@ pub fn resolve(env: &HashMap<String, String>, working_dir: &Path) -> VcsMetadata
             .map(|s| s.trim())
             .filter(|s| !s.is_empty());
         if let Some(iid) = mr_iid {
-            set_if_present(&mut out.branch, env.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"));
+            set_if_present(
+                &mut out.branch,
+                env.get("CI_MERGE_REQUEST_SOURCE_BRANCH_NAME"),
+            );
             set_if_present(
                 &mut out.base_branch,
                 env.get("CI_MERGE_REQUEST_TARGET_BRANCH_NAME"),
@@ -241,10 +247,7 @@ fn git_fallback(working_dir: &Path) -> VcsMetadata {
     //   <branch or "HEAD">
     // Cuts the process-fork cost in half on every build that lacks a
     // CI provider env var (local dev + bare-metal CI).
-    let combined = match run_git(
-        working_dir,
-        &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"],
-    ) {
+    let combined = match run_git(working_dir, &["rev-parse", "HEAD", "--abbrev-ref", "HEAD"]) {
         Some(s) => s,
         None => return out,
     };
@@ -551,20 +554,21 @@ mod tests {
         // in ANY output field. Catches a mutation that read
         // CI_COMMIT_REF_NAME and surfaced it (for branch OR any
         // other field).
-        for field in [
+        for val in [
             m.branch.as_deref(),
             m.base_branch.as_deref(),
             m.commit_sha.as_deref(),
             m.repo.as_deref(),
             m.provider,
-        ] {
-            if let Some(val) = field {
-                assert!(
-                    !val.contains("ref-name-leak-sentinel"),
-                    "ref-name sentinel leaked into output field: {:?}",
-                    val,
-                );
-            }
+        ]
+        .into_iter()
+        .flatten()
+        {
+            assert!(
+                !val.contains("ref-name-leak-sentinel"),
+                "ref-name sentinel leaked into output field: {:?}",
+                val,
+            );
         }
     }
 
@@ -610,29 +614,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let repo = tmp.path();
         assert!(Command::new("git")
-            .args(&["init", "-q", "-b", "main"])
+            .args(["init", "-q", "-b", "main"])
             .current_dir(repo)
             .status()
             .unwrap()
             .success());
         Command::new("git")
-            .args(&["config", "user.email", "test@example.com"])
+            .args(["config", "user.email", "test@example.com"])
             .current_dir(repo)
             .status()
             .unwrap();
         Command::new("git")
-            .args(&["config", "user.name", "Test"])
+            .args(["config", "user.name", "Test"])
             .current_dir(repo)
             .status()
             .unwrap();
         fs::write(repo.join("a.txt"), "hi").unwrap();
         Command::new("git")
-            .args(&["add", "."])
+            .args(["add", "."])
             .current_dir(repo)
             .status()
             .unwrap();
         Command::new("git")
-            .args(&["commit", "-q", "-m", "init"])
+            .args(["commit", "-q", "-m", "init"])
             .current_dir(repo)
             .status()
             .unwrap();
@@ -688,7 +692,10 @@ mod tests {
             .current_dir(repo)
             .output()
             .unwrap();
-        let sha = String::from_utf8(sha_out.stdout).unwrap().trim().to_string();
+        let sha = String::from_utf8(sha_out.stdout)
+            .unwrap()
+            .trim()
+            .to_string();
         assert!(Command::new("git")
             .args(["checkout", "-q", "--detach", &sha])
             .current_dir(repo)

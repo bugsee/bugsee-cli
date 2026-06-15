@@ -106,10 +106,7 @@ pub fn dispatch(cmd: DsymCommand) -> anyhow::Result<()> {
 /// list on any error — the caller is responsible for treating
 /// absence as "no UUIDs found" rather than failing the build.
 pub fn extract_uuids(path: &Path) -> Vec<String> {
-    extract_slices(path)
-        .into_iter()
-        .map(|s| s.uuid)
-        .collect()
+    extract_slices(path).into_iter().map(|s| s.uuid).collect()
 }
 
 /// Extract every Mach-O slice's `(uuid, arch)` from `path`. Same
@@ -166,13 +163,11 @@ fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
         Ok(a) => a,
         Err(_) => return,
     };
-    for obj in archive.objects() {
-        if let Ok(obj) = obj {
-            out.push(DsymSliceView {
-                uuid: format_uuid(obj.debug_id()),
-                arch: obj.arch().name().to_string(),
-            });
-        }
+    for obj in archive.objects().flatten() {
+        out.push(DsymSliceView {
+            uuid: format_uuid(obj.debug_id()),
+            arch: obj.arch().name().to_string(),
+        });
     }
 }
 
@@ -317,12 +312,12 @@ mod tests {
         buf.extend_from_slice(&[0x18, 0x00, 0x00, 0x00]); // sizeofcmds = 24
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // flags
         buf.extend_from_slice(&[0x00, 0x00, 0x00, 0x00]); // reserved
-        // LC_UUID
+                                                          // LC_UUID
         buf.extend_from_slice(&[0x1b, 0x00, 0x00, 0x00]); // cmd = LC_UUID
         buf.extend_from_slice(&[0x18, 0x00, 0x00, 0x00]); // cmdsize = 24
         buf.extend_from_slice(&[
-            0x54, 0xd7, 0x5f, 0xb3, 0x74, 0x7f, 0x38, 0x7f,
-            0x8a, 0x93, 0x4e, 0xa0, 0x34, 0xb1, 0xf8, 0xcf,
+            0x54, 0xd7, 0x5f, 0xb3, 0x74, 0x7f, 0x38, 0x7f, 0x8a, 0x93, 0x4e, 0xa0, 0x34, 0xb1,
+            0xf8, 0xcf,
         ]);
         buf
     }
@@ -351,7 +346,12 @@ mod tests {
         let path = tmp.path().join("synthetic.macho");
         std::fs::write(&path, synthetic_macho_with_uuid()).unwrap();
         let slices = extract_slices(&path);
-        assert_eq!(slices.len(), 1, "exactly one slice expected, got {:?}", slices);
+        assert_eq!(
+            slices.len(),
+            1,
+            "exactly one slice expected, got {:?}",
+            slices
+        );
         assert_eq!(slices[0].uuid, "54D75FB3-747F-387F-8A93-4EA034B1F8CF");
         assert_eq!(slices[0].arch, "x86_64");
     }
@@ -369,10 +369,7 @@ mod tests {
         let id: DebugId = "54d75fb3-747f-387f-8a93-4ea034b1f8cf"
             .parse()
             .expect("known-valid debug id");
-        assert_eq!(
-            format_uuid(id),
-            "54D75FB3-747F-387F-8A93-4EA034B1F8CF",
-        );
+        assert_eq!(format_uuid(id), "54D75FB3-747F-387F-8A93-4EA034B1F8CF",);
         // Cross-check: explicitly assert the four hyphens are at the
         // canonical positions (8, 13, 18, 23) so a future serde-rename
         // or formatter swap that drops dashes can't slip past.
@@ -406,12 +403,27 @@ mod tests {
         };
         let json = serde_json::to_string(&view).unwrap();
         // Exact lowercase keys.
-        assert!(json.contains("\"uuid\":"), "missing lowercase uuid key in {json}");
-        assert!(json.contains("\"arch\":"), "missing lowercase arch key in {json}");
+        assert!(
+            json.contains("\"uuid\":"),
+            "missing lowercase uuid key in {json}"
+        );
+        assert!(
+            json.contains("\"arch\":"),
+            "missing lowercase arch key in {json}"
+        );
         // Negative pin — common accidental renames.
-        assert!(!json.contains("\"UUID\":"), "UUID (uppercase) leaked in {json}");
-        assert!(!json.contains("\"Uuid\":"), "Uuid (PascalCase) leaked in {json}");
-        assert!(!json.contains("\"Arch\":"), "Arch (PascalCase) leaked in {json}");
+        assert!(
+            !json.contains("\"UUID\":"),
+            "UUID (uppercase) leaked in {json}"
+        );
+        assert!(
+            !json.contains("\"Uuid\":"),
+            "Uuid (PascalCase) leaked in {json}"
+        );
+        assert!(
+            !json.contains("\"Arch\":"),
+            "Arch (PascalCase) leaked in {json}"
+        );
         // Value round-trip — the field values come through as strings.
         assert!(json.contains("\"54D75FB3-747F-387F-8A93-4EA034B1F8CF\""));
         assert!(json.contains("\"arm64\""));
@@ -439,6 +451,9 @@ mod tests {
         assert!(json.starts_with('['));
         assert!(json.ends_with(']'));
         // Two slice objects, comma-separated.
-        assert!(json.contains("},{"), "expected 2-object array shape in {json}");
+        assert!(
+            json.contains("},{"),
+            "expected 2-object array shape in {json}"
+        );
     }
 }

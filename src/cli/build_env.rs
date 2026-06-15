@@ -138,7 +138,12 @@ fn format_xcode_actual(s: &str) -> String {
     let patch = &s[len - 1..];
     let minor = if len >= 2 { &s[len - 2..len - 1] } else { "0" };
     let major = if len >= 3 { &s[..len - 2] } else { "0" };
-    format!("{}.{}.{}", strip_lead(major), strip_lead(minor), strip_lead(patch))
+    format!(
+        "{}.{}.{}",
+        strip_lead(major),
+        strip_lead(minor),
+        strip_lead(patch)
+    )
 }
 
 fn strip_lead(s: &str) -> String {
@@ -449,10 +454,7 @@ mod tests {
 
     #[test]
     fn gitlab_falls_back_to_runner_id() {
-        let env = env_with(&[
-            ("GITLAB_CI", "true"),
-            ("CI_RUNNER_ID", "12345"),
-        ]);
+        let env = env_with(&[("GITLAB_CI", "true"), ("CI_RUNNER_ID", "12345")]);
         assert_eq!(
             resolve_machine_label(&env).as_deref(),
             Some("gitlab-ci:12345"),
@@ -474,18 +476,12 @@ mod tests {
     #[test]
     fn circleci_uses_node_index() {
         let env = env_with(&[("CIRCLECI", "true"), ("CIRCLE_NODE_INDEX", "0")]);
-        assert_eq!(
-            resolve_machine_label(&env).as_deref(),
-            Some("circleci:0"),
-        );
+        assert_eq!(resolve_machine_label(&env).as_deref(), Some("circleci:0"),);
     }
 
     #[test]
     fn bitrise_uses_app_slug() {
-        let env = env_with(&[
-            ("BITRISE_IO", "true"),
-            ("BITRISE_APP_SLUG", "abc123def456"),
-        ]);
+        let env = env_with(&[("BITRISE_IO", "true"), ("BITRISE_APP_SLUG", "abc123def456")]);
         assert_eq!(
             resolve_machine_label(&env).as_deref(),
             Some("bitrise:abc123def456"),
@@ -535,10 +531,7 @@ mod tests {
             ("CI_WORKFLOW", "   \t\n"),
             ("HOSTNAME", "runner-8"),
         ]);
-        assert_eq!(
-            resolve_machine_label(&env).as_deref(),
-            Some("ci:runner-8"),
-        );
+        assert_eq!(resolve_machine_label(&env).as_deref(), Some("ci:runner-8"),);
     }
 
     #[test]
@@ -580,7 +573,11 @@ mod tests {
     #[test]
     fn env_truthy_falsy_tokens() {
         for tok in &["", "0", "false", "off"] {
-            assert!(!env_truthy(Some(&tok.to_string())), "expected falsy: {:?}", tok);
+            assert!(
+                !env_truthy(Some(&tok.to_string())),
+                "expected falsy: {:?}",
+                tok
+            );
         }
         assert!(!env_truthy(None));
     }
@@ -607,9 +604,19 @@ mod tests {
 </plist>"#;
         std::fs::write(tmp.path(), body).unwrap();
         let out = read_plist_to_json(tmp.path());
-        assert_eq!(out.get("CFBundleShortVersionString").and_then(|v| v.as_str()), Some("1.2.3"));
-        assert_eq!(out.get("CFBundleVersion").and_then(|v| v.as_str()), Some("42"));
-        assert_eq!(out.get("CFBundleIdentifier").and_then(|v| v.as_str()), Some("com.example.app"));
+        assert_eq!(
+            out.get("CFBundleShortVersionString")
+                .and_then(|v| v.as_str()),
+            Some("1.2.3")
+        );
+        assert_eq!(
+            out.get("CFBundleVersion").and_then(|v| v.as_str()),
+            Some("42")
+        );
+        assert_eq!(
+            out.get("CFBundleIdentifier").and_then(|v| v.as_str()),
+            Some("com.example.app")
+        );
     }
 
     #[test]
@@ -641,6 +648,9 @@ mod tests {
 </plist>"#;
         std::fs::write(tmp.path(), body).unwrap();
         let out = read_plist_to_json(tmp.path());
-        assert_eq!(out.get("CFBundleVersion").and_then(|v| v.as_str()), Some("42"));
+        assert_eq!(
+            out.get("CFBundleVersion").and_then(|v| v.as_str()),
+            Some("42")
+        );
     }
 }

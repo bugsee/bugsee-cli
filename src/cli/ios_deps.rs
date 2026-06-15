@@ -56,8 +56,8 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::OnceLock;
 
@@ -81,16 +81,14 @@ fn cartfile_line_regex() -> &'static Regex {
 fn otool_framework_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"/([^/]+\.framework)/")
-            .expect("known-valid otool framework regex")
+        Regex::new(r"/([^/]+\.framework)/").expect("known-valid otool framework regex")
     })
 }
 
 fn otool_line_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^\s*([^\s]+)\s+\(compatibility version")
-            .expect("known-valid otool line regex")
+        Regex::new(r"^\s*([^\s]+)\s+\(compatibility version").expect("known-valid otool line regex")
     })
 }
 
@@ -208,8 +206,7 @@ pub fn find_first_above(start_dir: &Path, filename: &str) -> Option<PathBuf> {
     // different lockfiles. Now both walk the path as the user
     // supplied it. Falls back to the input path verbatim if
     // `absolute()` errors (Windows-only edge case).
-    let mut current = std::path::absolute(start_dir)
-        .unwrap_or_else(|_| start_dir.to_path_buf());
+    let mut current = std::path::absolute(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
     for _ in 0..6 {
         let candidate = current.join(filename);
         if candidate.is_file() {
@@ -532,10 +529,12 @@ pub fn parse_cartfile_resolved(path: &Path) -> Vec<DepEntry> {
         let Some(captures) = line_re.captures(line) else {
             continue;
         };
-        let name = captures.get(2).map(|m| m.as_str()).unwrap_or("").to_string();
-        let version = captures
-            .get(3)
-            .map(|m| m.as_str().to_string());
+        let name = captures
+            .get(2)
+            .map(|m| m.as_str())
+            .unwrap_or("")
+            .to_string();
+        let version = captures.get(3).map(|m| m.as_str().to_string());
         out.push(DepEntry {
             id: make_dep_id("library", "", &name),
             group: String::new(),
@@ -556,11 +555,7 @@ pub fn parse_cartfile_resolved(path: &Path) -> Vec<DepEntry> {
 
 // ─── Vendored frameworks (otool -L) ────────────────────────────────
 
-const SYSTEM_DYLIB_PREFIXES: &[&str] = &[
-    "/usr/lib/",
-    "/System/Library/",
-    "/Library/Frameworks/",
-];
+const SYSTEM_DYLIB_PREFIXES: &[&str] = &["/usr/lib/", "/System/Library/", "/Library/Frameworks/"];
 
 /// Run `otool -L` on the linked product binary and emit `file`-type
 /// entries for each embedded framework reference.
@@ -663,7 +658,10 @@ pub fn parse_otool_output(stdout: &str) -> Vec<DepEntry> {
             continue;
         };
         let load_path = captures.get(1).map(|m| m.as_str()).unwrap_or("");
-        if SYSTEM_DYLIB_PREFIXES.iter().any(|p| load_path.starts_with(p)) {
+        if SYSTEM_DYLIB_PREFIXES
+            .iter()
+            .any(|p| load_path.starts_with(p))
+        {
             continue;
         }
         if !(load_path.starts_with("@rpath/")
@@ -858,7 +856,11 @@ pub fn merge_dep_entries(sources: Vec<Vec<DepEntry>>, max_entries: usize) -> (Ve
 
 /// Top-level orchestrator. Locates each source under `project_root`,
 /// parses each, merges, returns the canonical result.
-pub fn collect(project_root: &Path, product_binary: Option<&Path>, max_entries: usize) -> CollectResult {
+pub fn collect(
+    project_root: &Path,
+    product_binary: Option<&Path>,
+    max_entries: usize,
+) -> CollectResult {
     let podfile = find_first_above(project_root, "Podfile.lock");
     // SPM `Package.resolved` discovery has three shapes the iOS
     // toolchain produces:
@@ -876,7 +878,10 @@ pub fn collect(project_root: &Path, product_binary: Option<&Path>, max_entries: 
         .or_else(|| find_first_above(project_root, "xcshareddata/swiftpm/Package.resolved"));
     let cartfile = find_first_above(project_root, "Cartfile.resolved");
 
-    let pods = podfile.as_deref().map(parse_podfile_lock).unwrap_or_default();
+    let pods = podfile
+        .as_deref()
+        .map(parse_podfile_lock)
+        .unwrap_or_default();
     let spm = package_resolved
         .as_deref()
         .map(parse_package_resolved)
@@ -934,7 +939,10 @@ mod tests {
         // `<type>:<group>:<name>` — single colons. Empty group
         // yields the `<type>::<name>` form by coincidence.
         assert_eq!(make_dep_id("library", "", "Foo"), "library::Foo");
-        assert_eq!(make_dep_id("file", "", "Bar.framework"), "file::Bar.framework");
+        assert_eq!(
+            make_dep_id("file", "", "Bar.framework"),
+            "file::Bar.framework"
+        );
     }
 
     // ── Podfile.lock ───────────────────────────────────────────────
@@ -1177,7 +1185,10 @@ mod tests {
         let mut second = dummy_entry("A");
         second.version = Some("from-spm".to_string());
         let (out, truncated) = merge_dep_entries(
-            vec![vec![first, dummy_entry("B")], vec![second, dummy_entry("C")]],
+            vec![
+                vec![first, dummy_entry("B")],
+                vec![second, dummy_entry("C")],
+            ],
             DEPENDENCIES_MAX_COUNT,
         );
         assert_eq!(out.len(), 3);
@@ -1195,13 +1206,9 @@ mod tests {
         // url; dropping it would silently exclude this package from
         // every vuln scan.
         let cocoapods_a = dummy_entry("A"); // no url
-        let spm_a = dummy_entry_with_url(
-            "A", "https://github.com/example/A.git",
-        );
-        let (out, _) = merge_dep_entries(
-            vec![vec![cocoapods_a], vec![spm_a]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let spm_a = dummy_entry_with_url("A", "https://github.com/example/A.git");
+        let (out, _) =
+            merge_dep_entries(vec![vec![cocoapods_a], vec![spm_a]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].url.as_deref(),
@@ -1215,10 +1222,7 @@ mod tests {
         // wins (no preference reason to replace).
         let first = dummy_entry_with_url("A", "https://first.example/A");
         let second = dummy_entry_with_url("A", "https://second.example/A");
-        let (out, _) = merge_dep_entries(
-            vec![vec![first], vec![second]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let (out, _) = merge_dep_entries(vec![vec![first], vec![second]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].url.as_deref(), Some("https://first.example/A"));
     }
@@ -1253,7 +1257,10 @@ mod tests {
             vec![vec![braintree_umbrella, cocoapods_subspec], vec![spm_entry]],
             DEPENDENCIES_MAX_COUNT,
         );
-        let core = out.iter().find(|e| e.name == "Braintree/Core").expect("Core kept");
+        let core = out
+            .iter()
+            .find(|e| e.name == "Braintree/Core")
+            .expect("Core kept");
         assert_eq!(
             core.url.as_deref(),
             Some("https://github.com/braintree/braintree_ios.git"),
@@ -1307,16 +1314,10 @@ mod tests {
         vendored.version = None;
         let mut spm = dummy_entry_with_url("Foo", "https://example.com/foo.git");
         spm.version = Some("2.0".to_string());
-        let (out, _) = merge_dep_entries(
-            vec![vec![vendored], vec![spm]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let (out, _) = merge_dep_entries(vec![vec![vendored], vec![spm]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].version.as_deref(), Some("2.0"));
-        assert_eq!(
-            out[0].url.as_deref(),
-            Some("https://example.com/foo.git"),
-        );
+        assert_eq!(out[0].url.as_deref(), Some("https://example.com/foo.git"),);
     }
 
     #[test]
@@ -1332,14 +1333,10 @@ mod tests {
         // test uses entries where prev.version == entry.version.
         let mut cocoapods = dummy_entry("Alamofire");
         cocoapods.version = Some("1.0".to_string());
-        let mut spm = dummy_entry_with_url(
-            "Alamofire", "https://github.com/Alamofire/Alamofire.git",
-        );
+        let mut spm =
+            dummy_entry_with_url("Alamofire", "https://github.com/Alamofire/Alamofire.git");
         spm.version = Some("2.0".to_string());
-        let (out, _) = merge_dep_entries(
-            vec![vec![cocoapods], vec![spm]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let (out, _) = merge_dep_entries(vec![vec![cocoapods], vec![spm]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         // Both fields took the incoming source's value — they belong
         // to the same package release.
@@ -1370,14 +1367,10 @@ mod tests {
         // than (url, wrong-version).
         let mut cocoapods = dummy_entry("Alamofire");
         cocoapods.version = Some("1.0".to_string());
-        let mut spm = dummy_entry_with_url(
-            "Alamofire", "https://github.com/Alamofire/Alamofire.git",
-        );
+        let mut spm =
+            dummy_entry_with_url("Alamofire", "https://github.com/Alamofire/Alamofire.git");
         spm.version = None;
-        let (out, _) = merge_dep_entries(
-            vec![vec![cocoapods], vec![spm]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let (out, _) = merge_dep_entries(vec![vec![cocoapods], vec![spm]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].url.as_deref(),
@@ -1417,7 +1410,9 @@ mod tests {
             vec![vec![umbrella, cocoapods_subspec], vec![spm]],
             DEPENDENCIES_MAX_COUNT,
         );
-        let core = out.iter().find(|e| e.name == "Braintree/Core")
+        let core = out
+            .iter()
+            .find(|e| e.name == "Braintree/Core")
             .expect("Core kept");
         // url comes from SPM.
         assert_eq!(
@@ -1451,14 +1446,10 @@ mod tests {
         // CocoaPods second. The url-bearing entry MUST remain — a
         // regression that flipped the comparison would lose the
         // url every time the manifest order put SPM first.
-        let spm_a = dummy_entry_with_url(
-            "A", "https://github.com/example/A.git",
-        );
+        let spm_a = dummy_entry_with_url("A", "https://github.com/example/A.git");
         let cocoapods_a = dummy_entry("A"); // no url
-        let (out, _) = merge_dep_entries(
-            vec![vec![spm_a], vec![cocoapods_a]],
-            DEPENDENCIES_MAX_COUNT,
-        );
+        let (out, _) =
+            merge_dep_entries(vec![vec![spm_a], vec![cocoapods_a]], DEPENDENCIES_MAX_COUNT);
         assert_eq!(out.len(), 1);
         assert_eq!(
             out[0].url.as_deref(),
@@ -1529,7 +1520,7 @@ mod tests {
         let mut entries = Vec::new();
         // 1 direct + 6 transitive, capped at 4 → keep direct + 3
         // transitive (the 3 with the lowest ids: B, D, F).
-        entries.push(dummy_entry("A"));   // direct
+        entries.push(dummy_entry("A")); // direct
         for name in ["F", "B", "H", "D", "J", "L"] {
             entries.push(dummy_transitive(name));
         }
@@ -1558,11 +1549,12 @@ mod tests {
         // sorted. A regression that skipped the post-truncation
         // re-sort would surface as a non-deterministic order in
         // the kept set — caught here.
-        let mut entries = Vec::new();
-        entries.push(dummy_entry("Zebra"));
-        entries.push(dummy_entry("Apple"));
-        entries.push(dummy_entry("Mango"));
-        entries.push(dummy_entry("Banana"));
+        let entries = vec![
+            dummy_entry("Zebra"),
+            dummy_entry("Apple"),
+            dummy_entry("Mango"),
+            dummy_entry("Banana"),
+        ];
         let (out, truncated) = merge_dep_entries(vec![entries], 2);
         assert!(truncated);
         assert_eq!(out.len(), 2);
@@ -1662,12 +1654,10 @@ mod tests {
         // return false so the caller can kill+reap the child.
         // Previously this branch had zero coverage — a mutation
         // that conflated Err with Ok would have slipped through.
-        use std::io::ErrorKind;
-
         struct FailingReader;
         impl std::io::Read for FailingReader {
             fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
-                Err(std::io::Error::new(ErrorKind::Other, "boom"))
+                Err(std::io::Error::other("boom"))
             }
         }
 
@@ -1844,7 +1834,8 @@ mod tests {
         // walks UP, never sideways into siblings, so it would
         // silently miss this shape — the migration regressed it.
         let tmp = TempDir::new().unwrap();
-        let nested = tmp.path()
+        let nested = tmp
+            .path()
             .join("MyApp.xcodeproj")
             .join("project.xcworkspace")
             .join("xcshareddata")
@@ -1866,7 +1857,8 @@ mod tests {
         // wrapper) nest one level shallower. Same discovery
         // mechanism, different sibling extension.
         let tmp = TempDir::new().unwrap();
-        let nested = tmp.path()
+        let nested = tmp
+            .path()
             .join("MyApp.xcworkspace")
             .join("xcshareddata")
             .join("swiftpm")
@@ -1887,13 +1879,15 @@ mod tests {
         // graph the CLI reports matches what Xcode is actually
         // building from.
         let tmp = TempDir::new().unwrap();
-        let in_proj = tmp.path()
+        let in_proj = tmp
+            .path()
             .join("MyApp.xcodeproj")
             .join("project.xcworkspace")
             .join("xcshareddata")
             .join("swiftpm")
             .join("Package.resolved");
-        let in_ws = tmp.path()
+        let in_ws = tmp
+            .path()
             .join("MyApp.xcworkspace")
             .join("xcshareddata")
             .join("swiftpm")
@@ -1901,16 +1895,20 @@ mod tests {
         // Write distinct fixtures so we can tell which one won.
         std::fs::create_dir_all(in_proj.parent().unwrap()).unwrap();
         std::fs::create_dir_all(in_ws.parent().unwrap()).unwrap();
-        std::fs::write(&in_proj,
+        std::fs::write(
+            &in_proj,
             "{\"pins\":[{\"identity\":\"from-proj\",\"kind\":\"remoteSourceControl\",\
              \"location\":\"https://example/proj.git\",\
              \"state\":{\"version\":\"1.0\",\"revision\":\"a\"}}],\"version\":3}",
-        ).unwrap();
-        std::fs::write(&in_ws,
+        )
+        .unwrap();
+        std::fs::write(
+            &in_ws,
             "{\"pins\":[{\"identity\":\"from-ws\",\"kind\":\"remoteSourceControl\",\
              \"location\":\"https://example/ws.git\",\
              \"state\":{\"version\":\"2.0\",\"revision\":\"b\"}}],\"version\":3}",
-        ).unwrap();
+        )
+        .unwrap();
 
         let result = collect(tmp.path(), None, DEPENDENCIES_MAX_COUNT);
         assert!(

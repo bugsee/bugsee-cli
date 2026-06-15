@@ -563,7 +563,11 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let deps = write(tmp.path(), "dependencies.json", r#"{"deps":[]}"#);
-        let payload = write(tmp.path(), "payload.json", r#"{"version":"1.0","build":"1"}"#);
+        let payload = write(
+            tmp.path(),
+            "payload.json",
+            r#"{"version":"1.0","build":"1"}"#,
+        );
 
         let put_url = format!("{}/flat-put", server.uri());
         Mock::given(method("POST"))
@@ -608,7 +612,11 @@ mod tests {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let deps = write(tmp.path(), "dependencies.json", r#"{"deps":[]}"#);
-        let payload = write(tmp.path(), "payload.json", r#"{"version":"1.0","build":"1"}"#);
+        let payload = write(
+            tmp.path(),
+            "payload.json",
+            r#"{"version":"1.0","build":"1"}"#,
+        );
 
         let put_url = format!("{}/will-500", server.uri());
         Mock::given(method("POST"))
