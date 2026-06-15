@@ -18,3 +18,4 @@
 pub mod dsym;
 pub mod elf;
 pub mod proguard;
+pub mod sourcemap;
