@@ -33,7 +33,8 @@ jobs:
           $base = "https://download.bugsee.com/cli/v$v"
           Write-Host "Fetching $base/bugsee-cli-x86_64-pc-windows-msvc.zip"
           Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip" -OutFile cli.zip
-          $expected = (Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip.sha256").Content.Trim().Split()[0].ToLower()
+          Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip.sha256" -OutFile cli.zip.sha256
+          $expected = ((Get-Content cli.zip.sha256 -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash cli.zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) { throw "sha256 mismatch: expected $expected, got $actual" }
           Write-Host "checksum OK: $actual"
