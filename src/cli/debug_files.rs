@@ -426,6 +426,45 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// Recursively discover `.dSYM` bundles under the given paths. An explicit
+/// `.dSYM` directory is taken as-is; a directory is walked for any `*.dSYM`
+/// bundle (a directory named `*.dSYM` with a `Contents/Resources/DWARF`
+/// subdirectory). Mirrors `sentry-cli debug-files upload`'s recursive scan, so
+/// a caller can point at an Xcode archive's `dSYMs/` folder (or a whole
+/// DerivedData tree) instead of enumerating bundles itself. De-duplicated.
+fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
+    fn is_dsym_bundle(p: &std::path::Path) -> bool {
+        p.is_dir()
+            && p.extension().and_then(|e| e.to_str()) == Some("dSYM")
+            && p.join("Contents").join("Resources").join("DWARF").is_dir()
+    }
+
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in paths {
+        // Explicit `.dSYM` bundle — trust it as-is (even if the DWARF subdir
+        // is missing, so the caller gets a clear identify error later rather
+        // than a silent skip).
+        if p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("dSYM") {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+            continue;
+        }
+        if !p.is_dir() {
+            tracing::warn!(path = %p.display(), "not a .dSYM bundle or a directory; skipping");
+            continue;
+        }
+        for entry in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+            let ep = entry.path();
+            if entry.file_type().is_dir() && is_dsym_bundle(ep) && seen.insert(ep.to_path_buf()) {
+                out.push(ep.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
 /// Run the upload for one or more pre-packaged native-debug-symbols archives.
 ///
 /// Phase 1 scope: each path must be a regular file (the AGP-produced
@@ -666,13 +705,18 @@ async fn run_sourcemap_upload(
     Ok(())
 }
 
-/// Pack and upload one or more Apple `.dSYM` bundles.
+/// Pack and upload Apple `.dSYM` bundles, discovered recursively.
 ///
-/// Phase 1 scope: each input path must be a `.dSYM` directory. Each bundle is
-/// independently identified (UUIDs per Mach-O slice extracted for logging),
-/// re-packed with the chosen compression strategy, and uploaded. The metadata
-/// POST carries ONLY `version` + `build` — server-side `images[].uuid`
-/// extraction matches BugseeAgent's wire protocol.
+/// Input paths are scanned for `.dSYM` bundles via [`discover_dsyms`] (an
+/// explicit `.dSYM` is taken as-is; a folder — e.g. an Xcode archive's
+/// `dSYMs/` — is walked), so the caller need not enumerate bundles itself
+/// (mirrors `sentry-cli debug-files upload`). Each bundle is independently
+/// identified (UUIDs per Mach-O slice extracted for logging), re-packed with
+/// the chosen compression strategy, and uploaded; an unreadable `.dSYM` is
+/// skipped with a warning rather than failing the run. The metadata POST
+/// carries ONLY `version` + `build` — server-side `images[].uuid` extraction
+/// matches BugseeAgent's wire protocol. (Pre-upload UUID dedup is a separate
+/// follow-up.)
 async fn run_dsym_upload(
     paths: &[PathBuf],
     endpoint: &str,
@@ -682,17 +726,18 @@ async fn run_dsym_upload(
     strategy: Strategy,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    if paths.is_empty() {
-        return Err(input_not_found("no input paths supplied"));
+    let candidates = discover_dsyms(paths);
+    if candidates.is_empty() {
+        return Err(input_not_found(format!(
+            "no .dSYM bundles found under: {}",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
     }
-    for p in paths {
-        if !p.is_dir() {
-            return Err(input_invalid(format!(
-                "--type dsym expects a `.dSYM` bundle (a directory); got {}",
-                p.display()
-            )));
-        }
-    }
+    tracing::info!(count = candidates.len(), "discovered dSYM bundles");
 
     let client = if dry_run {
         None
@@ -702,10 +747,18 @@ async fn run_dsym_upload(
 
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
-    for dsym_path in paths {
+    let mut skipped = 0u32;
+    for dsym_path in &candidates {
         tracing::info!(path = %dsym_path.display(), "processing dSYM bundle");
 
-        let identity = dsym::identify(dsym_path)?;
+        let identity = match dsym::identify(dsym_path) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(path = %dsym_path.display(), error = %e, "not a readable dSYM bundle; skipping");
+                skipped += 1;
+                continue;
+            }
+        };
         for slice in &identity.slices {
             tracing::info!(
                 uuid = %slice.uuid,
@@ -779,9 +832,9 @@ async fn run_dsym_upload(
     }
 
     if dry_run {
-        tracing::info!("dry-run complete");
+        tracing::info!(skipped, "dry-run complete");
     } else {
-        tracing::info!(uploaded, already_existed, "upload complete");
+        tracing::info!(uploaded, already_existed, skipped, "upload complete");
     }
     Ok(())
 }
@@ -994,5 +1047,89 @@ mod sourcemap_upload_tests {
         .await
         .unwrap_err();
         assert!(err.to_string().contains("no .map source-map files found"));
+    }
+}
+
+#[cfg(test)]
+mod dsym_discovery_tests {
+    use super::*;
+
+    /// Build a structurally-valid `.dSYM` skeleton under `dir`
+    /// (`<name>.dSYM/Contents/Resources/DWARF/<binary>`). discover_dsyms only
+    /// checks structure, not Mach-O validity, so a stub DWARF file suffices.
+    fn make_dsym(dir: &std::path::Path, name: &str) -> PathBuf {
+        let bundle = dir.join(format!("{name}.dSYM"));
+        let dwarf = bundle.join("Contents").join("Resources").join("DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join(name), b"\xcf\xfa\xed\xfe stub macho").unwrap();
+        bundle
+    }
+
+    fn names(found: &[PathBuf]) -> Vec<String> {
+        let mut v: Vec<String> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn discovers_bundles_recursively_in_a_folder() {
+        let tmp = tempfile::tempdir().unwrap();
+        make_dsym(tmp.path(), "App");
+        std::fs::create_dir_all(tmp.path().join("sub")).unwrap();
+        make_dsym(&tmp.path().join("sub"), "Framework");
+        // Noise: a non-.dSYM dir and a stray file are ignored.
+        std::fs::create_dir_all(tmp.path().join("NotADsym")).unwrap();
+        std::fs::write(tmp.path().join("readme.txt"), b"x").unwrap();
+
+        let found = discover_dsyms(&[tmp.path().to_path_buf()]);
+        assert_eq!(names(&found), vec!["App.dSYM", "Framework.dSYM"]);
+    }
+
+    #[test]
+    fn explicit_dsym_path_is_taken_as_is() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = make_dsym(tmp.path(), "Direct");
+        assert_eq!(discover_dsyms(std::slice::from_ref(&bundle)), vec![bundle]);
+    }
+
+    #[test]
+    fn explicit_dsym_without_dwarf_subdir_is_still_trusted() {
+        // A caller pointing at a specific (malformed) bundle should get a clear
+        // identify error later, not a silent skip — so discovery keeps it.
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("Empty.dSYM");
+        std::fs::create_dir_all(&bundle).unwrap();
+        assert_eq!(discover_dsyms(std::slice::from_ref(&bundle)), vec![bundle]);
+    }
+
+    #[test]
+    fn dir_named_dsym_without_dwarf_is_not_discovered_by_walk() {
+        // A `*.dSYM` directory found via a WALK must carry the DWARF subdir to
+        // count — avoids false positives on oddly-named folders.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("Bogus.dSYM")).unwrap();
+        make_dsym(tmp.path(), "Real");
+        let found = discover_dsyms(&[tmp.path().to_path_buf()]);
+        assert_eq!(names(&found), vec!["Real.dSYM"]);
+    }
+
+    #[test]
+    fn deduplicates_when_a_bundle_is_reachable_twice() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = make_dsym(tmp.path(), "Once");
+        // Pass both the containing folder (walk finds it) and the explicit bundle.
+        let found = discover_dsyms(&[tmp.path().to_path_buf(), bundle.clone()]);
+        assert_eq!(found.iter().filter(|p| **p == bundle).count(), 1);
+    }
+
+    #[test]
+    fn nonexistent_or_file_path_yields_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let f = tmp.path().join("a.txt");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(discover_dsyms(&[f, tmp.path().join("nope")]).is_empty());
     }
 }
