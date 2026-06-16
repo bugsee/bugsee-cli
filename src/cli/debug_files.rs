@@ -746,7 +746,12 @@ fn pack_dsym_bundle(
 /// matches BugseeAgent's wire protocol. (Pre-upload UUID dedup is a separate
 /// follow-up.)
 #[allow(clippy::too_many_arguments)]
-async fn run_dsym_upload(
+// Visible to the `xcode` post-action orchestrator (`crate::cli::xcode`)
+// so it can reuse the exact dSYM discovery + UUID-dedup + presigned PUT
+// path instead of duplicating it. Still routed through the
+// `debug-files upload --type dsym` subcommand for the standalone CLI
+// surface.
+pub(crate) async fn run_dsym_upload(
     paths: &[PathBuf],
     endpoint: &str,
     app_token: &str,

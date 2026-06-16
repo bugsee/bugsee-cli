@@ -8,6 +8,7 @@ pub mod pack;
 pub mod sourcemaps;
 pub mod upload;
 pub mod vcs_metadata;
+pub mod xcode;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -98,6 +99,14 @@ pub enum Command {
     /// `symbolic-debuginfo` Mach-O parser.
     #[command(subcommand)]
     Dsym(dsym::DsymCommand),
+
+    /// Xcode build-phase orchestration. `post-action` reads the Xcode build
+    /// environment (exported as env vars by a "Run Script" build phase) and
+    /// sequences the build-publish ops the CLI already owns — build-info
+    /// registration + bundle upload and dSYM upload — so the iOS SDK's
+    /// `tools.bundle/BugseeAgent` can delegate the whole flow to one command.
+    #[command(subcommand)]
+    Xcode(xcode::XcodeCommand),
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -110,5 +119,6 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::IosDeps(cmd) => ios_deps::dispatch(cmd),
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),
         Command::Dsym(cmd) => dsym::dispatch(cmd),
+        Command::Xcode(cmd) => xcode::dispatch(cmd, cli.endpoint, cli.app_token).await,
     }
 }
