@@ -1,0 +1,58 @@
+# Cross-platform end-to-end coverage of the JUST-BUILT (from-source) bugsee-cli
+# on every push/PR. Builds the debug binary on ubuntu/macOS/Windows and drives
+# it through every upload flow via the stdlib mock-server harness
+# (scripts/e2e_flows.py) — real HTTP round-trips, not dry-run.
+#
+# Complementary to windows-e2e.yml: that workflow is manual (workflow_dispatch)
+# and tests the PUBLISHED release binary from download.bugsee.com; this one tests
+# the current commit's source build on three OSes pre-merge. Different trigger,
+# different binary provenance — intentionally not merged.
+name: e2e
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: e2e-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  e2e:
+    name: e2e (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: target/debug/bugsee-cli
+            py: python3
+          - os: macos-latest
+            bin: target/debug/bugsee-cli
+            py: python3
+          - os: windows-latest
+            bin: target/debug/bugsee-cli.exe
+            py: python
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build the CLI (debug)
+        run: cargo build --bin bugsee-cli
+      - name: Run the e2e flow matrix (real mock-server uploads)
+        # git-bash is preinstalled on windows-latest, so one bash step with
+        # forward-slash paths works identically on all three OSes.
+        shell: bash
+        run: |
+          ${{ matrix.py }} --version
+          ${{ matrix.py }} scripts/e2e_flows.py --bin "${{ matrix.bin }}"
