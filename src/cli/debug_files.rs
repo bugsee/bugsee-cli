@@ -56,8 +56,10 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         zstd_level: Option<i64>,
 
-        /// Force a re-upload even if the server reports the file already exists.
-        /// (Server still dedupes by hash; this flag is reserved for future "skip cache" use.)
+        /// Force a re-upload even if the server already has the symbol. For
+        /// `--type dsym` this bypasses the pre-upload UUID dedup, re-packing and
+        /// re-uploading the bundle. (Other types dedup server-side by content
+        /// hash on the metadata POST.)
         #[arg(long)]
         force: bool,
 
@@ -117,7 +119,7 @@ pub async fn dispatch(
             icon,
             no_zstd,
             zstd_level,
-            force: _,
+            force,
             dry_run,
         } => {
             let kind = r#type.unwrap_or(DebugFileType::Proguard);
@@ -200,7 +202,7 @@ pub async fn dispatch(
 
             if kind == DebugFileType::Dsym {
                 return run_dsym_upload(
-                    &paths, &endpoint, &app_token, &version, &build, strategy, dry_run,
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
                 )
                 .await;
             }
@@ -344,6 +346,8 @@ async fn run_proguard_upload(
             build,
             hash: Some(&identity.content_sha1_hex),
             transform: None,
+            uuids: None,
+            overwrite: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
         let outcome = presigned::upload(
@@ -535,6 +539,8 @@ async fn run_elf_upload(
             build,
             hash: Some(&identity.content_sha1_hex),
             transform: Some("breakpad"),
+            uuids: None,
+            overwrite: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
         let outcome = presigned::upload(
@@ -674,6 +680,8 @@ async fn run_sourcemap_upload(
             build,
             hash: Some(&identity.content_sha1_hex),
             transform: None,
+            uuids: None,
+            overwrite: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
         let outcome = presigned::upload(
@@ -705,6 +713,26 @@ async fn run_sourcemap_upload(
     Ok(())
 }
 
+/// Pack a `.dSYM` bundle's entries into a temp zip with the chosen strategy.
+/// Returns the tempdir guard (keep it alive until the PUT finishes), the zip
+/// path, and the zip size. Called only once the server has confirmed it wants
+/// the bundle, so an already-uploaded dSYM is never read/compressed.
+fn pack_dsym_bundle(
+    dsym_path: &std::path::Path,
+    bundle_name: &str,
+    strategy: Strategy,
+) -> anyhow::Result<(tempfile::TempDir, PathBuf, u64)> {
+    let entries = dsym::enumerate_bundle_entries(dsym_path)?;
+    let zip_entries: Vec<ZipEntry<'_>> = entries
+        .iter()
+        .map(|(name, path)| ZipEntry::compressed(name.as_str(), path.as_path()))
+        .collect();
+    let tmpdir = tempfile::tempdir()?;
+    let zip_path = tmpdir.path().join(format!("{}.zip", bundle_name));
+    let zip_size = compress::pack_entries(&zip_entries, &zip_path, strategy)?;
+    Ok((tmpdir, zip_path, zip_size))
+}
+
 /// Pack and upload Apple `.dSYM` bundles, discovered recursively.
 ///
 /// Input paths are scanned for `.dSYM` bundles via [`discover_dsyms`] (an
@@ -717,6 +745,7 @@ async fn run_sourcemap_upload(
 /// carries ONLY `version` + `build` — server-side `images[].uuid` extraction
 /// matches BugseeAgent's wire protocol. (Pre-upload UUID dedup is a separate
 /// follow-up.)
+#[allow(clippy::too_many_arguments)]
 async fn run_dsym_upload(
     paths: &[PathBuf],
     endpoint: &str,
@@ -724,6 +753,7 @@ async fn run_dsym_upload(
     version: &str,
     build: &str,
     strategy: Strategy,
+    force: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let candidates = discover_dsyms(paths);
@@ -767,68 +797,67 @@ async fn run_dsym_upload(
             );
         }
 
-        let entries = dsym::enumerate_bundle_entries(dsym_path)?;
-        let zip_entries: Vec<ZipEntry<'_>> = entries
-            .iter()
-            .map(|(name, path)| ZipEntry::compressed(name.as_str(), path.as_path()))
-            .collect();
-
-        let tmpdir = tempfile::tempdir()?;
         let bundle_name = dsym_path
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("bundle.dSYM");
-        let zip_path = tmpdir.path().join(format!("{}.zip", bundle_name));
 
-        let zip_size = compress::pack_entries(&zip_entries, &zip_path, strategy)?;
-        tracing::info!(
-            zip_size,
-            entries = zip_entries.len(),
-            slices = identity.slices.len(),
-            ?strategy,
-            "packed",
-        );
-
-        if dry_run {
-            tracing::info!(
-                "dry-run: would POST metadata + PUT {} ({} bytes)",
-                zip_path.display(),
-                zip_size,
-            );
-            continue;
-        }
-
-        // dSYM metadata is intentionally minimal: only version + build.
-        // The worker extracts Mach-O UUIDs from the zip via
-        // `symbolic.debuginfo.Archive.iter_objects()` and stores one entry
-        // per arch slice in `images[]`.
+        // Declare the Mach-O slice UUIDs up front so the server can dedup
+        // BEFORE we pack and PUT (Sentry-style "skip already uploaded"). When
+        // every UUID is already present the server returns 16004 and we never
+        // read or compress the (possibly large) DWARF bytes. `--force` (->
+        // `overwrite`) bypasses the skip. After a real upload the worker
+        // re-extracts and reconciles the per-arch UUIDs from the bundle.
+        let slice_uuids: Vec<String> = identity.slices.iter().map(|s| s.uuid.to_string()).collect();
         let metadata = presigned::Metadata {
             uuid: None,
             version,
             build,
             hash: None,
             transform: None,
+            uuids: Some(&slice_uuids),
+            overwrite: if force { Some(true) } else { None },
         };
+
+        if dry_run {
+            // Pack to validate the bundle is well-formed; skip all network.
+            let (_guard, _zip, zip_size) = pack_dsym_bundle(dsym_path, bundle_name, strategy)?;
+            tracing::info!(
+                zip_size,
+                slices = slice_uuids.len(),
+                "dry-run: would POST metadata + PUT {}",
+                bundle_name,
+            );
+            continue;
+        }
+
         let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(
+        let presigned_url = match presigned::register(
             client,
             RetryPolicy::default(),
             endpoint,
             app_token,
             &metadata,
-            &zip_path,
         )
-        .await?;
-        match outcome {
-            presigned::Outcome::Uploaded => {
-                uploaded += 1;
-                tracing::info!(bundle = bundle_name, "uploaded");
-            }
-            presigned::Outcome::AlreadyExists => {
+        .await?
+        {
+            presigned::Registration::AlreadyExists => {
                 already_existed += 1;
-                tracing::info!(bundle = bundle_name, "already on server, skipped");
+                tracing::info!(
+                    bundle = bundle_name,
+                    "already on server, skipped (not packed)"
+                );
+                continue;
             }
-        }
+            presigned::Registration::Proceed { presigned_url } => presigned_url,
+        };
+
+        // The server wants it — only NOW pack the (possibly large) bundle.
+        let (_guard, zip_path, zip_size) = pack_dsym_bundle(dsym_path, bundle_name, strategy)?;
+        tracing::info!(zip_size, slices = slice_uuids.len(), ?strategy, "packed");
+        presigned::put_payload(client, RetryPolicy::default(), &presigned_url, &zip_path).await?;
+        uploaded += 1;
+        tracing::info!(bundle = bundle_name, "uploaded");
     }
 
     if dry_run {
