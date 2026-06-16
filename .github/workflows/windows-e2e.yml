@@ -1,0 +1,53 @@
+# Windows end-to-end smoke test for a PUBLISHED bugsee-cli release.
+# Runs the real x86_64-pc-windows-msvc binary (downloaded from
+# download.bugsee.com, the same URL production consumers use) through every
+# upload flow against an in-process mock server — proving the Windows binary's
+# subcommand dispatch, packing/zstd, and HTTP client path all work on a genuine
+# Windows host. Manual (workflow_dispatch) so it runs AFTER a release has been
+# mirrored to download.bugsee.com (the mirror step is itself manual), avoiding a
+# race with release.yml at tag time.
+name: Windows e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Published CLI version to e2e-test (no leading v), e.g. 0.3.0"
+        required: true
+        default: "0.3.0"
+
+permissions:
+  contents: read
+
+jobs:
+  windows-e2e:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download + verify the published Windows binary
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $v = "${{ inputs.version }}"
+          $base = "https://download.bugsee.com/cli/v$v"
+          Write-Host "Fetching $base/bugsee-cli-x86_64-pc-windows-msvc.zip"
+          Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip" -OutFile cli.zip
+          $expected = (Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip.sha256").Content.Trim().Split()[0].ToLower()
+          $actual = (Get-FileHash cli.zip -Algorithm SHA256).Hash.ToLower()
+          if ($actual -ne $expected) { throw "sha256 mismatch: expected $expected, got $actual" }
+          Write-Host "checksum OK: $actual"
+          Expand-Archive cli.zip -DestinationPath cli -Force
+          $exe = (Get-ChildItem -Recurse -Filter bugsee-cli.exe cli | Select-Object -First 1).FullName
+          if (-not $exe) { throw "bugsee-cli.exe not found in the archive" }
+          "CLI_EXE=$exe" | Out-File -FilePath $env:GITHUB_ENV -Append
+          $reported = (& $exe --version).Trim()
+          Write-Host "reported: $reported"
+          if ($reported -ne "bugsee-cli $v") { throw "version mismatch: '$reported' != 'bugsee-cli $v'" }
+
+      - name: Run the e2e flow matrix (real mock-server uploads)
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          python --version
+          python scripts/e2e_flows.py --bin "$env:CLI_EXE"
