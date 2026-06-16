@@ -45,10 +45,12 @@ use std::path::{Path, PathBuf};
 use clap::Subcommand;
 use serde_json::{json, Map, Value};
 
-use crate::cli::{build_env, debug_files, ios_deps, vcs_metadata};
+use crate::cli::{
+    build_env, debug_files, ios_deps, size_check, vcs_metadata, xcactivitylog, xcode_ipa,
+};
 use crate::compress::Strategy;
-use crate::error::config_invalid;
-use crate::upload::build_info::{self, Entry, Params};
+use crate::error::{config_invalid, Error};
+use crate::upload::build;
 use crate::upload::http::RetryPolicy;
 
 const DEFAULT_ENDPOINT: &str = "https://api.bugsee.com";
@@ -65,17 +67,61 @@ const DEPS_COLLECTION_SCOPE: &str = "all";
 /// Deps blob `schema_version` — the agent's `_DEPS_SCHEMA_VERSION`.
 const DEPS_SCHEMA_VERSION: i64 = 1;
 
+/// The `post-action` flow is configured almost entirely through environment
+/// variables (Xcode exports build settings as env vars, and the BUGSEE_* knobs
+/// ride alongside them), so they belong in `--help` even though they aren't
+/// clap flags. Truthy values everywhere: `1`, `true`, `yes`, `on` (case-insensitive).
+const POST_ACTION_ENV_HELP: &str = "\
+Environment variables (read from the Xcode build-phase environment):
+
+Gating (whether the post-action does anything):
+  BUGSEE_BUILD_INFO_ENABLED             Master switch for the whole flow [default: on].
+  BUGSEE_BUILD_INFO_ALL_ACTIONS         Also run on plain Build actions, not just Archive [default: off].
+  BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS  Run for non-Release configurations too [default: off → Release-only].
+
+Collection opt-outs:
+  BUGSEE_DEPENDENCIES_ENABLED           Collect the dependency graph [default: on].
+  BUGSEE_BUILD_INFO_TIMINGS_ENABLED     Decode build timings from .xcactivitylog [default: on].
+
+Artefact upload (size analysis):
+  BUGSEE_SIZE_ANALYSIS_ENABLED          Upload the packaged .ipa for server-side size analysis [default: off].
+  BUGSEE_CHUNKED_UPLOAD                 Use the chunked transport for the artefact [default: off].
+
+Size-check build gate (deliberately fails the build; only with --force-foreground):
+  BUGSEE_SIZE_CHECK_ENABLED             Enable the in-build size-growth check [default: off].
+  BUGSEE_SIZE_CHECK_WARNING_PCT         Warn if the .ipa grew >= this percent vs the previous build.
+  BUGSEE_SIZE_CHECK_FAIL_PCT            Fail (exit 40) if it grew >= this percent.
+  BUGSEE_SIZE_CHECK_WARNING_BYTES       Warn if it grew >= this many bytes.
+  BUGSEE_SIZE_CHECK_FAIL_BYTES          Fail (exit 40) if it grew >= this many bytes.
+
+The app token and endpoint come from --app-token / --endpoint (or BUGSEE_APP_TOKEN /
+BUGSEE_ENDPOINT). In background mode the daemon's log goes to $PROJECT_TEMP_DIR/bugsee-cli.log.";
+
 /// `bugsee-cli xcode` argument shape.
 #[derive(Subcommand, Debug)]
 pub enum XcodeCommand {
-    /// Run the build-publish flow from an Xcode post-action build phase.
+    /// Run the iOS build-publish flow from an Xcode Run-Script post-action (backgrounded by default).
     ///
     /// Reads the Xcode build settings from the process environment, gates on
     /// the `BUGSEE_BUILD_INFO_*` flags (Release-only by default), and — when
     /// admitted — registers the build, uploads the build-info bundle, and
     /// uploads dSYMs. A no-op (exit 0) when gated out: this runs as a
     /// post-action and must never fail an already-signed build.
-    PostAction,
+    ///
+    /// Runs in the BACKGROUND by default (double-forks into a detached daemon so
+    /// the archive returns immediately; its output goes to
+    /// `$PROJECT_TEMP_DIR/bugsee-cli.log`). Pass `--force-foreground` to run
+    /// synchronously instead — the only mode in which a size-check FAIL can
+    /// deliberately fail the build (exit 40).
+    #[command(after_long_help = POST_ACTION_ENV_HELP)]
+    PostAction {
+        /// Run synchronously in the foreground instead of detaching into a
+        /// background daemon. Required for CI gating: a size-check FAIL only
+        /// propagates its non-zero exit when foregrounded. (Mirrors
+        /// `sentry-cli debug-files upload --force-foreground`.)
+        #[arg(long)]
+        force_foreground: bool,
+    },
 }
 
 /// CLI dispatch. The app token comes from the global `--app-token` /
@@ -86,7 +132,10 @@ pub async fn dispatch(
     app_token: Option<String>,
 ) -> anyhow::Result<()> {
     match cmd {
-        XcodeCommand::PostAction => {
+        // `force_foreground` is consumed by `main` (it decides whether to
+        // daemonize BEFORE the async runtime starts); by the time dispatch runs
+        // the decision is already made, so it's irrelevant here.
+        XcodeCommand::PostAction { .. } => {
             let env: HashMap<String, String> = std::env::vars().collect();
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
@@ -375,6 +424,7 @@ fn deps_blob(entries: &[ios_deps::DepEntry], truncated: bool, scope: &str) -> Va
 /// crash-join value and would only confuse the dashboard). The build record
 /// is still useful via `package_id` + `version` + `build`.
 /// TODO(phase 2): extract the main executable LC_UUID and set `uuid`.
+#[allow(clippy::too_many_arguments)]
 fn build_registration_payload(
     env: &HashMap<String, String>,
     bundle: &BundleInfo,
@@ -382,8 +432,17 @@ fn build_registration_payload(
     machine: Option<&str>,
     xcode_version: Option<&str>,
     deps_summary_value: Option<Value>,
+    timings_summary: Option<Value>,
+    build_uuid: &str,
+    artifact_size: u64,
+    request_artifact_upload: bool,
 ) -> Value {
     let mut payload = Map::new();
+
+    // `uuid` — the main executable's Mach-O `LC_UUID` (or a random fallback).
+    // The iOS SDK reports the same `LC_UUID` with every crash, so this is the
+    // crash↔build join key. Always present so a build record is joinable.
+    payload.insert("uuid".into(), Value::String(build_uuid.to_string()));
 
     // `format` — the artefact format. The agent always sends `"ipa"` (iOS);
     // pin it here too so the back-end groups iOS builds identically.
@@ -407,9 +466,20 @@ fn build_registration_payload(
         );
     }
 
-    // Phase 1 never ships artefact bytes.
-    // TODO(phase 2): set request_artifact_upload from BUGSEE_SIZE_ANALYSIS_ENABLED.
-    payload.insert("request_artifact_upload".into(), Value::Bool(false));
+    // `artifact_size` — the packaged `.ipa` byte size. The server stores it as
+    // the build's size and uses it as the next build's size-check baseline.
+    // Omitted when packaging failed (size 0).
+    if artifact_size > 0 {
+        payload.insert("artifact_size".into(), Value::from(artifact_size));
+    }
+
+    // `request_artifact_upload` — whether the server should sign an artefact
+    // endpoint. Set from `BUGSEE_SIZE_ANALYSIS_ENABLED` (opt-in). `build::run`
+    // re-asserts this same flag, so the two never disagree.
+    payload.insert(
+        "request_artifact_upload".into(),
+        Value::Bool(request_artifact_upload),
+    );
 
     // VCS block — nested under `vcs`, omitted when the resolver produced no
     // fields so the server distinguishes "unknown" cleanly. `VcsMetadata`
@@ -446,7 +516,12 @@ fn build_registration_payload(
             Value::String(sdk_name.to_string()),
         );
     }
-    // TODO(phase 2): build_metadata.timings (from .xcactivitylog decode).
+    // `build_metadata.timings` — the inline build-timings summary decoded from
+    // the `.xcactivitylog` (total_ms, top_tasks, per-category `<bucket>_ms`).
+    // Omitted when no log / no timings were extractable.
+    if let Some(timings) = timings_summary {
+        metadata.insert("timings".into(), timings);
+    }
     if !metadata.is_empty() {
         payload.insert("build_metadata".into(), Value::Object(metadata));
     }
@@ -474,20 +549,70 @@ fn plugin_version() -> &'static str {
 
 // ─── Orchestration ──────────────────────────────────────────────────
 
-/// Run the Phase-1 post-action flow. Returns `Ok(())` for both the
-/// "ran the flow" and the "gated out / soft-failed" cases — this is a
-/// post-action and must never fail an already-signed build. Only a hard
-/// config error (no app token when one is required) returns `Err`.
+/// Per-step OUTCOME of a post-action run, emitted as one JSON line on stdout so
+/// a delegating bootstrapper (the iOS BugseeAgent) can write its cross-producer
+/// handshake manifest accurately — `artifact_uploaded` in particular must
+/// reflect whether bytes actually shipped, not mere intent.
+#[derive(Debug, Clone, serde::Serialize)]
+pub(crate) struct PostActionReport {
+    pub build_registered: bool,
+    pub artifact_uploaded: bool,
+    pub dsym_uploaded: bool,
+    pub deps_collected: bool,
+    pub timings: bool,
+    pub size_analysis: bool,
+    /// `"pass"` / `"warn"` / `"fail"` / `"skip"`.
+    pub size_check: &'static str,
+    /// The `error:`-ready gate line when `size_check == "fail"`. Internal: not
+    /// serialized into the stdout report.
+    #[serde(skip)]
+    pub size_check_fail_line: Option<String>,
+}
+
+/// Run the post-action flow. A thin wrapper over [`run_post_action_inner`]: it
+/// emits the JSON result report on stdout and maps a size-check FAIL to the
+/// terminal `ExitCode::SizeCheckFailed`. Returns `Ok(())` for both the "ran" and
+/// the "gated out / soft-failed" cases — a post-action must never fail an
+/// already-signed build — except for a hard config error (no app token) or a
+/// deliberate size-check FAIL.
 async fn run_post_action(
     env: &HashMap<String, String>,
     endpoint: &str,
     app_token: Option<&str>,
 ) -> anyhow::Result<()> {
+    let report = match run_post_action_inner(env, endpoint, app_token).await? {
+        Some(r) => r,
+        // Gated out / no .app — nothing ran, so no report is emitted.
+        None => return Ok(()),
+    };
+
+    // Machine-readable result line on STDOUT — the ONLY thing this command writes
+    // to stdout (tracing goes to stderr). In the background daemon there is no
+    // stdout reader, so it lands in the log harmlessly.
+    println!("{}", serde_json::to_string(&report)?);
+
+    // The one place the post-action deliberately fails the build.
+    if let Some(line) = report.size_check_fail_line {
+        return Err(Error::SizeCheckFailed(line).into());
+    }
+    Ok(())
+}
+
+/// The post-action orchestration. Returns `Ok(Some(report))` after a full run,
+/// `Ok(None)` when gated out / no `.app` was found, or `Err` only for a hard
+/// config error. Never emits the stdout report or the size-check Err itself —
+/// that is the caller's ([`run_post_action`]) job, which keeps this body
+/// testable in-process.
+async fn run_post_action_inner(
+    env: &HashMap<String, String>,
+    endpoint: &str,
+    app_token: Option<&str>,
+) -> anyhow::Result<Option<PostActionReport>> {
     // 1+2. Gate.
     match should_run(env) {
         Gate::Skip(reason) => {
             tracing::info!("Bugsee: {reason}. Skipping build-info upload.");
-            return Ok(());
+            return Ok(None);
         }
         Gate::Run => {}
     }
@@ -510,7 +635,7 @@ async fn run_post_action(
                 target_build_dir = trimmed(env, "TARGET_BUILD_DIR"),
                 "Bugsee: no .app found. Skipping build-info upload."
             );
-            return Ok(());
+            return Ok(None);
         }
     };
     tracing::info!(app = %app_path.display(), "Bugsee: located .app");
@@ -529,106 +654,266 @@ async fn run_post_action(
     let machine = build_env::resolve_machine_label(env);
     let xcode_version = build_env::resolve_xcode_version();
 
-    // 6. Collect deps. Project root from PROJECT_DIR / SRCROOT / SOURCE_ROOT,
-    // mirroring the agent's `_collect_dependencies_impl`.
-    let deps_root = env
-        .get("PROJECT_DIR")
-        .or_else(|| env.get("SRCROOT"))
-        .or_else(|| env.get("SOURCE_ROOT"))
-        .filter(|s| !s.trim().is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    // Resolve the product binary so the vendored-framework scan runs (the
-    // agent passes `--product-binary`). Best-effort: only the Build-dir path
-    // exposes `EXECUTABLE_NAME`.
-    let product_binary = resolve_product_binary(env);
-    let collected = ios_deps::collect(&deps_root, product_binary.as_deref(), DEPS_MAX_COUNT);
-    let scope = if collected.scope_label.is_empty() {
-        DEPS_COLLECTION_SCOPE
-    } else {
-        collected.scope_label.as_str()
-    };
-
-    // A temp dir holds the payload + dependencies.json for the build-info run.
+    // A temp dir holds the payload + the deps/timings sidecars + the packaged
+    // .ipa for the build registration.
     let tmpdir = tempfile::tempdir()?;
 
-    let mut entries: Vec<Entry> = Vec::new();
-    let deps_summary_value = if collected.entries.is_empty() {
-        None
+    // 6. Collect deps — opt-out via `BUGSEE_DEPENDENCIES_ENABLED` (default on),
+    // mirroring the agent's gate so privacy-conscious shops can disable it.
+    // Stages dependencies.json (RAW compact JSON; `build::run` zstd-compresses it
+    // into the build-info bundle, and the worker re-gzips each entry internally).
+    let mut deps_path: Option<PathBuf> = None;
+    let mut deps_summary_value: Option<Value> = None;
+    if env_truthy_default_true(env.get("BUGSEE_DEPENDENCIES_ENABLED")) {
+        // Project root from PROJECT_DIR / SRCROOT / SOURCE_ROOT, mirroring the
+        // agent's `_collect_dependencies_impl`.
+        let deps_root = env
+            .get("PROJECT_DIR")
+            .or_else(|| env.get("SRCROOT"))
+            .or_else(|| env.get("SOURCE_ROOT"))
+            .filter(|s| !s.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+        // Resolve the product binary so the vendored-framework scan runs (the
+        // agent passes `--product-binary`). Best-effort: only the Build-dir path
+        // exposes `EXECUTABLE_NAME`.
+        let product_binary = resolve_product_binary(env);
+        let collected = ios_deps::collect(&deps_root, product_binary.as_deref(), DEPS_MAX_COUNT);
+        if !collected.entries.is_empty() {
+            let scope = if collected.scope_label.is_empty() {
+                DEPS_COLLECTION_SCOPE
+            } else {
+                collected.scope_label.as_str()
+            };
+            let collected_at = iso8601_now();
+            let summary = deps_summary(
+                &collected.entries,
+                collected.truncated,
+                scope,
+                &collected_at,
+            );
+            let blob = deps_blob(&collected.entries, collected.truncated, scope);
+            let path = tmpdir.path().join("dependencies.json");
+            // Compact JSON (no whitespace) — matches the agent's `_deps_blob_gz`
+            // `separators=(',', ':')`.
+            std::fs::write(&path, serde_json::to_vec(&blob)?)?;
+            deps_path = Some(path);
+            deps_summary_value = Some(summary);
+        }
     } else {
-        let collected_at = iso8601_now();
-        let summary = deps_summary(
-            &collected.entries,
-            collected.truncated,
-            scope,
-            &collected_at,
-        );
-        let blob = deps_blob(&collected.entries, collected.truncated, scope);
-        let deps_path = tmpdir.path().join("dependencies.json");
-        // Compact JSON (no whitespace) — matches the agent's `_deps_blob_gz`
-        // `separators=(',', ':')`.
-        std::fs::write(&deps_path, serde_json::to_vec(&blob)?)?;
-        entries.push(Entry {
-            name: "dependencies.json".into(),
-            source: deps_path,
-        });
-        Some(summary)
+        tracing::info!("Bugsee: dependency collection disabled (BUGSEE_DEPENDENCIES_ENABLED).");
+    }
+
+    // 6b. Decode build timings from the newest `.xcactivitylog` ($OBJROOT →
+    // DerivedData Logs/Build) — opt-out via `BUGSEE_BUILD_INFO_TIMINGS_ENABLED`
+    // (default on), mirroring the agent's gate. The inline summary rides in
+    // `build_metadata.timings`; the per-target Gantt DETAIL blob becomes a RAW
+    // `timings.json` sidecar. Never fails — a malformed log degrades to no
+    // timings.
+    let timings = if env_truthy_default_true(env.get("BUGSEE_BUILD_INFO_TIMINGS_ENABLED")) {
+        xcactivitylog::resolve(env)
+    } else {
+        tracing::info!("Bugsee: build-timings disabled (BUGSEE_BUILD_INFO_TIMINGS_ENABLED).");
+        xcactivitylog::BuildTimings::default()
     };
-
-    // TODO(phase 2): collect build timings and push a `timings.json` Entry.
-
-    // 7. Register + upload the build-info bundle (self-contained). When there
-    // are no sidecars, there is nothing to bundle — register-only is a
-    // Phase-2 concern (it requires the artefact path), so for now we log and
-    // fall through to the dSYM step. `build_info::run` errors on empty
-    // entries, so we must guard.
-    if entries.is_empty() {
-        tracing::info!(
-            "Bugsee: no dependencies collected — nothing to bundle for build-info. \
-             Skipping build-info upload (the build record is registered by the \
-             artefact-upload path in a later phase)."
-        );
-        // TODO(phase 2): register the build even with no sidecars (via the
-        // artefact-upload path) so a build record always lands.
-    } else {
-        let payload = build_registration_payload(
-            env,
-            &bundle,
-            &vcs,
-            machine.as_deref(),
-            xcode_version.as_deref(),
-            deps_summary_value,
-        );
-        let payload_path = tmpdir.path().join("payload.json");
-        std::fs::write(&payload_path, serde_json::to_vec(&payload)?)?;
-
-        let params = Params {
-            endpoint,
-            app_token: Some(app_token),
-            payload_json: Some(&payload_path),
-            upload_url: None,
-            entries: &entries,
-            strategy: Strategy::default(),
-            out: None,
-            dry_run: false,
-        };
-        // Soft-fail: a single upload hiccup must not fail the build. Log and
-        // continue to the dSYM step, exactly as the agent does.
-        match build_info::run(params, RetryPolicy::default()).await {
-            Ok(outcome) => {
-                tracing::info!(?outcome, "Bugsee: build-info bundle uploaded");
-            }
+    let timings_summary = timings.summary;
+    let mut timings_path: Option<PathBuf> = None;
+    if let Some(timeline) = &timings.timeline {
+        let path = tmpdir.path().join("timings.json");
+        match serde_json::to_vec(timeline) {
+            Ok(bytes) => match std::fs::write(&path, bytes) {
+                Ok(()) => timings_path = Some(path),
+                Err(e) => {
+                    tracing::warn!(error = %e, "Bugsee: failed to stage timings.json (continuing)");
+                }
+            },
             Err(e) => {
-                tracing::warn!(error = %e, "Bugsee: build-info upload failed (continuing)");
+                tracing::warn!(error = %e, "Bugsee: failed to serialize timings blob (continuing)");
             }
         }
     }
 
+    // 6c. Package the `.app` into a synthetic `.ipa` (always — the size feeds
+    // the build record + the size-check baseline). Size-analysis (opt-in)
+    // controls whether the bytes are also SHIPPED; packaging happens regardless.
+    let size_analysis_enabled = env_truthy(env.get("BUGSEE_SIZE_ANALYSIS_ENABLED"));
+    let ipa_path = tmpdir
+        .path()
+        .join(format!("{}.ipa", ipa_stem(&app_path, &bundle)));
+    let (artifact_size, packaged) = match xcode_ipa::package_app_as_ipa(&app_path, &ipa_path) {
+        Ok(()) => {
+            let size = std::fs::metadata(&ipa_path).map(|m| m.len()).unwrap_or(0);
+            tracing::info!(artifact_size = size, "Bugsee: packaged synthetic .ipa");
+            (size, true)
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                size_analysis_requested = size_analysis_enabled,
+                "Bugsee: .ipa packaging failed — registering the build without an \
+                 artefact (bytes will NOT ship even if size-analysis was requested)"
+            );
+            (0, false)
+        }
+    };
+    // Only ship bytes when size-analysis is on AND we actually packaged.
+    let request_artifact_upload = size_analysis_enabled && packaged;
+    // Chunked artefact transport is opt-in and only meaningful when shipping.
+    let chunked = request_artifact_upload && env_truthy(env.get("BUGSEE_CHUNKED_UPLOAD"));
+
+    // Main-executable `LC_UUID` — the crash↔build join key. A random fallback
+    // guarantees the build record always carries SOME uuid (just not joinable).
+    let build_uuid = xcode_ipa::main_executable_uuid(&app_path)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+
+    // 6d. Fetch the size-check baseline BEFORE registering — the lookup must not
+    // pick up the in-flight build as its own baseline. Returns None for every
+    // skip condition (master switch off, no thresholds, no package_id, first
+    // build, infra error); the actual comparison runs LAST (after dSYMs) so a
+    // size FAIL never blocks symbol upload.
+    let config = trimmed(env, "CONFIGURATION");
+    let size_check_prep = size_check::prepare(
+        env,
+        endpoint,
+        app_token,
+        bundle.package_id.as_deref(),
+        config,
+    )
+    .await;
+
+    // 7. Register the build (always) and — when size-analysis is on — ship the
+    // artefact. The build-info bundle (deps/timings) rides the SAME
+    // registration. `build::run` registers even with no sidecars and no
+    // artefact, so a build record ALWAYS lands (closing the no-deps gap).
+    let payload = build_registration_payload(
+        env,
+        &bundle,
+        &vcs,
+        machine.as_deref(),
+        xcode_version.as_deref(),
+        deps_summary_value,
+        timings_summary,
+        &build_uuid,
+        artifact_size,
+        request_artifact_upload,
+    );
+    let payload_path = tmpdir.path().join("payload.json");
+    std::fs::write(&payload_path, serde_json::to_vec(&payload)?)?;
+
+    let params = build::Params {
+        endpoint,
+        app_token,
+        payload_json: &payload_path,
+        artifact: &ipa_path,
+        request_artifact_upload,
+        mapping: None,
+        deps: deps_path.as_deref(),
+        timings: timings_path.as_deref(),
+        strategy: Strategy::default(),
+        chunked,
+        dry_run: false,
+        out: None,
+    };
+    // Soft-fail: a single upload hiccup must not fail the build. Log and
+    // continue to the dSYM step, exactly as the agent does. `build_registered`
+    // tracks the OUTCOME (did the POST + any artefact PUT succeed) for the
+    // result report.
+    let build_registered = match build::run(params, RetryPolicy::default()).await {
+        Ok(outcome) => {
+            tracing::info!(
+                ?outcome,
+                request_artifact_upload,
+                "Bugsee: build registered"
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "Bugsee: build registration/upload failed (continuing)");
+            false
+        }
+    };
+    // Bytes actually shipped only when we requested it AND the run succeeded.
+    let artifact_uploaded = request_artifact_upload && build_registered;
+    let deps_collected = deps_path.is_some();
+    let timings_collected = timings_path.is_some();
+
     // 8. Discover + upload dSYMs. The folder is `$DWARF_DSYM_FOLDER_PATH`
     // (every Run-Script env carries it) or, for an archive, `<archive>/dSYMs`.
-    upload_dsyms(env, endpoint, app_token, &bundle).await;
+    let dsym_uploaded = upload_dsyms(env, endpoint, app_token, &bundle).await;
 
-    Ok(())
+    // 9. In-build size-check evaluation (LAST, so a FAIL doesn't skip any
+    // upload). PASS/WARN print a line and continue; FAIL is recorded on the
+    // report and turned into `ExitCode::SizeCheckFailed` by the caller — the one
+    // place the post-action deliberately fails the build. Skipped when packaging
+    // failed (no real local size to compare).
+    let mut size_check = "skip";
+    let mut size_check_fail_line: Option<String> = None;
+    if let Some(prep) = size_check_prep.filter(|_| packaged) {
+        let (verdict, line) = prep.decide(artifact_size);
+        match verdict {
+            size_check::Verdict::Pass => {
+                size_check = "pass";
+                eprintln!("{line}"); // stderr → visible in Xcode's Run-Script log
+            }
+            size_check::Verdict::Warn => {
+                size_check = "warn";
+                eprintln!("{line}");
+            }
+            size_check::Verdict::Fail => {
+                size_check = "fail";
+                size_check_fail_line = Some(line);
+            }
+        }
+    }
+
+    Ok(Some(PostActionReport {
+        build_registered,
+        artifact_uploaded,
+        dsym_uploaded,
+        deps_collected,
+        timings: timings_collected,
+        size_analysis: size_analysis_enabled,
+        size_check,
+        size_check_fail_line,
+    }))
+}
+
+/// A filesystem-safe `.ipa` filename stem: the bundle id (reverse-DNS) when
+/// present, else the `.app`'s basename. Any char outside `[A-Za-z0-9._-]`
+/// becomes `_` so a malformed Info.plist can't smuggle path-traversal into the
+/// temp filename. Mirrors the agent's `safe_stem` derivation.
+fn ipa_stem(app_path: &Path, bundle: &BundleInfo) -> String {
+    let raw = bundle
+        .package_id
+        .as_deref()
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| {
+            app_path
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        });
+    // Drop any directory component first (basename), then whitelist-sanitize.
+    let base = Path::new(&raw)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or(raw);
+    let sanitized: String = base
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if sanitized.is_empty() {
+        "build".to_string()
+    } else {
+        sanitized
+    }
 }
 
 /// Resolve the linked product binary (`<app>/EXECUTABLE_NAME`) for the
@@ -645,18 +930,20 @@ fn resolve_product_binary(env: &HashMap<String, String>) -> Option<PathBuf> {
 }
 
 /// Discover the dSYM folder and run the reusable upload path. Soft-fails: a
-/// missing folder or an upload error logs and returns — never fails the build.
+/// missing folder or an upload error logs and returns `false` — never fails the
+/// build. Returns `true` only when the upload completed (used by the result
+/// report a delegating bootstrapper reads).
 async fn upload_dsyms(
     env: &HashMap<String, String>,
     endpoint: &str,
     app_token: &str,
     bundle: &BundleInfo,
-) {
+) -> bool {
     let folder = match resolve_dsym_folder(env) {
         Some(f) => f,
         None => {
             tracing::info!("Bugsee: no dSYM folder found (DWARF_DSYM_FOLDER_PATH / archive dSYMs). Skipping dSYM upload.");
-            return;
+            return false;
         }
     };
     tracing::info!(folder = %folder.display(), "Bugsee: uploading dSYMs");
@@ -679,11 +966,15 @@ async fn upload_dsyms(
     )
     .await
     {
-        Ok(()) => tracing::info!("Bugsee: dSYM upload complete"),
+        Ok(()) => {
+            tracing::info!("Bugsee: dSYM upload complete");
+            true
+        }
         Err(e) => {
             // Includes the "no .dSYM bundles found" case — a soft skip here,
             // not a build failure.
             tracing::warn!(error = %e, "Bugsee: dSYM upload skipped/failed (continuing)");
+            false
         }
     }
 }
@@ -1164,6 +1455,11 @@ mod tests {
         ];
         let summary = deps_summary(&entries, false, "all", "2026-06-16T00:00:00Z");
 
+        let timings = serde_json::json!({
+            "total_ms": 12345,
+            "native_ms": 9000,
+            "top_tasks": [{ "name": "Alpha", "duration_ms": 4000 }],
+        });
         let payload = build_registration_payload(
             &env,
             &bundle,
@@ -1171,10 +1467,20 @@ mod tests {
             Some("github-actions:runner-1"),
             Some("16.2"),
             Some(summary),
+            Some(timings),
+            "0123456789abcdef0123456789abcdef",
+            4096,
+            true,
         );
         let obj = payload.as_object().unwrap();
 
         assert_eq!(obj.get("format").and_then(Value::as_str), Some("ipa"));
+        // uuid (crash↔build join key) + artifact_size are present.
+        assert_eq!(
+            obj.get("uuid").and_then(Value::as_str),
+            Some("0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(obj.get("artifact_size").and_then(Value::as_u64), Some(4096));
         assert_eq!(
             obj.get("package_id").and_then(Value::as_str),
             Some("com.example.app")
@@ -1185,9 +1491,10 @@ mod tests {
             obj.get("build_configuration").and_then(Value::as_str),
             Some("Release")
         );
+        // request_artifact_upload reflects the flag we passed (size-analysis on).
         assert_eq!(
             obj.get("request_artifact_upload").and_then(Value::as_bool),
-            Some(false)
+            Some(true)
         );
         assert_eq!(
             obj.get("request_dependencies_upload")
@@ -1229,6 +1536,19 @@ mod tests {
             .and_then(Value::as_str)
             .unwrap()
             .starts_with("bugsee-cli/"));
+
+        // build_metadata.timings — the inline build-timings summary, nested
+        // under build_metadata (not at the payload root).
+        let timings = meta.get("timings").and_then(Value::as_object).unwrap();
+        assert_eq!(timings.get("total_ms").and_then(Value::as_i64), Some(12345));
+        assert_eq!(timings.get("native_ms").and_then(Value::as_i64), Some(9000));
+        assert_eq!(
+            timings
+                .get("top_tasks")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(1)
+        );
 
         // dependencies_summary.
         let dsum = obj
@@ -1275,7 +1595,8 @@ mod tests {
             build: None,
         };
         let vcs = vcs_metadata::VcsMetadata::default();
-        let payload = build_registration_payload(&env, &bundle, &vcs, None, None, None);
+        let payload =
+            build_registration_payload(&env, &bundle, &vcs, None, None, None, None, "ff", 0, false);
         let obj = payload.as_object().unwrap();
         assert!(!obj.contains_key("vcs"), "empty vcs must be omitted");
         // No deps summary passed → keys absent.
@@ -1406,6 +1727,619 @@ mod tests {
             "deps blob should list the pod: {content}"
         );
         assert!(content.contains("\"schema_version\":1"));
+    }
+
+    /// When `$OBJROOT` resolves to a DerivedData tree with a build log, the
+    /// post-action decodes timings: the bundle gains a RAW `timings.json` entry
+    /// and the registration POST carries `build_metadata.timings`. Here there is
+    /// NO Podfile.lock, so timings is the SOLE sidecar — proving timings alone
+    /// makes the bundle non-empty and registers the build.
+    #[tokio::test]
+    async fn post_action_decodes_and_bundles_timings() {
+        use crate::cli::xcactivitylog::fixtures;
+
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Archive layout with an Info.plist.
+        let archive = root.join("App.xcarchive");
+        let app = archive
+            .join("Products")
+            .join("Applications")
+            .join("MyApp.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.example.myapp</string>
+  <key>CFBundleShortVersionString</key><string>3.0.0</string>
+  <key>CFBundleVersion</key><string>300</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+
+        // DerivedData tree with a synthetic build log. `$OBJROOT` is a deep
+        // descendant so `find_derived_data_root` walks up to `<dd>`.
+        let dd = root.join("DerivedData").join("MyApp-abc");
+        let logs_build = dd.join("Logs").join("Build");
+        std::fs::create_dir_all(&logs_build).unwrap();
+        fixtures::write_synthetic_log(
+            &logs_build,
+            &[("Ld Alpha", fixtures::T0, fixtures::T0 + 2.0)], // packaging, 2000ms
+            &[("Build target Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+        );
+        let obj_root = dd
+            .join("Build")
+            .join("Intermediates.noindex")
+            .join("ArchiveIntermediates")
+            .join("MyApp")
+            .join("IntermediateBuildFilesPath");
+        std::fs::create_dir_all(&obj_root).unwrap();
+
+        // SRCROOT with no Podfile.lock → deps empty → timings is the sole entry.
+        let srcroot = root.join("src");
+        std::fs::create_dir_all(&srcroot).unwrap();
+        let dsym_dir = root.join("dSYMs");
+        std::fs::create_dir_all(&dsym_dir).unwrap();
+
+        let put_url = format!("{}/build-info-put", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .and(body_partial_json(json!({
+                "request_build_info_upload": true,
+                "build_metadata": { "timings": { "total_ms": 2000, "packaging_ms": 2000 } },
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build_id": "b1", "build_info_upload_endpoint": put_url }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/build-info-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("OBJROOT", obj_root.to_str().unwrap()),
+            ("SDK_NAME", "iphoneos18.5"),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+        ]);
+
+        let endpoint = server.uri();
+        run_post_action(&env, &endpoint, Some("TKN"))
+            .await
+            .expect("post-action should succeed");
+
+        // The bundle's sole entry is a RAW timings.json (the Gantt blob).
+        let received = server.received_requests().await.unwrap();
+        let put = received
+            .iter()
+            .find(|r| r.url.path() == "/build-info-put")
+            .expect("a PUT to the presigned URL");
+        let mut archive_zip = ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
+        let names: Vec<String> = (0..archive_zip.len())
+            .map(|i| archive_zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert_eq!(names, vec!["timings.json"]);
+        let mut content = String::new();
+        archive_zip
+            .by_name("timings.json")
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        // RAW (un-gzipped) compact JSON — the worker re-gzips internally.
+        assert!(content.contains("\"schema_version\":1"));
+        assert!(content.contains("\"category\":\"packaging\""));
+        assert!(content.contains("Alpha"));
+    }
+
+    /// With `BUGSEE_SIZE_ANALYSIS_ENABLED=1`, the post-action packages the `.app`
+    /// into a synthetic `.ipa`, registers with `request_artifact_upload: true`,
+    /// PUTs the artefact ZIP (a STORED `.ipa`), AND ships the build-info bundle —
+    /// all from one registration.
+    #[tokio::test]
+    async fn post_action_size_analysis_ships_ipa() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        let archive = root.join("App.xcarchive");
+        let app = archive
+            .join("Products")
+            .join("Applications")
+            .join("MyApp.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.example.myapp</string>
+  <key>CFBundleShortVersionString</key><string>3.0.0</string>
+  <key>CFBundleVersion</key><string>300</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+
+        // A Podfile.lock so a deps sidecar (and thus the build-info bundle) ships
+        // alongside the artefact.
+        let srcroot = root.join("src");
+        std::fs::create_dir_all(&srcroot).unwrap();
+        std::fs::write(
+            srcroot.join("Podfile.lock"),
+            "PODS:\n  - Alamofire (5.9.1)\n\nDEPENDENCIES:\n  - Alamofire (= 5.9.1)\n",
+        )
+        .unwrap();
+
+        let dsym_dir = root.join("dSYMs");
+        std::fs::create_dir_all(&dsym_dir).unwrap();
+
+        let art_url = format!("{}/artefact-put", server.uri());
+        let bi_url = format!("{}/build-info-put", server.uri());
+
+        // One registration: request_artifact_upload AND request_build_info_upload
+        // both true; the server signs BOTH endpoints.
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .and(body_partial_json(json!({
+                "request_artifact_upload": true,
+                "request_build_info_upload": true,
+                "format": "ipa",
+                "package_id": "com.example.myapp",
+                "build_configuration": "Release",
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build_id": "b1", "endpoint": art_url, "build_info_upload_endpoint": bi_url }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/artefact-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/build-info-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("SDK_NAME", "iphoneos18.5"),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_SIZE_ANALYSIS_ENABLED", "1"),
+        ]);
+
+        let endpoint = server.uri();
+        run_post_action(&env, &endpoint, Some("TKN"))
+            .await
+            .expect("post-action should succeed");
+
+        // The artefact PUT body is a ZIP whose sole entry is a STORED `.ipa`.
+        let received = server.received_requests().await.unwrap();
+        let art = received
+            .iter()
+            .find(|r| r.url.path() == "/artefact-put")
+            .expect("an artefact PUT");
+        let mut zip = ZipArchive::new(std::io::Cursor::new(art.body.clone())).unwrap();
+        let names: Vec<String> = (0..zip.len())
+            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .collect();
+        assert_eq!(names.len(), 1);
+        assert!(names[0].ends_with(".ipa"), "artefact entry: {}", names[0]);
+        assert_eq!(
+            zip.by_index(0).unwrap().compression(),
+            zip::CompressionMethod::Stored
+        );
+        // The synthetic .ipa carries the app under Payload/.
+        let mut ipa_bytes = Vec::new();
+        zip.by_index(0)
+            .unwrap()
+            .read_to_end(&mut ipa_bytes)
+            .unwrap();
+        let inner = ZipArchive::new(std::io::Cursor::new(ipa_bytes)).unwrap();
+        assert!(
+            inner
+                .file_names()
+                .any(|n| n.starts_with("Payload/MyApp.app/")),
+            "synthetic .ipa must place the app under Payload/"
+        );
+    }
+
+    /// Build a minimal Release archive + empty SRCROOT/dSYM dirs for the
+    /// size-check tests. Returns `(archive, srcroot, dsym_dir)`.
+    fn size_check_archive(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+        let archive = root.join("App.xcarchive");
+        let app = archive
+            .join("Products")
+            .join("Applications")
+            .join("MyApp.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleIdentifier</key><string>com.example.myapp</string>
+  <key>CFBundleShortVersionString</key><string>3.0.0</string>
+  <key>CFBundleVersion</key><string>300</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        let srcroot = root.join("src"); // no Podfile.lock → deps empty
+        std::fs::create_dir_all(&srcroot).unwrap();
+        let dsym_dir = root.join("dSYMs"); // empty → dSYM step no-ops
+        std::fs::create_dir_all(&dsym_dir).unwrap();
+        (archive, srcroot, dsym_dir)
+    }
+
+    /// A size-check FAIL: a tiny baseline makes the freshly packaged `.ipa`
+    /// "growth" past the fail gate. The post-action returns a TERMINAL error
+    /// (`ExitCode::SizeCheckFailed`, which does NOT trigger bootstrapper
+    /// fallback) carrying the `error:`-ready gate line.
+    #[tokio::test]
+    async fn post_action_size_check_fail_returns_terminal_error() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+
+        // Baseline fetched BEFORE registration; 1-byte baseline forces growth.
+        Mock::given(method("GET"))
+            .and(path("/v2/apps/TKN/builds/baseline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build": { "artifact_size": 1, "version": "2.9", "build": "299" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Register-only (no sidecars, no artefact ship): a single POST.
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_SIZE_CHECK_ENABLED", "1"),
+            ("BUGSEE_SIZE_CHECK_FAIL_BYTES", "1"),
+        ]);
+
+        let endpoint = server.uri();
+        let err = run_post_action(&env, &endpoint, Some("TKN"))
+            .await
+            .unwrap_err();
+        // Terminal gate failure — NOT a structural/fallback exit code.
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::SizeCheckFailed
+        );
+        let msg = format!("{err}");
+        assert!(msg.contains("Bugsee size check:"), "msg: {msg}");
+        assert!(msg.contains("exceeds fail threshold 1 B"), "msg: {msg}");
+        // Baseline label comes from the fetched version/build.
+        assert!(msg.contains("vs version 2.9 (299)"), "msg: {msg}");
+    }
+
+    /// A size-check that is under threshold: a huge baseline makes the small
+    /// `.ipa` a shrink → PASS → the post-action returns Ok (build not failed).
+    #[tokio::test]
+    async fn post_action_size_check_pass_is_ok() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+
+        Mock::given(method("GET"))
+            .and(path("/v2/apps/TKN/builds/baseline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build": { "artifact_size": 1_000_000_000, "version": "2.9" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_SIZE_CHECK_ENABLED", "1"),
+            ("BUGSEE_SIZE_CHECK_FAIL_BYTES", "1"),
+        ]);
+
+        let endpoint = server.uri();
+        run_post_action(&env, &endpoint, Some("TKN"))
+            .await
+            .expect("an under-threshold size check must not fail the build");
+    }
+
+    /// `run_post_action_inner` returns an accurate per-step OUTCOME report — the
+    /// data a delegating bootstrapper reads to write its handshake manifest.
+    /// Here: size-analysis ON + a Podfile (deps) + a server that signs both
+    /// endpoints → `build_registered`, `artifact_uploaded`, `deps_collected`,
+    /// `size_analysis` all true; `size_check` "skip" (not enabled).
+    #[tokio::test]
+    async fn post_action_inner_reports_outcomes() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        std::fs::write(
+            srcroot.join("Podfile.lock"),
+            "PODS:\n  - Alamofire (5.9.1)\n\nDEPENDENCIES:\n  - Alamofire (= 5.9.1)\n",
+        )
+        .unwrap();
+
+        let art_url = format!("{}/art", server.uri());
+        let bi_url = format!("{}/bi", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build_id": "b1", "endpoint": art_url, "build_info_upload_endpoint": bi_url }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_SIZE_ANALYSIS_ENABLED", "1"),
+        ]);
+        let endpoint = server.uri();
+        let report = run_post_action_inner(&env, &endpoint, Some("TKN"))
+            .await
+            .expect("inner ok")
+            .expect("a report (not gated out)");
+
+        assert!(report.build_registered);
+        assert!(
+            report.artifact_uploaded,
+            "size-analysis on + signed endpoint"
+        );
+        assert!(report.deps_collected);
+        assert!(report.size_analysis);
+        assert_eq!(report.size_check, "skip");
+        assert!(report.size_check_fail_line.is_none());
+
+        // The serialized stdout shape carries the outcome flags (not the internal
+        // fail line).
+        let v = serde_json::to_value(&report).unwrap();
+        assert_eq!(v["artifact_uploaded"], json!(true));
+        assert_eq!(v["size_check"], json!("skip"));
+        assert!(v.get("size_check_fail_line").is_none());
+    }
+
+    /// Register-only (size-analysis OFF, no sidecars): the report shows a
+    /// registered build but NO artefact shipped.
+    #[tokio::test]
+    async fn post_action_inner_report_register_only() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+        ]);
+        let endpoint = server.uri();
+        let report = run_post_action_inner(&env, &endpoint, Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.build_registered);
+        assert!(
+            !report.artifact_uploaded,
+            "size-analysis off → no bytes shipped"
+        );
+        assert!(!report.size_analysis);
+    }
+
+    /// `BUGSEE_DEPENDENCIES_ENABLED=0` suppresses dep collection even with a
+    /// Podfile present (privacy opt-out parity with the agent).
+    #[tokio::test]
+    async fn post_action_inner_respects_deps_optout() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        std::fs::write(
+            srcroot.join("Podfile.lock"),
+            "PODS:\n  - Alamofire (5.9.1)\n\nDEPENDENCIES:\n  - Alamofire (= 5.9.1)\n",
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_DEPENDENCIES_ENABLED", "0"),
+        ]);
+        let endpoint = server.uri();
+        let report = run_post_action_inner(&env, &endpoint, Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        // Deps suppressed despite the Podfile; build still registers.
+        assert!(
+            !report.deps_collected,
+            "deps opt-out must suppress collection"
+        );
+        assert!(report.build_registered);
+    }
+
+    /// `BUGSEE_BUILD_INFO_TIMINGS_ENABLED=0` suppresses timings even with a
+    /// decodable `.xcactivitylog` present (privacy opt-out parity), and the
+    /// report's `timings` flag goes false.
+    #[tokio::test]
+    async fn post_action_inner_respects_timings_optout() {
+        use crate::cli::xcactivitylog::fixtures;
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+
+        // A DerivedData tree with a decodable build log (timings WOULD resolve).
+        let dd = tmp.path().join("DerivedData").join("MyApp-abc");
+        let logs_build = dd.join("Logs").join("Build");
+        std::fs::create_dir_all(&logs_build).unwrap();
+        fixtures::write_synthetic_log(
+            &logs_build,
+            &[("Ld Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+            &[("Build target Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+        );
+        let obj_root = dd.join("Build").join("Intermediates.noindex");
+        std::fs::create_dir_all(&obj_root).unwrap();
+
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("OBJROOT", obj_root.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ("BUGSEE_BUILD_INFO_TIMINGS_ENABLED", "0"),
+        ]);
+        let endpoint = server.uri();
+        let report = run_post_action_inner(&env, &endpoint, Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!report.timings, "timings opt-out must suppress decode");
+        assert!(report.build_registered);
+    }
+
+    /// The happy path: with a decodable log and no opt-out, `report.timings` is
+    /// true (guards against the opt-out test passing for the wrong reason).
+    #[tokio::test]
+    async fn post_action_inner_reports_timings_true_on_happy_path() {
+        use crate::cli::xcactivitylog::fixtures;
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        let dd = tmp.path().join("DerivedData").join("MyApp-abc");
+        let logs_build = dd.join("Logs").join("Build");
+        std::fs::create_dir_all(&logs_build).unwrap();
+        fixtures::write_synthetic_log(
+            &logs_build,
+            &[("Ld Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+            &[("Build target Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+        );
+        let obj_root = dd.join("Build").join("Intermediates.noindex");
+        std::fs::create_dir_all(&obj_root).unwrap();
+        let put_url = format!("{}/bi", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1", "build_info_upload_endpoint": put_url }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+            ("SRCROOT", srcroot.to_str().unwrap()),
+            ("OBJROOT", obj_root.to_str().unwrap()),
+            ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+        ]);
+        let endpoint = server.uri();
+        let report = run_post_action_inner(&env, &endpoint, Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            report.timings,
+            "a decodable log with no opt-out must report timings"
+        );
+    }
+
+    /// Gated-out → `run_post_action_inner` returns `Ok(None)` (no report).
+    #[tokio::test]
+    async fn post_action_inner_gated_out_is_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("App.xcarchive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let env = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Debug"), // not Release → gated out
+        ]);
+        let report = run_post_action_inner(&env, "http://127.0.0.1:1", None)
+            .await
+            .unwrap();
+        assert!(report.is_none());
     }
 
     /// A gated-out env (Debug, no opt-in) makes `post-action` a no-op that

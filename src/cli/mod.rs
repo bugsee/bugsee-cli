@@ -5,10 +5,13 @@ pub mod debug_files;
 pub mod dsym;
 pub mod ios_deps;
 pub mod pack;
+pub mod size_check;
 pub mod sourcemaps;
 pub mod upload;
 pub mod vcs_metadata;
+pub mod xcactivitylog;
 pub mod xcode;
+pub mod xcode_ipa;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -109,6 +112,28 @@ pub enum Command {
     Xcode(xcode::XcodeCommand),
 }
 
+/// Whether this invocation should detach into a background daemon BEFORE any
+/// work (and before the async runtime starts — forking a live multi-threaded
+/// runtime is unsafe).
+///
+/// Only `xcode post-action` daemonizes — the iOS post-action context, where the
+/// archive must return fast. Every other command, including the user-facing
+/// `debug-files upload` (which a developer may run directly from a terminal),
+/// stays in the foreground. `--force-foreground` opts the post-action back into
+/// synchronous execution so a size-check FAIL can gate CI. Always `false` on
+/// non-unix (no `fork`).
+pub fn should_daemonize(cli: &Cli) -> bool {
+    if !cfg!(unix) {
+        return false;
+    }
+    matches!(
+        &cli.command,
+        Command::Xcode(xcode::XcodeCommand::PostAction {
+            force_foreground: false
+        })
+    )
+}
+
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
     match cli.command {
         Command::DebugFiles(cmd) => debug_files::dispatch(cmd, cli.endpoint, cli.app_token).await,
@@ -120,5 +145,56 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),
         Command::Dsym(cmd) => dsym::dispatch(cmd),
         Command::Xcode(cmd) => xcode::dispatch(cmd, cli.endpoint, cli.app_token).await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    fn parse(args: &[&str]) -> Cli {
+        Cli::try_parse_from(args).expect("valid args")
+    }
+
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn post_action_daemonizes_by_default() {
+        let cli = parse(&["bugsee-cli", "xcode", "post-action"]);
+        assert!(should_daemonize(&cli));
+    }
+
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn post_action_force_foreground_stays_synchronous() {
+        let cli = parse(&["bugsee-cli", "xcode", "post-action", "--force-foreground"]);
+        assert!(!should_daemonize(&cli));
+    }
+
+    #[test]
+    fn debug_files_upload_never_daemonizes() {
+        // The user-facing dSYM/symbol upload must stay foreground even by
+        // default — a developer may run it directly from a terminal.
+        let cli = parse(&[
+            "bugsee-cli",
+            "debug-files",
+            "upload",
+            "--type",
+            "dsym",
+            "--app-token",
+            "TKN",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            ".",
+        ]);
+        assert!(!should_daemonize(&cli));
+    }
+
+    #[test]
+    fn metadata_commands_never_daemonize() {
+        let cli = parse(&["bugsee-cli", "vcs-metadata"]);
+        assert!(!should_daemonize(&cli));
     }
 }

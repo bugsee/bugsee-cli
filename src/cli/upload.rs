@@ -249,6 +249,8 @@ pub async fn dispatch(
                 app_token,
                 payload_json: &payload_json,
                 artifact: &artifact,
+                // `upload build` exists to ship the artefact — always request it.
+                request_artifact_upload: true,
                 mapping: mapping.as_deref(),
                 deps: deps.as_deref(),
                 timings: timings.as_deref(),

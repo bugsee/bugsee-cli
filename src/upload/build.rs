@@ -40,8 +40,17 @@ pub struct Params<'a> {
     /// Registration metadata JSON — the POST body for `/v2/apps/<token>/builds`.
     pub payload_json: &'a Path,
     /// The build artefact (`.aab`/`.apk`/`.ipa`). STORED verbatim in the upload
-    /// ZIP (already a compressed container).
+    /// ZIP (already a compressed container). Only read when `request_artifact_upload`
+    /// is set; ignored on the register-only path.
     pub artifact: &'a Path,
+    /// Whether to ship the artefact bytes. `true` (the Gradle/`upload build`
+    /// default) packs + PUTs the artefact ZIP and asks the server to sign an
+    /// artefact endpoint. `false` (the iOS build-info / size-baseline path)
+    /// registers the build record WITHOUT shipping bytes — the producer's
+    /// payload still carries `artifact_size`/`uuid`, and the build-info bundle
+    /// (deps/timings) rides the same registration. This is what guarantees a
+    /// build record even for a no-dependency project.
+    pub request_artifact_upload: bool,
     /// Optional R8/ProGuard `mapping.txt`, packed (zstd) alongside the artefact.
     pub mapping: Option<&'a Path>,
     /// Optional build-info sidecars — when present, the build-info bundle is
@@ -78,43 +87,48 @@ struct ErrorPayload {
 }
 
 pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
-    if !params.artifact.is_file() {
-        return Err(Error::InputNotFound(format!(
-            "artifact does not exist or is not a file: {}",
-            params.artifact.display()
-        )));
-    }
+    let want_build_info = params.deps.is_some() || params.timings.is_some();
 
-    // 1. Pack the upload ZIP: artefact STORED + optional mapping zstd. Same
-    //    container the worker's size-analysis job consumes (see `pack`).
+    // 1. Pack the upload ZIP — ONLY when shipping artefact bytes. The
+    //    register-only path (request_artifact_upload = false) never reads the
+    //    artefact; it just registers the build record + drives the build-info
+    //    bundle. `zip_path` is otherwise unused.
     let tmpdir = tempfile::tempdir()?;
     let zip_path: PathBuf = match (params.dry_run, params.out) {
         (true, Some(out)) => out.to_path_buf(),
         _ => tmpdir.path().join("upload.zip"),
     };
-    let artifact_name = params
-        .artifact
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| Error::ConfigInvalid("artifact path has no usable file name".into()))?;
-    let mut entries = vec![ZipEntry::stored(artifact_name, params.artifact)];
-    if let Some(m) = params.mapping {
-        if !m.is_file() {
+    if params.request_artifact_upload {
+        if !params.artifact.is_file() {
             return Err(Error::InputNotFound(format!(
-                "mapping does not exist or is not a file: {}",
-                m.display()
+                "artifact does not exist or is not a file: {}",
+                params.artifact.display()
             )));
         }
-        entries.push(ZipEntry::compressed("mapping.txt", m));
+        let artifact_name = params
+            .artifact
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| Error::ConfigInvalid("artifact path has no usable file name".into()))?;
+        let mut entries = vec![ZipEntry::stored(artifact_name, params.artifact)];
+        if let Some(m) = params.mapping {
+            if !m.is_file() {
+                return Err(Error::InputNotFound(format!(
+                    "mapping does not exist or is not a file: {}",
+                    m.display()
+                )));
+            }
+            entries.push(ZipEntry::compressed("mapping.txt", m));
+        }
+        let zip_size = compress::pack_entries(&entries, &zip_path, params.strategy)?;
+        tracing::info!(zip_size, artifact = %artifact_name, "packed build upload ZIP");
     }
-    let zip_size = compress::pack_entries(&entries, &zip_path, params.strategy)?;
-    tracing::info!(zip_size, artifact = %artifact_name, "packed build upload ZIP");
 
     if params.dry_run {
         tracing::info!(
-            zip_size,
+            request_artifact_upload = params.request_artifact_upload,
             path = params.out.map(|p| p.display().to_string()),
-            "dry-run: packed build upload ZIP; skipping registration + upload"
+            "dry-run: skipping registration + upload"
         );
         return Ok(Outcome::DryRun);
     }
@@ -123,13 +137,24 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
 
     // Registration metadata, built once and shared by both transports: the
     // producer's JSON + the `request_*_upload` flags the CLI owns.
-    let want_build_info = params.deps.is_some() || params.timings.is_some();
     let metadata = build_metadata(&params, want_build_info).await?;
 
-    // 2. Upload the artefact — chunked (large) or single-PUT — and learn the
-    //    build id + the signed build-info endpoint. Both transports yield the
-    //    same two facts, so step 3 is identical for either.
-    let (build_id, build_info_endpoint) = if params.chunked {
+    // 2. Register the build and learn the build id + signed build-info endpoint.
+    //    When shipping, also upload the artefact (chunked or single-PUT). Both
+    //    transports yield the same two facts, so step 3 is identical for either.
+    let (build_id, build_info_endpoint) = if !params.request_artifact_upload {
+        // Register-only: a single POST creates the build record (with the
+        // producer's uuid / artifact_size); no artefact bytes ship.
+        let reg = register_single(
+            &client,
+            policy,
+            params.endpoint,
+            params.app_token,
+            &metadata,
+        )
+        .await?;
+        (reg.build_id, reg.build_info_endpoint)
+    } else if params.chunked {
         let out = chunked::upload(
             &client,
             policy,
@@ -178,7 +203,12 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         }
         (reg.build_id, reg.build_info_endpoint)
     };
-    tracing::info!(%build_id, chunked = params.chunked, "artefact uploaded");
+    tracing::info!(
+        %build_id,
+        request_artifact_upload = params.request_artifact_upload,
+        chunked = params.chunked,
+        "build registered"
+    );
 
     // 3. Build-info bundle, from the SAME registration (pre-signed mode) — no
     //    second build registration. Only when sidecars were supplied AND the
@@ -231,7 +261,10 @@ async fn build_metadata(params: &Params<'_>, want_build_info: bool) -> Result<Ma
             params.payload_json.display()
         ))
     })?;
-    body.insert("request_artifact_upload".into(), Value::Bool(true));
+    body.insert(
+        "request_artifact_upload".into(),
+        Value::Bool(params.request_artifact_upload),
+    );
     if want_build_info {
         body.insert("request_build_info_upload".into(), Value::Bool(true));
     }
@@ -343,6 +376,7 @@ mod tests {
             app_token: "TKN",
             payload_json: payload,
             artifact,
+            request_artifact_upload: true,
             mapping: None,
             deps: None,
             timings: None,
@@ -500,15 +534,120 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn register_only_skips_artefact_put_but_still_bundles() {
+        // request_artifact_upload = false: the build registers (carrying the
+        // producer's payload), NO artefact PUT happens, but the build-info
+        // bundle still ships from the same registration. This is the iOS
+        // build-info / size-baseline path and what closes the no-deps gap.
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        // The artefact path is passed but must NOT be read (the file is absent).
+        let absent_artifact = tmp.path().join("nonexistent.ipa");
+        let deps = write(tmp.path(), "deps.json", br#"{"deps":["a"]}"#);
+        let payload = write(
+            tmp.path(),
+            "p.json",
+            br#"{"uuid":"abc","artifact_size":123}"#,
+        );
+        let bi_url = format!("{}/buildinfo", server.uri());
+
+        // Registration: request_artifact_upload MUST be false; build-info true.
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .and(body_partial_json(serde_json::json!({
+                "request_artifact_upload": false,
+                "request_build_info_upload": true,
+                "uuid": "abc",
+                "artifact_size": 123
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true,
+                "result": { "build_id": "b9", "build_info_upload_endpoint": bi_url }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        // The build-info bundle PUT happens; NO artefact PUT mock is mounted, so
+        // any artefact PUT would surface as an unmatched request.
+        Mock::given(method("PUT"))
+            .and(path("/buildinfo"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let mut params = base_params(&uri, &payload, &absent_artifact);
+        params.request_artifact_upload = false;
+        params.deps = Some(&deps);
+        let outcome = run(params, RetryPolicy::fast(3)).await.unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Uploaded {
+                build_id: "b9".into()
+            }
+        );
+
+        // Exactly two requests: the registration POST + the build-info PUT. No
+        // third request to any artefact URL.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 2, "expected only register + build-info PUT");
+        let paths: Vec<&str> = received.iter().map(|r| r.url.path()).collect();
+        assert!(paths.contains(&"/v2/apps/TKN/builds"));
+        assert!(paths.contains(&"/buildinfo"));
+    }
+
+    #[tokio::test]
+    async fn register_only_with_no_sidecars_just_registers() {
+        // The bare-minimum case that closes the no-deps-no-build-record gap: no
+        // artefact bytes, no deps/timings — just a build registration POST.
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let absent_artifact = tmp.path().join("nope.ipa");
+        let payload = write(tmp.path(), "p.json", br#"{"uuid":"abc"}"#);
+
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .and(body_partial_json(serde_json::json!({
+                "request_artifact_upload": false
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "build_id": "b10" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let mut params = base_params(&uri, &payload, &absent_artifact);
+        params.request_artifact_upload = false;
+        let outcome = run(params, RetryPolicy::fast(3)).await.unwrap();
+        assert_eq!(
+            outcome,
+            Outcome::Uploaded {
+                build_id: "b10".into()
+            }
+        );
+        // Exactly one request — the registration POST. No PUTs at all.
+        let received = server.received_requests().await.unwrap();
+        assert_eq!(received.len(), 1);
+        assert_eq!(received[0].url.path(), "/v2/apps/TKN/builds");
+    }
+
+    #[tokio::test]
     async fn application_not_found_maps_to_app_token_rejected() {
         let server = MockServer::start().await;
         let tmp = tempfile::tempdir().unwrap();
         let artifact = write(tmp.path(), "app.aab", b"PK\x03\x04");
         let payload = write(tmp.path(), "p.json", br#"{"uuid":"abc"}"#);
+        // The REAL appserver returns the error at the TOP LEVEL (HTTP 200,
+        // `res.error()` → `{ ok: false, error: {...} }`, no `result` wrapper).
+        // `register_single` must still detect it via its `unwrap_or(&value)`
+        // fallback — pinning the real wire shape, not the nested one.
         Mock::given(method("POST"))
             .and(path("/v2/apps/TKN/builds"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "ok": false, "result": { "error": { "type": "ApplicationNotFoundError" } }
+                "ok": false, "error": { "type": "ApplicationNotFoundError", "message": "no such app" }
             })))
             .mount(&server)
             .await;

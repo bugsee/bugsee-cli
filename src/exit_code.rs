@@ -15,7 +15,8 @@
 //! | 10–19  | Input / discovery problems (file not found, unparseable format).      | no                       |
 //! | 20–29  | Configuration problems (bad token, unreachable endpoint).            | no                       |
 //! | 30–39  | Upload problems (network, server 4xx/5xx).                            | no                       |
-//! | 40+    | Reserved.                                                            | no                       |
+//! | 40     | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
+//! | 41+    | Reserved.                                                            | no                       |
 //!
 //! The rationale for `should_fallback`: codes 1 and 2 indicate the CLI never
 //! got a fair chance to run. Codes ≥ 10 indicate a substantive failure that
@@ -37,6 +38,12 @@ pub enum ExitCode {
 
     UploadServer = 30,
     UploadTransport = 31,
+
+    /// A deliberate build gate failed (the build grew past a configured
+    /// size-check threshold). Terminal — the build SHOULD fail — but NOT a
+    /// structural CLI failure, so an integrating bootstrapper must propagate it
+    /// as a build failure rather than fall back to its in-language path.
+    SizeCheckFailed = 40,
 }
 
 impl ExitCode {
@@ -74,6 +81,9 @@ mod tests {
         assert!(!ExitCode::AppTokenRejected.should_fallback());
         assert!(!ExitCode::UploadServer.should_fallback());
         assert!(!ExitCode::UploadTransport.should_fallback());
+        // A size-check FAIL is terminal, NOT a fallback trigger — re-running via
+        // the in-language path would skip the gate and not fail the build.
+        assert!(!ExitCode::SizeCheckFailed.should_fallback());
     }
 
     #[test]
@@ -89,5 +99,6 @@ mod tests {
         assert_eq!(ExitCode::AppTokenRejected.as_i32(), 21);
         assert_eq!(ExitCode::UploadServer.as_i32(), 30);
         assert_eq!(ExitCode::UploadTransport.as_i32(), 31);
+        assert_eq!(ExitCode::SizeCheckFailed.as_i32(), 40);
     }
 }

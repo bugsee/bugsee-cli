@@ -485,11 +485,14 @@ mod tests {
             r#"{"version":"1.0","build":"1"}"#,
         );
 
+        // Real appserver wire shape: HTTP 200 with the error at the TOP LEVEL
+        // (no `result` wrapper) — `register` finds it via its `unwrap_or(&value)`
+        // fallback.
         Mock::given(method("POST"))
             .and(path("/v2/apps/BAD/builds"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
                 "ok": false,
-                "result": { "error": { "type": "ApplicationNotFoundError", "message": "no such app" } }
+                "error": { "type": "ApplicationNotFoundError", "message": "no such app" }
             })))
             .expect(1)
             .mount(&server)

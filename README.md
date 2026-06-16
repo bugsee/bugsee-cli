@@ -2,21 +2,6 @@
 
 Cross-platform Rust binary that collects debug information files (dSYM, ELF, PE/PDB, Portable PDB, Breakpad, R8/ProGuard mappings, JS source maps), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, MSBuild target, Unity post-build hook, Flutter Dart plugin, npm package).
 
-Built on the `symbolic` Rust crate family — the same crates the Bugsee worker already uses via Python wheels for `symbolic.debuginfo`, `symbolic.sourcemap`, `symbolic.symcache` — so producer and consumer parse artifacts with the same code.
-
-## Scope
-
-- **In scope.** Symbol discovery, debug-ID normalization, source-map debug-ID injection, Zstd compression, chunked upload, legacy presigned upload, **and** the canonical build-environment resolvers consumed by the iOS-side Python BugseeAgents (VCS metadata, iOS dependency collection, Xcode/build-env helpers, dSYM UUID extraction). Centralising these in one Rust binary eliminates the historical duplication between the fastlane plugin's and the iOS SDK's Python implementations.
-- **Out of scope.** Build timings, app-size analysis, dependency-tree collection on non-iOS platforms — those stay in the per-build-system plugins (Gradle plugin, MSBuild target, etc.) where they have access to build-system internals.
-
-## Locked design decisions
-
-1. **BMF/BSF — keep for existing setups, drop for new ones.** Existing deployments continue to convert PDB/MDB → BMF/BSF via `bugsee-cli debug-files convert`. New deployments upload Portable PDB / dSYM directly and rely on `symbolic-debuginfo` server-side.
-2. **Zstd is the default wire format.** Default level **11**, minimum production level **9**. The worker already accepts ZIP files with Z_STANDARD (compression method 93) entries.
-3. **Debug ID is the universal identifier.** Native artifacts (Mach-O UUID, ELF GNU build-id, PE Timestamp+Size) carry it naturally. JS bundles get a deterministic UUIDv5 via `bugsee-cli sourcemaps inject`. Server lookup is by debug-id; the old `(uuid, version, build)` tuple stays as a backward-compat shim during fleet migration.
-4. **Chunked upload for large artefacts.** `GET /v2/apps/<token>/builds/chunk-options` → `POST .../builds/chunks/check` (sha1-keyed) → PUT missing chunks → `POST .../builds/chunked`. Used by `upload build --chunked` for artefacts above the single-PUT threshold (e.g. Flutter Dart `.symbols`, Unity IL2CPP) that routinely exceed 50–100 MB.
-5. **Cross-language wire shape is a public contract.** Each subcommand's stdout JSON shape is consumed by at least one external Python script (see Subcommands § below). Breaking changes to field names, casing, types, or null-vs-omit semantics require a major version bump and a coordinated rollout across the fastlane plugin and the iOS SDK's BugseeAgent.
-
 ## Building
 
 ```sh

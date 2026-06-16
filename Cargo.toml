@@ -87,6 +87,11 @@ plist = "1"
 zstd = { version = "0.13", features = ["zstdmt"] }
 zip = { version = "2", default-features = false, features = ["zstd", "deflate"] }
 
+# gzip — `.xcactivitylog` build logs are gzip of an SLF0 token stream. Already
+# in the dependency tree via `zip`/`reqwest`, so this direct dep adds no new
+# crate. Used in cli/xcactivitylog.rs only.
+flate2 = "1"
+
 # Serialization + IDs
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -102,6 +107,12 @@ hex = "0.4"
 # File discovery
 walkdir = "2"
 globset = "0.4"
+
+# Unix double-fork for `xcode post-action`'s background (daemon) mode. Already
+# in the dependency tree via tokio/reqwest, so this direct dep adds no new crate.
+# Used in src/daemon.rs only (a no-op stub on non-unix).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Errors + diagnostics
 anyhow = "1"

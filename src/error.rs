@@ -53,6 +53,13 @@ pub enum Error {
     /// HTTP-client passthrough. Classified as `UploadTransport`.
     #[error("HTTP error: {0}")]
     Http(#[from] reqwest::Error),
+
+    /// A deliberate build gate failed (size-check threshold crossed). The
+    /// `message` is already the user-facing gate line (it carries its own
+    /// context), so it is rendered verbatim — `main` prints `error: {message}`,
+    /// which Xcode surfaces in the build log + Report navigator.
+    #[error("{0}")]
+    SizeCheckFailed(String),
 }
 
 impl Error {
@@ -64,6 +71,7 @@ impl Error {
             Error::AppTokenRejected => ExitCode::AppTokenRejected,
             Error::UploadServer { .. } => ExitCode::UploadServer,
             Error::UploadTransport(_) | Error::Http(_) => ExitCode::UploadTransport,
+            Error::SizeCheckFailed(_) => ExitCode::SizeCheckFailed,
         }
     }
 }
@@ -126,6 +134,18 @@ mod tests {
             Error::UploadTransport("x".into()).exit_code(),
             ExitCode::UploadTransport
         );
+        assert_eq!(
+            Error::SizeCheckFailed("grew too much".into()).exit_code(),
+            ExitCode::SizeCheckFailed
+        );
+    }
+
+    #[test]
+    fn size_check_failed_displays_message_verbatim() {
+        // `main` prints `error: {Display}`; the message must NOT be wrapped so
+        // Xcode parses the `error: Bugsee size check: ...` line cleanly.
+        let e = Error::SizeCheckFailed("Bugsee size check: grew".into());
+        assert_eq!(format!("{e}"), "Bugsee size check: grew");
     }
 
     #[test]
