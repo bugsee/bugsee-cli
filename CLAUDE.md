@@ -31,6 +31,13 @@ cargo fmt -- --check                        # format check (CI gate)
 - Format with `cargo fmt` (or `rustfmt --edition 2021 <file>` for one file). Keep
   reformatting scoped to the files you actually changed — don't bundle a
   whole-crate reformat into an unrelated diff.
+- The crate ships on macOS, Linux, AND Windows. A platform-only dependency goes
+  in a `[target.'cfg(unix)'.dependencies]` table that MUST come AFTER the plain
+  `[dependencies]` table — TOML absorbs every key after a `[table]` header into
+  that table, so placing it mid-`[dependencies]` silently moves all following
+  deps under `cfg(unix)` and they vanish on Windows (native build stays green, so
+  only the Windows CI leg catches it). Verify a Cargo.toml dep change with
+  `cargo metadata --no-deps` (check each dep's `target`).
 
 ## Layout
 
