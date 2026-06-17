@@ -108,12 +108,6 @@ hex = "0.4"
 walkdir = "2"
 globset = "0.4"
 
-# Unix double-fork for `xcode post-action`'s background (daemon) mode. Already
-# in the dependency tree via tokio/reqwest, so this direct dep adds no new crate.
-# Used in src/daemon.rs only (a no-op stub on non-unix).
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-
 # Errors + diagnostics
 anyhow = "1"
 thiserror = "2"
@@ -121,6 +115,15 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.17"
 tempfile = "3"
+
+# Unix double-fork for `xcode post-action`'s background (daemon) mode. This is a
+# TARGET-specific table, so it MUST come AFTER the main [dependencies] table —
+# placed mid-table, TOML would capture every following key into the unix-only
+# table and those crates would vanish on Windows. Already in the tree via
+# tokio/reqwest, so no new crate. Used in src/daemon.rs only (no-op stub on
+# non-unix).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [dev-dependencies]
 assert_cmd = "2"
