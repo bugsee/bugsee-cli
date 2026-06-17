@@ -4,6 +4,21 @@ All notable changes to `bugsee-cli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.0] - 2026-06-17
+
+### Added
+- `update` — self-update the binary in place. Resolves the newest published
+  version WITHIN THE SAME MAJOR as the running binary (minor/patch are
+  non-breaking; a major bump is never auto-adopted), downloads and
+  SHA-256-verifies the release for the host triple, and atomically replaces the
+  current executable (`self-replace`, so the Windows running-`.exe` case works).
+  `--check` reports only; `--version X.Y.Z` installs an exact version.
+- Release mirror now publishes tiny version pointers for auto-update discovery:
+  `cli/latest/version.txt` (absolute latest) and `cli/v<major>.x/version.txt`
+  (latest within a major). Both advance-only. The per-major pointer is the
+  shared contract the CLI's `update`, the Android Gradle plugin, and the iOS
+  BugseeAgents all read to find the newest non-breaking version.
+
 ## [0.5.0] - 2026-06-17
 
 ### Added
@@ -105,6 +120,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.6.0]: https://github.com/bugsee/bugsee-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bugsee/bugsee-cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bugsee/bugsee-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bugsee/bugsee-cli/compare/v0.2.0...v0.3.0
