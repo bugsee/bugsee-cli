@@ -89,8 +89,45 @@ jobs:
             --acl public-read \
             --cache-control "public, max-age=300, must-revalidate"
 
+      - name: Publish version pointers (latest + per-major)
+        # Tiny, schema-stable discovery files the auto-update logic reads. Each
+        # holds a bare `X.Y.Z`. `cli/latest/version.txt` = the absolute latest;
+        # `cli/v<major>.x/version.txt` = the latest WITHIN that major, so a
+        # consumer pinned to major M can pull a newer minor/patch (non-breaking
+        # by our release policy) without ever crossing into a breaking major.
+        # The SAME per-major pointer is read by the CLI's own `update` command,
+        # the Android Gradle plugin, and the iOS BugseeAgents.
+        #
+        # ADVANCE-ONLY: both pointers are only moved FORWARD (sort -V), so a
+        # re-mirror of an older tag (e.g. a backport while a newer release is
+        # live) never regresses a pointer.
+        run: |
+          set -euo pipefail
+          VER="${{ github.event.inputs.tag }}"
+          VER="${VER#v}"            # v0.5.0 -> 0.5.0
+          MAJOR="${VER%%.*}"        # 0.5.0  -> 0
+          printf '%s\n' "$VER" > version.txt
+
+          advance_pointer() {
+            local key="$1" cur
+            cur=$(aws s3 cp "s3://${{ vars.S3_BUCKET }}/$key" - 2>/dev/null | tr -d '[:space:]' || true)
+            if [ -n "$cur" ] && [ "$(printf '%s\n%s\n' "$cur" "$VER" | sort -V | tail -1)" != "$VER" ]; then
+              echo "pointer $key already at $cur (newer than $VER) — not regressing"
+              return 0
+            fi
+            aws s3 cp version.txt "s3://${{ vars.S3_BUCKET }}/$key" \
+              --acl public-read \
+              --cache-control "public, max-age=300, must-revalidate"
+            echo "advanced $key -> $VER"
+          }
+
+          advance_pointer "cli/latest/version.txt"
+          advance_pointer "cli/v${MAJOR}.x/version.txt"
+
       - name: Summary
         run: |
+          VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"; MAJOR="${VER%%.*}"
           echo "Mirrored ${{ github.event.inputs.tag }} to:"
           echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/"
-          echo "  https://${{ vars.S3_BUCKET }}/cli/latest/"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/latest/   (version.txt -> $VER)"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/v${MAJOR}.x/version.txt -> $VER"

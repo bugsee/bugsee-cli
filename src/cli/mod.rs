@@ -7,6 +7,7 @@ pub mod ios_deps;
 pub mod pack;
 pub mod size_check;
 pub mod sourcemaps;
+pub mod update;
 pub mod upload;
 pub mod vcs_metadata;
 pub mod xcactivitylog;
@@ -110,6 +111,14 @@ pub enum Command {
     /// `tools.bundle/BugseeAgent` can delegate the whole flow to one command.
     #[command(subcommand)]
     Xcode(xcode::XcodeCommand),
+
+    /// Self-update the `bugsee-cli` binary in place. By default it adopts the
+    /// newest published version WITHIN THE SAME MAJOR as the running binary
+    /// (minor/patch are non-breaking) — never a breaking major bump. Downloads
+    /// and SHA-256-verifies the release for the host triple, then atomically
+    /// replaces the current executable. Use `--check` to only report, or
+    /// `--version X.Y.Z` to install an exact version.
+    Update(update::UpdateArgs),
 }
 
 /// Whether this invocation should detach into a background daemon BEFORE any
@@ -146,6 +155,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
         Command::BuildEnv(cmd) => build_env::dispatch(cmd),
         Command::Dsym(cmd) => dsym::dispatch(cmd),
         Command::Xcode(cmd) => xcode::dispatch(cmd, cli.endpoint, cli.app_token).await,
+        Command::Update(args) => update::dispatch(args).await,
     }
 }
 

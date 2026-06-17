@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2021"
 rust-version = "1.79"
 authors = ["Bugsee"]
@@ -115,6 +115,12 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
 indicatif = "0.17"
 tempfile = "3"
+
+# In-place self-replacement of the running executable for `bugsee-cli update`.
+# Handles the Windows "can't overwrite a running .exe" dance (rename-then-stage)
+# and the Unix atomic-rename uniformly. Cross-platform, so it stays in the plain
+# [dependencies] table (NOT a cfg(target) table).
+self-replace = "1"
 
 # Unix double-fork for `xcode post-action`'s background (daemon) mode. This is a
 # TARGET-specific table, so it MUST come AFTER the main [dependencies] table —
