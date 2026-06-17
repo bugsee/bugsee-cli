@@ -28,8 +28,8 @@ const DEBUG_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0xb0, 0x95, 0xee, 0x5e, 0x53, 0x00, 0x4d, 0xa9, 0x8a, 0x05, 0x04, 0xde, 0xb0, 0x6a, 0x90, 0x01,
 ]);
 
-/// The `//# debugId=` magic comment (Sentry-compatible) appended to bundles and
-/// scanned for idempotency.
+/// The `//# debugId=` magic comment (the de-facto source-map debug-id
+/// convention) appended to bundles and scanned for idempotency.
 const DEBUG_ID_COMMENT_PREFIX: &str = "//# debugId=";
 
 const SOURCE_MAPPING_URL_PREFIX: &str = "//# sourceMappingURL=";
@@ -42,7 +42,7 @@ pub fn compute_debug_id(content: &[u8]) -> Uuid {
 
 /// The runtime stub appended to each JS bundle. On load it registers
 /// `globalThis._bugseeDebugIds[<this script's Error stack>] = <debug_id>` — the
-/// Sentry-proven self-identification the SDK reads at crash time to recover the
+/// self-identification the SDK reads at crash time to recover the
 /// debug-id of the bundle a frame belongs to. Defensive (try/catch, multi-env
 /// global resolution) so it can never throw in a customer bundle.
 fn runtime_stub(debug_id: &Uuid) -> String {

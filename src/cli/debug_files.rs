@@ -448,9 +448,9 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// Recursively discover `.dSYM` bundles under the given paths. An explicit
 /// `.dSYM` directory is taken as-is; a directory is walked for any `*.dSYM`
 /// bundle (a directory named `*.dSYM` with a `Contents/Resources/DWARF`
-/// subdirectory). Mirrors `sentry-cli debug-files upload`'s recursive scan, so
-/// a caller can point at an Xcode archive's `dSYMs/` folder (or a whole
-/// DerivedData tree) instead of enumerating bundles itself. De-duplicated.
+/// subdirectory). The recursive scan lets a caller point at an Xcode archive's
+/// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
+/// itself. De-duplicated.
 fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
     fn is_dsym_bundle(p: &std::path::Path) -> bool {
         p.is_dir()
@@ -752,8 +752,8 @@ fn pack_dsym_bundle(
 ///
 /// Input paths are scanned for `.dSYM` bundles via [`discover_dsyms`] (an
 /// explicit `.dSYM` is taken as-is; a folder — e.g. an Xcode archive's
-/// `dSYMs/` — is walked), so the caller need not enumerate bundles itself
-/// (mirrors `sentry-cli debug-files upload`). Each bundle is independently
+/// `dSYMs/` — is walked), so the caller need not enumerate bundles itself.
+/// Each bundle is independently
 /// identified (UUIDs per Mach-O slice extracted for logging), re-packed with
 /// the chosen compression strategy, and uploaded; an unreadable `.dSYM` is
 /// skipped with a warning rather than failing the run. The metadata POST
@@ -823,7 +823,7 @@ pub(crate) async fn run_dsym_upload(
             .unwrap_or("bundle.dSYM");
 
         // Declare the Mach-O slice UUIDs up front so the server can dedup
-        // BEFORE we pack and PUT (Sentry-style "skip already uploaded"). When
+        // BEFORE we pack and PUT (skip already-uploaded bundles). When
         // every UUID is already present the server returns 16004 and we never
         // read or compress the (possibly large) DWARF bytes. `--force` (->
         // `overwrite`) bypasses the skip. After a real upload the worker

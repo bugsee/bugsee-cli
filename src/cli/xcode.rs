@@ -117,8 +117,7 @@ pub enum XcodeCommand {
     PostAction {
         /// Run synchronously in the foreground instead of detaching into a
         /// background daemon. Required for CI gating: a size-check FAIL only
-        /// propagates its non-zero exit when foregrounded. (Mirrors
-        /// `sentry-cli debug-files upload --force-foreground`.)
+        /// propagates its non-zero exit when foregrounded.
         #[arg(long)]
         force_foreground: bool,
     },
