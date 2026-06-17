@@ -4,6 +4,37 @@ All notable changes to `bugsee-cli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] - 2026-06-17
+
+The release that moves the whole iOS build-publish flow into the CLI: one
+`xcode post-action` command does what the iOS SDK's build script used to do in
+process, and dSYM uploads gain recursive discovery + pre-upload dedup.
+
+### Added
+- `xcode post-action` — run the entire iOS build-publish flow from an Xcode
+  "Run Script" post-action: decode build timings from the `.xcactivitylog`,
+  package the `.app` into a synthetic `.ipa`, register the build, upload the
+  artefact (when size-analysis is enabled) and the build-info bundle, upload
+  dSYMs, and run an optional in-build size-check. Runs in the background by
+  default (detaches so the archive returns immediately, logging to
+  `$PROJECT_TEMP_DIR/bugsee-cli.log`); `--force-foreground` runs synchronously.
+  Configured through `BUGSEE_*` environment variables — see
+  `bugsee-cli xcode post-action --help`.
+- `debug-files upload --type dsym` recursive discovery — point at an Xcode
+  archive's `dSYMs/` folder (or a whole DerivedData tree) and every `*.dSYM`
+  bundle is found and uploaded; no need to enumerate bundles yourself.
+- dSYM pre-upload dedup — the Mach-O slice UUIDs are declared up front so the
+  server can skip bundles it already has BEFORE the (possibly large) DWARF bytes
+  are packed or transferred. `--force` re-uploads.
+- In-build size-check — fail the build with the new exit code **40**
+  (`SizeCheckFailed`) when the artefact grows past a configured threshold
+  (in `--force-foreground`).
+
+### Changed
+- `--help` now documents every command, argument, option, and value-enum
+  variant, including the `BUGSEE_*` environment variables that configure
+  `xcode post-action`.
+
 ## [0.3.0] - 2026-06-15
 
 The release that completes the build-time upload unification surface: artefact
