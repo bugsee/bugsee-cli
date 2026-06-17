@@ -68,14 +68,17 @@ pub enum DebugFilesCommand {
         dry_run: bool,
     },
 
-    /// Convert a debug-file to Bugsee's legacy BMF/BSF format (for existing deployments only).
+    /// Convert a debug-file to Bugsee's legacy BMF/BSF format (existing deployments only; NOT YET IMPLEMENTED).
     Convert {
+        /// Input debug-file to convert (e.g. a Windows PDB or Mono MDB).
         #[arg(required = true)]
         input: PathBuf,
 
+        /// Target legacy format to convert to.
         #[arg(long, value_enum)]
         to: LegacyFormat,
 
+        /// Output path for the converted file.
         #[arg(long)]
         output: PathBuf,
     },
@@ -83,15 +86,25 @@ pub enum DebugFilesCommand {
 
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DebugFileType {
+    /// Apple dSYM bundle (or a Mach-O inside one); deduplicated by Mach-O UUID.
     Dsym,
+    /// Native ELF (Android NDK / Linux); also uploaded with a Breakpad transform.
     Elf,
+    /// Windows PE (scaffold — not yet processed).
     Pe,
+    /// Windows PDB (scaffold — not yet processed).
     Pdb,
+    /// .NET Portable PDB (scaffold — not yet processed).
     PortablePdb,
+    /// Breakpad symbol file (scaffold — not yet processed).
     Breakpad,
+    /// Android R8 / ProGuard `mapping.txt` (the default when `--type` is unset).
     Proguard,
+    /// JVM bytecode debug info (scaffold — not yet processed).
     Jvm,
+    /// Source bundle (scaffold — not yet processed).
     Sourcebundle,
+    /// WebAssembly debug info (scaffold — not yet processed).
     Wasm,
     /// JS source maps (React Native / web). Keyed by the debug-id embedded by
     /// `bugsee-cli sourcemaps inject` (or a caller-supplied `--uuid`).
@@ -100,7 +113,9 @@ pub enum DebugFileType {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum LegacyFormat {
+    /// Convert to the legacy BMF container.
     Bmf,
+    /// Convert to the legacy BSF container.
     Bsf,
 }
 
