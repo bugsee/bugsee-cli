@@ -128,8 +128,12 @@ rule, or entry name requires a major version bump and a coordinated rollout.
 `bugsee-cli xcode post-action` runs the whole iOS build-publish flow from an Xcode
 "Run Script" post-action — build-timings, `.app`→`.ipa` packaging, build
 registration, artefact + build-info upload, dSYM upload, and the in-build
-size-check. It is configured almost entirely through `BUGSEE_*` environment
-variables (documented in its `--help`).
+size-check. It is configured through `BUGSEE_*` environment variables and/or the
+equivalent `--enable-*` / `--disable-*` toggle pairs and `--size-check-*` value
+flags (a flag overrides its env var; within a pair the last one wins). Both
+surfaces are documented in its `--help`. The flags are overlaid onto the
+collected environment map in `dispatch` (`apply_overrides`) before any gate
+runs, so the env-driven gate logic stays the single source of truth.
 
 It runs in the BACKGROUND by default: `main` double-forks (`daemon.rs`) BEFORE
 building the tokio runtime. Forking a live multi-threaded runtime is undefined

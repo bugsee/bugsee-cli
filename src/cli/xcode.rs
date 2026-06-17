@@ -72,12 +72,16 @@ const DEPS_SCHEMA_VERSION: i64 = 1;
 /// ride alongside them), so they belong in `--help` even though they aren't
 /// clap flags. Truthy values everywhere: `1`, `true`, `yes`, `on` (case-insensitive).
 const POST_ACTION_ENV_HELP: &str = "\
-Environment variables (read from the Xcode build-phase environment):
+Environment variables (read from the Xcode build-phase environment). Every
+toggle below also has an --enable-<x> / --disable-<x> flag and every threshold a
+--size-check-*  flag (listed under Options above); a flag passed on the command
+line overrides its environment variable.
 
 Gating (whether the post-action does anything):
   BUGSEE_BUILD_INFO_ENABLED             Master switch for the whole flow [default: on].
   BUGSEE_BUILD_INFO_ALL_ACTIONS         Also run on plain Build actions, not just Archive [default: off].
   BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS  Run for non-Release configurations too [default: off → Release-only].
+                                        (Legacy alias: BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS.)
 
 Collection opt-outs:
   BUGSEE_DEPENDENCIES_ENABLED           Collect the dependency graph [default: on].
@@ -120,7 +124,202 @@ pub enum XcodeCommand {
         /// propagates its non-zero exit when foregrounded.
         #[arg(long)]
         force_foreground: bool,
+
+        #[command(flatten)]
+        overrides: PostActionOverrides,
     },
+}
+
+/// CLI alternatives to the `BUGSEE_*` post-action knobs. Every toggle has an
+/// `--enable-<x>` / `--disable-<x>` pair; the numeric size-check thresholds are
+/// plain value flags. A flag passed on the command line overrides the matching
+/// environment variable (within a pair the last one wins); an unset flag leaves
+/// the env var / default in force. These are overlaid onto the collected
+/// environment by [`apply_overrides`] before any gate runs, so the env-driven
+/// gate logic stays the single source of truth.
+#[derive(clap::Args, Debug, Default)]
+pub struct PostActionOverrides {
+    /// Run the build-publish flow (overrides BUGSEE_BUILD_INFO_ENABLED; default: on).
+    #[arg(long = "enable-build-info", overrides_with = "disable_build_info")]
+    enable_build_info: bool,
+    /// Skip the entire build-publish flow (overrides BUGSEE_BUILD_INFO_ENABLED).
+    #[arg(long = "disable-build-info", overrides_with = "enable_build_info")]
+    disable_build_info: bool,
+
+    /// Also run on plain Build actions, not just Archive (overrides BUGSEE_BUILD_INFO_ALL_ACTIONS; default: off).
+    #[arg(long = "enable-all-actions", overrides_with = "disable_all_actions")]
+    enable_all_actions: bool,
+    /// Run only on Archive actions (overrides BUGSEE_BUILD_INFO_ALL_ACTIONS).
+    #[arg(long = "disable-all-actions", overrides_with = "enable_all_actions")]
+    disable_all_actions: bool,
+
+    /// Run for non-Release configurations too (overrides BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS; default: off → Release-only).
+    #[arg(
+        long = "enable-all-configurations",
+        overrides_with = "disable_all_configurations"
+    )]
+    enable_all_configurations: bool,
+    /// Restrict to Release configurations (overrides BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS).
+    #[arg(
+        long = "disable-all-configurations",
+        overrides_with = "enable_all_configurations"
+    )]
+    disable_all_configurations: bool,
+
+    /// Collect the dependency graph (overrides BUGSEE_DEPENDENCIES_ENABLED; default: on).
+    #[arg(long = "enable-dependencies", overrides_with = "disable_dependencies")]
+    enable_dependencies: bool,
+    /// Skip dependency-graph collection (overrides BUGSEE_DEPENDENCIES_ENABLED).
+    #[arg(long = "disable-dependencies", overrides_with = "enable_dependencies")]
+    disable_dependencies: bool,
+
+    /// Decode build timings from the .xcactivitylog (overrides BUGSEE_BUILD_INFO_TIMINGS_ENABLED; default: on).
+    #[arg(long = "enable-timings", overrides_with = "disable_timings")]
+    enable_timings: bool,
+    /// Skip build-timings decoding (overrides BUGSEE_BUILD_INFO_TIMINGS_ENABLED).
+    #[arg(long = "disable-timings", overrides_with = "enable_timings")]
+    disable_timings: bool,
+
+    /// Upload the packaged .ipa for server-side size analysis (overrides BUGSEE_SIZE_ANALYSIS_ENABLED; default: off).
+    #[arg(
+        long = "enable-size-analysis",
+        overrides_with = "disable_size_analysis"
+    )]
+    enable_size_analysis: bool,
+    /// Do not upload the .ipa for size analysis (overrides BUGSEE_SIZE_ANALYSIS_ENABLED).
+    #[arg(
+        long = "disable-size-analysis",
+        overrides_with = "enable_size_analysis"
+    )]
+    disable_size_analysis: bool,
+
+    /// Use the chunked transport for the artefact upload (overrides BUGSEE_CHUNKED_UPLOAD; default: off).
+    #[arg(
+        long = "enable-chunked-upload",
+        overrides_with = "disable_chunked_upload"
+    )]
+    enable_chunked_upload: bool,
+    /// Use the single-PUT transport for the artefact upload (overrides BUGSEE_CHUNKED_UPLOAD).
+    #[arg(
+        long = "disable-chunked-upload",
+        overrides_with = "enable_chunked_upload"
+    )]
+    disable_chunked_upload: bool,
+
+    /// Enable the in-build size-growth check (overrides BUGSEE_SIZE_CHECK_ENABLED; default: off).
+    #[arg(long = "enable-size-check", overrides_with = "disable_size_check")]
+    enable_size_check: bool,
+    /// Disable the in-build size-growth check (overrides BUGSEE_SIZE_CHECK_ENABLED).
+    #[arg(long = "disable-size-check", overrides_with = "enable_size_check")]
+    disable_size_check: bool,
+
+    /// Warn if the .ipa grew >= this percent vs the previous build (overrides BUGSEE_SIZE_CHECK_WARNING_PCT).
+    #[arg(long = "size-check-warning-pct", value_name = "PCT")]
+    size_check_warning_pct: Option<f64>,
+    /// Fail (exit 40) if the .ipa grew >= this percent (overrides BUGSEE_SIZE_CHECK_FAIL_PCT).
+    #[arg(long = "size-check-fail-pct", value_name = "PCT")]
+    size_check_fail_pct: Option<f64>,
+    /// Warn if the .ipa grew >= this many bytes (overrides BUGSEE_SIZE_CHECK_WARNING_BYTES).
+    #[arg(long = "size-check-warning-bytes", value_name = "BYTES")]
+    size_check_warning_bytes: Option<i64>,
+    /// Fail (exit 40) if the .ipa grew >= this many bytes (overrides BUGSEE_SIZE_CHECK_FAIL_BYTES).
+    #[arg(long = "size-check-fail-bytes", value_name = "BYTES")]
+    size_check_fail_bytes: Option<i64>,
+}
+
+/// Resolve an `--enable-x` / `--disable-x` flag pair to a tri-state. `clap`'s
+/// `overrides_with` guarantees the two bools are never both `true` (the last
+/// one on the command line wins), so this is unambiguous; `None` means neither
+/// was passed (fall back to the env var / default).
+fn resolve_toggle(enable: bool, disable: bool) -> Option<bool> {
+    if enable {
+        Some(true)
+    } else if disable {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Overlay the explicit CLI toggle/threshold flags onto the collected
+/// environment map. A flag that was passed wins over the corresponding
+/// `BUGSEE_*` env var; an unset flag leaves the env value (or its default)
+/// untouched. Bool flags write the canonical `"1"` / `"0"` token so the
+/// existing `env_truthy*` parsing applies unchanged; numeric flags stringify
+/// and are re-validated by the size-check threshold parsers (a non-positive
+/// value disables its gate, exactly as the env path does).
+fn apply_overrides(env: &mut HashMap<String, String>, o: &PostActionOverrides) {
+    fn set_bool(env: &mut HashMap<String, String>, key: &str, v: Option<bool>) {
+        if let Some(b) = v {
+            env.insert(key.to_string(), if b { "1" } else { "0" }.to_string());
+        }
+    }
+    fn set_num(env: &mut HashMap<String, String>, key: &str, v: Option<impl ToString>) {
+        if let Some(n) = v {
+            env.insert(key.to_string(), n.to_string());
+        }
+    }
+
+    set_bool(
+        env,
+        "BUGSEE_BUILD_INFO_ENABLED",
+        resolve_toggle(o.enable_build_info, o.disable_build_info),
+    );
+    set_bool(
+        env,
+        "BUGSEE_BUILD_INFO_ALL_ACTIONS",
+        resolve_toggle(o.enable_all_actions, o.disable_all_actions),
+    );
+    // All-configurations is read by `should_run` as an OR of the canonical key
+    // and the legacy `BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS` alias. When the
+    // flag is explicit, write BOTH keys so a stray legacy env var can't defeat
+    // an explicit `--disable-all-configurations`.
+    if let Some(b) = resolve_toggle(o.enable_all_configurations, o.disable_all_configurations) {
+        let tok = if b { "1" } else { "0" }.to_string();
+        env.insert(
+            "BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS".to_string(),
+            tok.clone(),
+        );
+        env.insert("BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS".to_string(), tok);
+    }
+    set_bool(
+        env,
+        "BUGSEE_DEPENDENCIES_ENABLED",
+        resolve_toggle(o.enable_dependencies, o.disable_dependencies),
+    );
+    set_bool(
+        env,
+        "BUGSEE_BUILD_INFO_TIMINGS_ENABLED",
+        resolve_toggle(o.enable_timings, o.disable_timings),
+    );
+    set_bool(
+        env,
+        "BUGSEE_SIZE_ANALYSIS_ENABLED",
+        resolve_toggle(o.enable_size_analysis, o.disable_size_analysis),
+    );
+    set_bool(
+        env,
+        "BUGSEE_CHUNKED_UPLOAD",
+        resolve_toggle(o.enable_chunked_upload, o.disable_chunked_upload),
+    );
+    set_bool(
+        env,
+        "BUGSEE_SIZE_CHECK_ENABLED",
+        resolve_toggle(o.enable_size_check, o.disable_size_check),
+    );
+
+    set_num(
+        env,
+        "BUGSEE_SIZE_CHECK_WARNING_PCT",
+        o.size_check_warning_pct,
+    );
+    set_num(env, "BUGSEE_SIZE_CHECK_FAIL_PCT", o.size_check_fail_pct);
+    set_num(
+        env,
+        "BUGSEE_SIZE_CHECK_WARNING_BYTES",
+        o.size_check_warning_bytes,
+    );
+    set_num(env, "BUGSEE_SIZE_CHECK_FAIL_BYTES", o.size_check_fail_bytes);
 }
 
 /// CLI dispatch. The app token comes from the global `--app-token` /
@@ -133,9 +332,12 @@ pub async fn dispatch(
     match cmd {
         // `force_foreground` is consumed by `main` (it decides whether to
         // daemonize BEFORE the async runtime starts); by the time dispatch runs
-        // the decision is already made, so it's irrelevant here.
-        XcodeCommand::PostAction { .. } => {
-            let env: HashMap<String, String> = std::env::vars().collect();
+        // the decision is already made, so it's irrelevant here. The `overrides`
+        // are overlaid onto the env map so every downstream gate sees them as if
+        // they were environment variables (CLI flag wins over a real env var).
+        XcodeCommand::PostAction { overrides, .. } => {
+            let mut env: HashMap<String, String> = std::env::vars().collect();
+            apply_overrides(&mut env, &overrides);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
         }
@@ -1051,6 +1253,347 @@ mod tests {
             .iter()
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect()
+    }
+
+    // ── CLI override flags ─────────────────────────────────────────
+
+    /// Parse a `bugsee-cli xcode post-action <extra...>` invocation through the
+    /// real top-level `Cli` and return its `PostActionOverrides`. Exercises the
+    /// actual clap wiring (`overrides_with` last-wins, value parsing) rather
+    /// than constructing the struct by hand.
+    fn parse_overrides(extra: &[&str]) -> PostActionOverrides {
+        use clap::Parser;
+        let mut args: Vec<&str> = vec!["bugsee-cli", "xcode", "post-action"];
+        args.extend_from_slice(extra);
+        let cli = crate::cli::Cli::try_parse_from(args).expect("args should parse");
+        match cli.command {
+            crate::cli::Command::Xcode(XcodeCommand::PostAction { overrides, .. }) => overrides,
+            other => panic!("expected post-action, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_toggle_is_tristate() {
+        assert_eq!(resolve_toggle(true, false), Some(true));
+        assert_eq!(resolve_toggle(false, true), Some(false));
+        assert_eq!(resolve_toggle(false, false), None);
+        // `overrides_with` prevents both-true at the clap layer; if it ever
+        // occurred, enable wins (documented behaviour).
+        assert_eq!(resolve_toggle(true, true), Some(true));
+    }
+
+    #[test]
+    fn enable_disable_pair_resolves_and_last_one_wins() {
+        let only_enable = parse_overrides(&["--enable-size-check"]);
+        assert_eq!(
+            resolve_toggle(
+                only_enable.enable_size_check,
+                only_enable.disable_size_check
+            ),
+            Some(true),
+        );
+
+        let only_disable = parse_overrides(&["--disable-size-check"]);
+        assert_eq!(
+            resolve_toggle(
+                only_disable.enable_size_check,
+                only_disable.disable_size_check
+            ),
+            Some(false),
+        );
+
+        // Both passed — clap's reciprocal `overrides_with` makes the LAST one win.
+        let disable_last = parse_overrides(&["--enable-size-check", "--disable-size-check"]);
+        assert_eq!(
+            resolve_toggle(
+                disable_last.enable_size_check,
+                disable_last.disable_size_check
+            ),
+            Some(false),
+            "disable passed last must win",
+        );
+        let enable_last = parse_overrides(&["--disable-size-check", "--enable-size-check"]);
+        assert_eq!(
+            resolve_toggle(
+                enable_last.enable_size_check,
+                enable_last.disable_size_check
+            ),
+            Some(true),
+            "enable passed last must win",
+        );
+
+        // Neither → fall through to env/default.
+        let none = parse_overrides(&[]);
+        assert_eq!(
+            resolve_toggle(none.enable_size_check, none.disable_size_check),
+            None,
+        );
+    }
+
+    #[test]
+    fn apply_overrides_writes_canonical_bool_tokens() {
+        // A default-off knob enabled + a default-on knob disabled.
+        let o = parse_overrides(&["--enable-size-check", "--disable-build-info"]);
+        let mut env = env_of(&[]);
+        apply_overrides(&mut env, &o);
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_ENABLED").map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_BUILD_INFO_ENABLED").map(String::as_str),
+            Some("0"),
+        );
+        // A knob with no flag passed is never written.
+        assert!(!env.contains_key("BUGSEE_DEPENDENCIES_ENABLED"));
+        // The canonical tokens parse the way the gate logic expects: the
+        // default-on parser must now read the disabled knob as false.
+        assert!(!env_truthy_default_true(
+            env.get("BUGSEE_BUILD_INFO_ENABLED")
+        ));
+        assert!(env_truthy(env.get("BUGSEE_SIZE_CHECK_ENABLED")));
+    }
+
+    #[test]
+    fn every_toggle_flag_writes_its_exact_canonical_key_and_token() {
+        // Regression guard for the FULL flag→env-key→token mapping. The keys are
+        // inline string literals in both `apply_overrides` and each consumer, so
+        // a typo on one side is only caught by a test that pins the exact string
+        // `apply_overrides` writes. Each row asserts `--enable-X` writes "1" and
+        // `--disable-X` writes "0" to the documented key — a typo or a "1"/"0"
+        // swap on ANY knob fails this test loudly.
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "--enable-build-info",
+                "--disable-build-info",
+                "BUGSEE_BUILD_INFO_ENABLED",
+            ),
+            (
+                "--enable-all-actions",
+                "--disable-all-actions",
+                "BUGSEE_BUILD_INFO_ALL_ACTIONS",
+            ),
+            (
+                "--enable-all-configurations",
+                "--disable-all-configurations",
+                "BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS",
+            ),
+            (
+                "--enable-dependencies",
+                "--disable-dependencies",
+                "BUGSEE_DEPENDENCIES_ENABLED",
+            ),
+            (
+                "--enable-timings",
+                "--disable-timings",
+                "BUGSEE_BUILD_INFO_TIMINGS_ENABLED",
+            ),
+            (
+                "--enable-size-analysis",
+                "--disable-size-analysis",
+                "BUGSEE_SIZE_ANALYSIS_ENABLED",
+            ),
+            (
+                "--enable-chunked-upload",
+                "--disable-chunked-upload",
+                "BUGSEE_CHUNKED_UPLOAD",
+            ),
+            (
+                "--enable-size-check",
+                "--disable-size-check",
+                "BUGSEE_SIZE_CHECK_ENABLED",
+            ),
+        ];
+        for (enable, disable, key) in cases {
+            let mut env = env_of(&[]);
+            apply_overrides(&mut env, &parse_overrides(&[enable]));
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some("1"),
+                "{enable} must write {key}=1",
+            );
+
+            let mut env = env_of(&[]);
+            apply_overrides(&mut env, &parse_overrides(&[disable]));
+            assert_eq!(
+                env.get(*key).map(String::as_str),
+                Some("0"),
+                "{disable} must write {key}=0",
+            );
+        }
+    }
+
+    #[test]
+    fn cli_flag_overrides_pre_existing_env_var() {
+        // Real env says enabled; the --disable flag must win.
+        let o = parse_overrides(&["--disable-size-check"]);
+        let mut env = env_of(&[("BUGSEE_SIZE_CHECK_ENABLED", "1")]);
+        apply_overrides(&mut env, &o);
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_ENABLED").map(String::as_str),
+            Some("0"),
+        );
+        assert!(!env_truthy(env.get("BUGSEE_SIZE_CHECK_ENABLED")));
+    }
+
+    #[test]
+    fn all_configurations_flag_writes_both_canonical_and_legacy_keys() {
+        // Disabling must defeat a stray legacy-alias env var (should_run ORs
+        // the two keys), so the explicit flag has to clear BOTH.
+        let o = parse_overrides(&["--disable-all-configurations"]);
+        let mut env = env_of(&[("BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS", "1")]);
+        apply_overrides(&mut env, &o);
+        assert_eq!(
+            env.get("BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS")
+                .map(String::as_str),
+            Some("0"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS")
+                .map(String::as_str),
+            Some("0"),
+        );
+        // The OR the gate computes is now false.
+        assert!(
+            !(env_truthy(env.get("BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS"))
+                || env_truthy(env.get("BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS"))),
+        );
+
+        // Enabling sets both to "1".
+        let o = parse_overrides(&["--enable-all-configurations"]);
+        let mut env = env_of(&[]);
+        apply_overrides(&mut env, &o);
+        assert_eq!(
+            env.get("BUGSEE_BUILD_INFO_ALL_CONFIGURATIONS")
+                .map(String::as_str),
+            Some("1"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_SIZE_ANALYSIS_ALL_CONFIGURATIONS")
+                .map(String::as_str),
+            Some("1"),
+        );
+    }
+
+    #[test]
+    fn numeric_thresholds_stringify_and_reparse_through_size_check() {
+        // All four thresholds at once, each a DISTINCT value, so a key swap (e.g.
+        // a warning value written to a fail key) surfaces as a wrong resolved
+        // field — not just a missing one.
+        let o = parse_overrides(&[
+            "--size-check-warning-pct",
+            "5",
+            "--size-check-fail-pct",
+            "12.5",
+            "--size-check-warning-bytes",
+            "1000",
+            "--size-check-fail-bytes",
+            "1048576",
+        ]);
+        let mut env = env_of(&[]);
+        apply_overrides(&mut env, &o);
+        // Exact env-key strings written by apply_overrides.
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_WARNING_PCT").map(String::as_str),
+            Some("5"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_FAIL_PCT").map(String::as_str),
+            Some("12.5"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_WARNING_BYTES")
+                .map(String::as_str),
+            Some("1000"),
+        );
+        assert_eq!(
+            env.get("BUGSEE_SIZE_CHECK_FAIL_BYTES").map(String::as_str),
+            Some("1048576"),
+        );
+        // And all four round-trip through the real threshold parser, each to its
+        // own field with its own value.
+        let t = crate::cli::size_check::resolve_thresholds(&env);
+        assert_eq!(t.warning_pct, Some(5.0));
+        assert_eq!(t.fail_pct, Some(12.5));
+        assert_eq!(t.warning_bytes, Some(1_000));
+        assert_eq!(t.fail_bytes, Some(1_048_576));
+    }
+
+    #[test]
+    fn zero_numeric_flag_disables_its_gate_like_env() {
+        // Parity with the env path: a 0 threshold disables that gate
+        // (parse_pos_* rejects `<= 0`) rather than erroring.
+        let o = parse_overrides(&["--size-check-fail-pct", "0", "--size-check-fail-bytes", "0"]);
+        let mut env = env_of(&[]);
+        apply_overrides(&mut env, &o);
+        let t = crate::cli::size_check::resolve_thresholds(&env);
+        assert_eq!(t.fail_pct, None);
+        assert_eq!(t.fail_bytes, None);
+    }
+
+    #[test]
+    fn negative_numeric_flag_is_rejected_at_the_cli_layer() {
+        // The stringly-typed env path treats a `<= 0` threshold as "disable".
+        // On the CLI a negative value is a hard parse error instead — clap will
+        // not accept a hyphen-led token as a numeric option value — which is
+        // friendlier than silently disabling the gate on a typo.
+        use clap::Parser;
+        let r = crate::cli::Cli::try_parse_from([
+            "bugsee-cli",
+            "xcode",
+            "post-action",
+            "--size-check-fail-bytes",
+            "-1",
+        ]);
+        assert!(r.is_err(), "negative byte threshold must be rejected");
+    }
+
+    #[test]
+    fn no_flags_is_a_pure_noop_on_the_env_map() {
+        let o = parse_overrides(&[]);
+        let mut env = env_of(&[
+            ("BUGSEE_BUILD_INFO_ENABLED", "weird-value"),
+            ("ACTION", "install"),
+        ]);
+        let before = env.clone();
+        apply_overrides(&mut env, &o);
+        assert_eq!(env, before, "no flag passed → env map untouched");
+    }
+
+    #[test]
+    fn disable_build_info_flag_gates_out_should_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("App.xcarchive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let base = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Release"),
+        ]);
+        // Without the flag this is a Run.
+        assert_eq!(should_run(&base), Gate::Run);
+        // The --disable-build-info flag overlays "0" → Skip.
+        let mut env = base.clone();
+        apply_overrides(&mut env, &parse_overrides(&["--disable-build-info"]));
+        assert!(matches!(should_run(&env), Gate::Skip(_)));
+    }
+
+    #[test]
+    fn enable_all_configurations_flag_admits_a_debug_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("App.xcarchive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let base = env_of(&[
+            ("ACTION", "install"),
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("CONFIGURATION", "Debug"),
+        ]);
+        // Debug is Release-only-gated out by default.
+        assert!(matches!(should_run(&base), Gate::Skip(_)));
+        // The flag lifts the Release-only restriction.
+        let mut env = base.clone();
+        apply_overrides(&mut env, &parse_overrides(&["--enable-all-configurations"]));
+        assert_eq!(should_run(&env), Gate::Run);
     }
 
     // ── Gating ─────────────────────────────────────────────────────
@@ -2273,6 +2816,268 @@ mod tests {
             .unwrap();
         assert!(!report.timings, "timings opt-out must suppress decode");
         assert!(report.build_registered);
+    }
+
+    // ── CLI flags drive the full networked flow (parity with the env vars) ──
+    //
+    // The tests above prove each deep-flow behaviour via its `BUGSEE_*` env var.
+    // These prove the equivalent `--enable-*` / `--disable-*` FLAG produces the
+    // IDENTICAL networked outcome: the env is built WITHOUT the var, the flag
+    // overlay is applied exactly as `dispatch` does, and the real flow runs
+    // against the in-process mock. This closes the gap where a flag's effect was
+    // only observable past the network boundary.
+
+    /// Apply post-action override flags onto an env map, mirroring `dispatch`.
+    fn with_flags(mut env: HashMap<String, String>, flags: &[&str]) -> HashMap<String, String> {
+        apply_overrides(&mut env, &parse_overrides(flags));
+        env
+    }
+
+    #[tokio::test]
+    async fn flag_disable_dependencies_suppresses_collection_through_the_flow() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        // A Podfile that WOULD yield deps if collection ran.
+        std::fs::write(
+            srcroot.join("Podfile.lock"),
+            "PODS:\n  - Alamofire (5.9.1)\n\nDEPENDENCIES:\n  - Alamofire (= 5.9.1)\n",
+        )
+        .unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        // No BUGSEE_DEPENDENCIES_ENABLED env var — the FLAG drives the opt-out.
+        let env = with_flags(
+            env_of(&[
+                ("ACTION", "install"),
+                ("ARCHIVE_PATH", archive.to_str().unwrap()),
+                ("CONFIGURATION", "Release"),
+                ("SRCROOT", srcroot.to_str().unwrap()),
+                ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ]),
+            &["--disable-dependencies"],
+        );
+        let report = run_post_action_inner(&env, &server.uri(), Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !report.deps_collected,
+            "--disable-dependencies must suppress collection through the full flow"
+        );
+        assert!(report.build_registered);
+    }
+
+    #[tokio::test]
+    async fn flag_disable_timings_suppresses_decode_through_the_flow() {
+        use crate::cli::xcactivitylog::fixtures;
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        // A decodable build log — timings WOULD resolve without the opt-out.
+        let dd = tmp.path().join("DerivedData").join("MyApp-abc");
+        let logs_build = dd.join("Logs").join("Build");
+        std::fs::create_dir_all(&logs_build).unwrap();
+        fixtures::write_synthetic_log(
+            &logs_build,
+            &[("Ld Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+            &[("Build target Alpha", fixtures::T0, fixtures::T0 + 2.0)],
+        );
+        let obj_root = dd.join("Build").join("Intermediates.noindex");
+        std::fs::create_dir_all(&obj_root).unwrap();
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        // No BUGSEE_BUILD_INFO_TIMINGS_ENABLED env var — the FLAG drives it.
+        let env = with_flags(
+            env_of(&[
+                ("ACTION", "install"),
+                ("ARCHIVE_PATH", archive.to_str().unwrap()),
+                ("CONFIGURATION", "Release"),
+                ("SRCROOT", srcroot.to_str().unwrap()),
+                ("OBJROOT", obj_root.to_str().unwrap()),
+                ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ]),
+            &["--disable-timings"],
+        );
+        let report = run_post_action_inner(&env, &server.uri(), Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            !report.timings,
+            "--disable-timings must suppress decode through the full flow"
+        );
+        assert!(report.build_registered);
+    }
+
+    #[tokio::test]
+    async fn flag_enable_size_analysis_ships_artifact_through_the_flow() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        let art_url = format!("{}/art", server.uri());
+        // The registration signs an artefact endpoint, so a single PUT ships it.
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1", "endpoint": art_url }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1) // exactly one artefact PUT
+            .mount(&server)
+            .await;
+
+        // No BUGSEE_SIZE_ANALYSIS_ENABLED env var — the FLAG turns it on.
+        let env = with_flags(
+            env_of(&[
+                ("ACTION", "install"),
+                ("ARCHIVE_PATH", archive.to_str().unwrap()),
+                ("CONFIGURATION", "Release"),
+                ("SRCROOT", srcroot.to_str().unwrap()),
+                ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ]),
+            &["--enable-size-analysis"],
+        );
+        let report = run_post_action_inner(&env, &server.uri(), Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            report.size_analysis,
+            "--enable-size-analysis must turn it on"
+        );
+        assert!(
+            report.artifact_uploaded,
+            "--enable-size-analysis must ship the artefact (the PUT must fire)"
+        );
+        assert!(report.build_registered);
+        // server drops here → wiremock asserts the PUT .expect(1) count was met.
+    }
+
+    #[tokio::test]
+    async fn flag_size_check_fail_returns_terminal_error_through_the_flow() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+        // A 1-byte baseline forces the freshly packaged .ipa over the fail gate.
+        Mock::given(method("GET"))
+            .and(path("/v2/apps/TKN/builds/baseline"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true,
+                "result": { "build": { "artifact_size": 1, "version": "2.9", "build": "299" } }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1" }
+            })))
+            .mount(&server)
+            .await;
+
+        // The size-check enable AND the fail threshold both come from FLAGS, not
+        // env vars — proving the numeric threshold flag flows through too.
+        let env = with_flags(
+            env_of(&[
+                ("ACTION", "install"),
+                ("ARCHIVE_PATH", archive.to_str().unwrap()),
+                ("CONFIGURATION", "Release"),
+                ("SRCROOT", srcroot.to_str().unwrap()),
+                ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ]),
+            &["--enable-size-check", "--size-check-fail-bytes", "1"],
+        );
+        let err = run_post_action(&env, &server.uri(), Some("TKN"))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::SizeCheckFailed,
+            "size-check FAIL driven by flags must be a terminal gate error"
+        );
+        assert!(
+            format!("{err}").contains("exceeds fail threshold 1 B"),
+            "err: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn flag_enable_chunked_upload_uses_chunked_transport_through_the_flow() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let (archive, srcroot, dsym_dir) = size_check_archive(tmp.path());
+
+        // Chunked-transport endpoints. A huge chunk_size makes the small .ipa a
+        // single chunk; `missing: []` means the server already has it, so no
+        // chunk PUT happens and the (content-dependent) chunk hashes don't need
+        // matching — method+path matchers suffice. The single-PUT path would hit
+        // `POST /builds` instead and NEVER touch `chunk-options`, so the
+        // `.expect(1)` on chunk-options is what proves the FLAG selected chunked.
+        Mock::given(method("GET"))
+            .and(path("/v2/apps/TKN/builds/chunk-options"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "chunk_size": 1_000_000_000u64, "max_chunks": 100 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds/chunks/check"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "missing": [], "upload_urls": {} }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds/chunked"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": true, "result": { "build_id": "b1", "build_info_upload_endpoint": "" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        // Both size-analysis (so bytes ship at all) and the chunked transport
+        // come from FLAGS — no env vars.
+        let env = with_flags(
+            env_of(&[
+                ("ACTION", "install"),
+                ("ARCHIVE_PATH", archive.to_str().unwrap()),
+                ("CONFIGURATION", "Release"),
+                ("SRCROOT", srcroot.to_str().unwrap()),
+                ("DWARF_DSYM_FOLDER_PATH", dsym_dir.to_str().unwrap()),
+            ]),
+            &["--enable-size-analysis", "--enable-chunked-upload"],
+        );
+        let report = run_post_action_inner(&env, &server.uri(), Some("TKN"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(report.size_analysis);
+        assert!(
+            report.artifact_uploaded,
+            "chunked upload must still ship the artefact"
+        );
+        assert!(report.build_registered);
+        // server drops → wiremock asserts chunk-options + /chunked .expect(1)
+        // fired, i.e. the chunked transport (not single-PUT) was taken.
     }
 
     /// The happy path: with a decodable log and no opt-out, `report.timings` is

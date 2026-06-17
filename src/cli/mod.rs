@@ -129,7 +129,8 @@ pub fn should_daemonize(cli: &Cli) -> bool {
     matches!(
         &cli.command,
         Command::Xcode(xcode::XcodeCommand::PostAction {
-            force_foreground: false
+            force_foreground: false,
+            ..
         })
     )
 }
