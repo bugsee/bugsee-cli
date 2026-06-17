@@ -4,6 +4,18 @@ All notable changes to `bugsee-cli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0] - 2026-06-17
+
+### Added
+- `xcode post-action` CLI flags as alternatives to its `BUGSEE_*` environment
+  variables. Every toggle now has a matching `--enable-<x>` / `--disable-<x>`
+  pair (build-info, all-actions, all-configurations, dependencies, timings,
+  size-analysis, chunked-upload, size-check), and every size-check threshold a
+  value flag (`--size-check-warning-pct` / `--size-check-fail-pct` /
+  `--size-check-warning-bytes` / `--size-check-fail-bytes`). A flag passed on
+  the command line overrides the corresponding env var; within a pair the last
+  flag wins; an unset flag falls back to the env var / default.
+
 ## [0.4.0] - 2026-06-17
 
 The release that moves the whole iOS build-publish flow into the CLI: one
@@ -93,6 +105,8 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.5.0]: https://github.com/bugsee/bugsee-cli/compare/v0.4.0...v0.5.0
+[0.4.0]: https://github.com/bugsee/bugsee-cli/compare/v0.3.0...v0.4.0
 [0.3.0]: https://github.com/bugsee/bugsee-cli/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/bugsee/bugsee-cli/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/bugsee/bugsee-cli/compare/v0.1.0...v0.1.1
