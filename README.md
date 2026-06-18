@@ -2,6 +2,29 @@
 
 Cross-platform Rust binary that collects debug information files (dSYM, ELF, PE/PDB, Portable PDB, Breakpad, R8/ProGuard mappings, JS source maps), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, MSBuild target, Unity post-build hook, Flutter Dart plugin, npm package).
 
+## Installation
+
+Install the latest release — it downloads and **SHA-256-verifies** the binary for
+your host from `download.bugsee.com` (no GitHub dependency):
+
+**macOS / Linux**
+```sh
+curl --proto '=https' --tlsv1.2 -sSfL https://download.bugsee.com/cli/install.sh | sh
+```
+
+**Windows (PowerShell)**
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://download.bugsee.com/cli/install.ps1 | iex"
+```
+
+The installer auto-detects OS/arch and installs to `/usr/local/bin` (or
+`~/.local/bin`) on Unix / `%LOCALAPPDATA%\Bugsee\bin` on Windows, printing a PATH
+hint if needed. Override via env vars: `BUGSEE_CLI_VERSION` (pin an exact
+`X.Y.Z`), `BUGSEE_CLI_INSTALL_DIR` (install location), `BUGSEE_CLI_BASE_URL`
+(download root, e.g. an internal mirror). Keep it current afterwards with
+`bugsee-cli update` (same-major only). Other channels: npm `@bugsee/cli`, a
+Homebrew tap, or the per-build-system bundles — see [Distribution](#distribution).
+
 ## Building
 
 ```sh

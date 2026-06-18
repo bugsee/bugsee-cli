@@ -45,6 +45,14 @@ jobs:
     name: mirror to s3
     runs-on: ubuntu-latest
     steps:
+      # The install scripts (installer/*.sh, *.ps1) are repo files, NOT release
+      # assets and NOT version-scoped (they read cli/latest/version.txt at run
+      # time). Check out the workflow's ref (the default branch on a
+      # workflow_dispatch) so the latest scripts get published to the stable
+      # cli/install.* URLs on every mirror run.
+      - name: Checkout (for install scripts)
+        uses: actions/checkout@v6
+
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v6
         with:
@@ -124,6 +132,23 @@ jobs:
           advance_pointer "cli/latest/version.txt"
           advance_pointer "cli/v${MAJOR}.x/version.txt"
 
+      - name: Publish install scripts (stable URLs)
+        # `cli/install.sh` / `cli/install.ps1` are the `curl … | sh` /
+        # `irm … | iex` entry points. Version-agnostic (they resolve the latest
+        # at run time), served from a stable URL, short-cached so script fixes
+        # roll out promptly. text/plain so a browser shows them and curl pipes
+        # them unchanged.
+        run: |
+          set -euo pipefail
+          aws s3 cp installer/install.sh "s3://${{ vars.S3_BUCKET }}/cli/install.sh" \
+            --acl public-read \
+            --content-type "text/plain; charset=utf-8" \
+            --cache-control "public, max-age=300, must-revalidate"
+          aws s3 cp installer/install.ps1 "s3://${{ vars.S3_BUCKET }}/cli/install.ps1" \
+            --acl public-read \
+            --content-type "text/plain; charset=utf-8" \
+            --cache-control "public, max-age=300, must-revalidate"
+
       - name: Summary
         run: |
           VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"; MAJOR="${VER%%.*}"
@@ -131,3 +156,4 @@ jobs:
           echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/"
           echo "  https://${{ vars.S3_BUCKET }}/cli/latest/   (version.txt -> $VER)"
           echo "  https://${{ vars.S3_BUCKET }}/cli/v${MAJOR}.x/version.txt -> $VER"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/install.sh  +  cli/install.ps1"

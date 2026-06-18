@@ -4,6 +4,16 @@ All notable changes to `bugsee-cli` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Self-hosted install scripts: `curl … https://download.bugsee.com/cli/install.sh | sh`
+  (macOS/Linux) and `irm …/cli/install.ps1 | iex` (Windows PowerShell). They
+  resolve the latest version from the mirror, download + SHA-256-verify the
+  host's binary from `download.bugsee.com` (no GitHub dependency), and install
+  it — overridable via `BUGSEE_CLI_VERSION` / `BUGSEE_CLI_INSTALL_DIR` /
+  `BUGSEE_CLI_BASE_URL`. Published at stable URLs by the release mirror.
+
 ## [0.6.0] - 2026-06-17
 
 ### Added
