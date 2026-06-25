@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] - 2026-06-25
+
 ### Added
 - Self-hosted install scripts: `curl … https://download.bugsee.com/cli/install.sh | sh`
   (macOS/Linux) and `irm …/cli/install.ps1 | iex` (Windows PowerShell). They
@@ -25,6 +27,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   is skipped before its bytes transfer. A `.so` built without `-Wl,--build-id`
   has no `code_id`; it is warned about and skipped (it can't be matched at
   crash time anyway, so it is never faked with the build UUID).
+- Bumped `symbolic-common` / `symbolic-debuginfo` `13` → `13.6.0`. The ELF
+  `code_id` the native upload reads is stable across major-13 minors, so this
+  stays identifier-compatible with the worker's `symbolic` 13.1.1.
+
+### Fixed
+- `upload build-info` now sends `Content-Type: application/octet-stream` on the
+  presigned PUT. The appserver signs the build-info URL **with** that
+  Content-Type, so omitting it made S3 reject the upload with a 403
+  `SignatureDoesNotMatch`. The artefact and chunk PUTs already set it; this
+  aligns the build-info path with them.
 
 ## [0.6.0] - 2026-06-17
 
@@ -142,6 +154,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.0]: https://github.com/bugsee/bugsee-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bugsee/bugsee-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bugsee/bugsee-cli/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/bugsee/bugsee-cli/compare/v0.3.0...v0.4.0

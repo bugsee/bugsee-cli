@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 rust-version = "1.79"
 authors = ["Bugsee"]
@@ -64,9 +64,12 @@ futures-util = "0.3"
 # Symbol parsing — the `symbolic` Rust crate family, aligned with the worker's
 # `symbolic` Python wheels so both sides parse the same artifacts. Drifting
 # majors across producer/consumer would risk subtle DWARF/ELF/PE divergence.
-# Worker is on 13 (target 13.1.1); float within the same major.
-symbolic-common = "13"
-symbolic-debuginfo = "13"
+# Worker is on 13 (target 13.1.1); float within the same major. The ELF
+# `code_id` (GNU build-id) the per-`.so` native upload reads is a stable,
+# major-13 value, so a newer minor here stays identifier-compatible with the
+# worker's 13.1.1.
+symbolic-common = "13.6.0"
+symbolic-debuginfo = "13.6.0"
 
 # Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
 # load-path lines). Used in cli/ios_deps.rs only.
