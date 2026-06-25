@@ -142,8 +142,18 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
     tracing::debug!(presigned_url = %presigned, body_len = body.len(), "PUT build-info bundle");
     // The PUT to the presigned S3 URL is idempotent (an overwrite of the same
     // key), so retrying on a retriable 5xx is safe.
+    //
+    // `Content-Type: application/octet-stream` is REQUIRED: the appserver signs
+    // the build-info presigned URL WITH that Content-Type (to match the Python
+    // producer's urllib default), so it is part of the SigV2 StringToSign.
+    // Omitting it makes S3 recompute a different signature → 403
+    // SignatureDoesNotMatch. The artefact (`build.rs`) and chunk (`chunked.rs`)
+    // PUTs set the same header for the same reason.
     let put = http::send_with_retry(policy, "build-info PUT", true, || {
-        client.put(&presigned).body(body.clone())
+        client
+            .put(&presigned)
+            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
+            .body(body.clone())
     })
     .await?;
 
@@ -396,9 +406,14 @@ mod tests {
         let deps = write(tmp.path(), "dependencies.json", r#"{"deps":[]}"#);
 
         let put_url = format!("{}/presigned-put", server.uri());
-        // ONLY a PUT is expected — any POST would fail the (absent) registration mock.
+        // ONLY a PUT is expected — any POST would fail the (absent) registration
+        // mock. The PUT MUST carry `Content-Type: application/octet-stream`: the
+        // appserver signs the presigned URL with that Content-Type, so omitting
+        // it yields a 403 SignatureDoesNotMatch against real S3. The header
+        // matcher makes this regression-proof (the mock won't match without it).
         Mock::given(method("PUT"))
             .and(path("/presigned-put"))
+            .and(header("content-type", "application/octet-stream"))
             .respond_with(ResponseTemplate::new(204))
             .expect(1)
             .mount(&server)
