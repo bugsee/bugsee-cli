@@ -14,6 +14,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   it — overridable via `BUGSEE_CLI_VERSION` / `BUGSEE_CLI_INSTALL_DIR` /
   `BUGSEE_CLI_BASE_URL`. Published at stable URLs by the release mirror.
 
+### Changed
+- `debug-files upload --type elf` now uploads native symbols **per `.so`**,
+  keyed by each library's real GNU build-id (`code_id`, extracted via
+  `symbolic-debuginfo` — identical to the worker's) instead of the build-level
+  `--uuid`. Each `.so` is registered + uploaded as its own symbol document
+  (pipelines run in parallel), which (a) stops native symbols from colliding
+  with the ProGuard mapping server-side — both previously shared the build
+  UUID — and (b) enables per-library dedup: an unchanged `.so` (same build-id)
+  is skipped before its bytes transfer. A `.so` built without `-Wl,--build-id`
+  has no `code_id`; it is warned about and skipped (it can't be matched at
+  crash time anyway, so it is never faked with the build UUID).
+
 ## [0.6.0] - 2026-06-17
 
 ### Added

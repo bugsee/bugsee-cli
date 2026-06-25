@@ -1,5 +1,6 @@
 use clap::{Subcommand, ValueEnum};
-use std::path::PathBuf;
+use futures_util::StreamExt;
+use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -494,6 +495,22 @@ fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// `build/intermediates/native_debug_metadata/<variant>/out` directory
 /// before invoking the CLI).
 #[allow(clippy::too_many_arguments)]
+/// Max concurrent per-`.so` register+upload pipelines. A native archive can hold
+/// dozens of libraries across ABIs; uploading them serially would dominate CI
+/// time, so each `.so` runs its own (pack → register → dedup-or-PUT) pipeline
+/// and they execute in parallel, bounded here.
+const ELF_UPLOAD_CONCURRENCY: usize = 6;
+
+/// Shared, cheaply-copyable parameters for a single `.so` upload pipeline.
+#[derive(Clone, Copy)]
+struct ElfUploadCtx<'a> {
+    endpoint: &'a str,
+    app_token: &'a str,
+    version: &'a str,
+    build: &'a str,
+    strategy: Strategy,
+}
+
 async fn run_elf_upload(
     paths: &[PathBuf],
     endpoint: &str,
@@ -508,10 +525,8 @@ async fn run_elf_upload(
     }
     for p in paths {
         if !p.is_file() {
-            // Directory-walk + re-pack is out of scope for Phase 1 — the
-            // Gradle plugin pre-zips the intermediate-folder case before
-            // invoking the CLI. Surface a clear config error rather than
-            // attempting a half-supported flow.
+            // Directory-walk + re-pack is out of scope — the Gradle plugin
+            // pre-zips the intermediate-folder case before invoking the CLI.
             return Err(input_invalid(format!(
                 "--type elf expects a pre-built zip file (typically AGP's \
                  native-debug-symbols.zip); got {}",
@@ -520,61 +535,94 @@ async fn run_elf_upload(
         }
     }
 
+    // `build_uuid` (the SDK's runtime BUILD_UUID) is NO LONGER the native
+    // symbol identity — each `.so` is keyed by its OWN GNU build-id (one file →
+    // one symbol document → one S3 object). The BUILD_UUID belongs to the
+    // ProGuard mapping; reusing it for native symbols was the source of the
+    // symbol-record collision. Retained for call-site compatibility + logged
+    // for correlation only.
+    tracing::debug!(build_uuid = %build_uuid, "native upload (per-.so build-id keyed)");
+
     let client = if dry_run {
         None
     } else {
         Some(http::build_client()?)
     };
+    let strategy = compress::Strategy::default();
+    let ctx = ElfUploadCtx {
+        endpoint,
+        app_token,
+        version,
+        build,
+        strategy,
+    };
 
-    let build_uuid_str = build_uuid.to_string();
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
+    let mut skipped_no_build_id = 0u32;
+
     for archive in paths {
         tracing::info!(path = %archive.display(), "processing native-debug-symbols archive");
-        let identity = elf::identify(archive)?;
+        let work_dir = tempfile::tempdir()?;
+        let libs = elf::extract_libs(archive, work_dir.path())?;
+        let total = libs.len();
+
+        // A `.so` with no GNU build-id can never be matched at crash time, so
+        // warn + skip rather than fake an identity (never the build UUID).
+        let mut uploadable: Vec<elf::ElfLib> = Vec::new();
+        for lib in libs {
+            if lib.build_id.is_some() {
+                uploadable.push(lib);
+            } else {
+                skipped_no_build_id += 1;
+                tracing::warn!(
+                    lib = %lib.name,
+                    arch = %lib.arch,
+                    "native library has no GNU build-id; skipping — it cannot be \
+                     symbolicated. Build the library with -Wl,--build-id."
+                );
+            }
+        }
         tracing::info!(
-            uuid = %build_uuid,
-            sha1 = %identity.content_sha1_hex,
-            size_bytes = identity.size_bytes,
-            "identified"
+            libraries = total,
+            uploadable = uploadable.len(),
+            "extracted native libraries"
         );
 
         if dry_run {
             tracing::info!(
-                "dry-run: would POST metadata + PUT {} ({} bytes)",
-                archive.display(),
-                identity.size_bytes,
+                "dry-run: would register + upload {} libraries from {}",
+                uploadable.len(),
+                archive.display()
+            );
+            continue;
+        }
+        if uploadable.is_empty() {
+            tracing::warn!(
+                archive = %archive.display(),
+                "no native libraries with a GNU build-id — nothing to upload"
             );
             continue;
         }
 
-        let metadata = presigned::Metadata {
-            uuid: Some(&build_uuid_str),
-            version,
-            build,
-            hash: Some(&identity.content_sha1_hex),
-            transform: Some("breakpad"),
-            uuids: None,
-            overwrite: None,
-        };
         let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(
-            client,
-            RetryPolicy::default(),
-            endpoint,
-            app_token,
-            &metadata,
-            archive,
-        )
-        .await?;
-        match outcome {
-            presigned::Outcome::Uploaded => {
-                uploaded += 1;
-                tracing::info!(uuid = %build_uuid, "uploaded");
-            }
-            presigned::Outcome::AlreadyExists => {
-                already_existed += 1;
-                tracing::info!(uuid = %build_uuid, "already on server, skipped");
+
+        // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
+        let outcomes: Vec<anyhow::Result<presigned::Outcome>> =
+            futures_util::stream::iter(uploadable.into_iter())
+                .map(|lib| {
+                    let client = client.clone();
+                    let work = work_dir.path().to_path_buf();
+                    async move { upload_one_so(&client, ctx, &lib, &work).await }
+                })
+                .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
+                .collect()
+                .await;
+
+        for outcome in outcomes {
+            match outcome? {
+                presigned::Outcome::Uploaded => uploaded += 1,
+                presigned::Outcome::AlreadyExists => already_existed += 1,
             }
         }
     }
@@ -582,9 +630,66 @@ async fn run_elf_upload(
     if dry_run {
         tracing::info!("dry-run complete");
     } else {
-        tracing::info!(uploaded, already_existed, "upload complete");
+        tracing::info!(
+            uploaded,
+            already_existed,
+            skipped_no_build_id,
+            "native upload complete"
+        );
     }
     Ok(())
+}
+
+/// Pack a single `.so` into its own upload ZIP and register+upload it, keyed by
+/// its GNU build-id with `transform = "breakpad"`. The server dedups on the
+/// build-id: an unchanged library already on the server returns `AlreadyExists`
+/// (16004) and the bytes are never transferred.
+async fn upload_one_so(
+    client: &reqwest::Client,
+    ctx: ElfUploadCtx<'_>,
+    lib: &elf::ElfLib,
+    work_dir: &Path,
+) -> anyhow::Result<presigned::Outcome> {
+    let build_id = lib
+        .build_id
+        .as_deref()
+        .expect("uploadable libs are filtered to Some(build_id)");
+    let entry_name = Path::new(&lib.name)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("lib.so");
+
+    let zip_path = work_dir.join(format!("{build_id}.zip"));
+    compress::pack_single_entry(&lib.path, entry_name, &zip_path, ctx.strategy)?;
+    let hash = elf::sha1_hex_of_file(&zip_path)?;
+
+    let metadata = presigned::Metadata {
+        uuid: Some(build_id),
+        version: ctx.version,
+        build: ctx.build,
+        hash: Some(&hash),
+        transform: Some("breakpad"),
+        uuids: None,
+        overwrite: None,
+    };
+    let outcome = presigned::upload(
+        client,
+        RetryPolicy::default(),
+        ctx.endpoint,
+        ctx.app_token,
+        &metadata,
+        &zip_path,
+    )
+    .await?;
+    match outcome {
+        presigned::Outcome::Uploaded => {
+            tracing::info!(lib = %lib.name, build_id, "uploaded")
+        }
+        presigned::Outcome::AlreadyExists => {
+            tracing::info!(lib = %lib.name, build_id, "already on server, skipped")
+        }
+    }
+    Ok(outcome)
 }
 
 /// Pack and upload one or more JS source maps, keyed by their debug-id.
