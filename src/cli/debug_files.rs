@@ -609,7 +609,7 @@ async fn run_elf_upload(
 
         // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
         let outcomes: Vec<anyhow::Result<presigned::Outcome>> =
-            futures_util::stream::iter(uploadable.into_iter())
+            futures_util::stream::iter(uploadable)
                 .map(|lib| {
                     let client = client.clone();
                     let work = work_dir.path().to_path_buf();
