@@ -19,3 +19,7 @@ pub mod dsym;
 pub mod elf;
 pub mod proguard;
 pub mod sourcemap;
+
+// Hand-assembled Mach-O fixtures shared by the dSYM + IPA unit tests.
+#[cfg(test)]
+pub(crate) mod test_macho;

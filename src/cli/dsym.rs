@@ -357,6 +357,72 @@ mod tests {
     }
 
     #[test]
+    fn extract_slices_reads_arm64_slice_uuid_and_arch() {
+        // The x86_64 case above only proves ONE arch decodes. Pin a second
+        // architecture so a `symbolic` regression that mis-decoded the arm64
+        // `cputype` (or renamed its arch) is caught.
+        use crate::symbols::test_macho::{thin_macho, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64};
+        let uuid = [
+            0xa1, 0xb2, 0xc3, 0xd4, 0xe5, 0xf6, 0x47, 0x88, 0x9a, 0xab, 0xbc, 0xcd, 0xde, 0xef,
+            0xf0, 0x01,
+        ];
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("arm64.macho");
+        std::fs::write(
+            &path,
+            thin_macho(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, uuid),
+        )
+        .unwrap();
+        let slices = extract_slices(&path);
+        assert_eq!(slices.len(), 1, "one arm64 slice, got {:?}", slices);
+        assert_eq!(slices[0].uuid, "A1B2C3D4-E5F6-4788-9AAB-BCCDDEEFF001");
+        assert_eq!(slices[0].arch, "arm64");
+    }
+
+    #[test]
+    fn extract_slices_returns_every_slice_of_a_fat_macho() {
+        // Multi-arch iteration — a single-arch fixture never reaches
+        // `symbolic`'s fat/universal parse path. Pin that BOTH slices come
+        // back, each with the right per-slice uuid + arch (order-independent).
+        use crate::symbols::test_macho::{
+            fat_macho, CPU_SUBTYPE_ARM64_ALL, CPU_SUBTYPE_X86_64_ALL, CPU_TYPE_ARM64,
+            CPU_TYPE_X86_64,
+        };
+        let uuid_x86 = [
+            0x11, 0x11, 0x11, 0x11, 0x22, 0x22, 0x43, 0x33, 0x84, 0x44, 0x55, 0x55, 0x66, 0x66,
+            0x77, 0x77,
+        ];
+        let uuid_arm = [
+            0x88, 0x88, 0x88, 0x88, 0x99, 0x99, 0x4a, 0xaa, 0x8b, 0xbb, 0xcc, 0xcc, 0xdd, 0xdd,
+            0xee, 0xee,
+        ];
+        let fat = fat_macho(&[
+            (CPU_TYPE_X86_64, CPU_SUBTYPE_X86_64_ALL, uuid_x86),
+            (CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, uuid_arm),
+        ]);
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("fat.macho");
+        std::fs::write(&path, fat).unwrap();
+
+        let slices = extract_slices(&path);
+        assert_eq!(
+            slices.len(),
+            2,
+            "both fat slices expected, got {:?}",
+            slices
+        );
+        let by_arch = |a: &str| slices.iter().find(|s| s.arch == a).map(|s| s.uuid.as_str());
+        assert_eq!(
+            by_arch("x86_64"),
+            Some("11111111-2222-4333-8444-555566667777")
+        );
+        assert_eq!(
+            by_arch("arm64"),
+            Some("88888888-9999-4AAA-8BBB-CCCCDDDDEEEE")
+        );
+    }
+
+    #[test]
     fn format_uuid_emits_uppercase_hyphenated_8_4_4_4_12() {
         // Behaviour-pinning test for the uppercase invariant the CLI
         // owes its consumers. The previous `uppercase_output_is_pinned`

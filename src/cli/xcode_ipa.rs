@@ -274,6 +274,43 @@ mod tests {
     }
 
     #[test]
+    fn main_executable_uuid_reads_real_macho_uuid() {
+        // Positive symbolic path for IPA extraction: the other
+        // `main_executable_uuid` tests only cover None cases (non-Mach-O,
+        // missing key) and the arch-preference logic with synthetic UUIDs
+        // that bypass `symbolic`. This one writes a REAL (synthesized)
+        // Mach-O as the app's main binary and pins that `symbolic` parses
+        // its LC_UUID back in the SDK's 32-lowercase-hex, no-dash wire shape.
+        use crate::symbols::test_macho::{thin_macho, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64};
+        let td = tempfile::tempdir().unwrap();
+        let app = td.path().join("MyApp.app");
+        std::fs::create_dir_all(&app).unwrap();
+        std::fs::write(
+            app.join("Info.plist"),
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+  <key>CFBundleExecutable</key><string>MyApp</string>
+</dict></plist>"#,
+        )
+        .unwrap();
+        let uuid = [
+            0xde, 0xad, 0xbe, 0xef, 0x00, 0x00, 0x40, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0xca, 0xfe,
+        ];
+        std::fs::write(
+            app.join("MyApp"),
+            thin_macho(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, uuid),
+        )
+        .unwrap();
+
+        // Expected = the LC_UUID bytes as 32 lowercase hex, no dashes —
+        // derived from the embedded ground truth, not from the output.
+        let expected: String = uuid.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(main_executable_uuid(&app), Some(expected));
+    }
+
+    #[test]
     fn packages_app_under_payload_with_per_file_method() {
         let td = tempfile::tempdir().unwrap();
         let app = make_app(td.path(), "MyApp.app");

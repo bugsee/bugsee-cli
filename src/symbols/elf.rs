@@ -151,6 +151,24 @@ mod tests {
     }
 
     #[test]
+    fn parse_elf_identity_reads_real_fixture_build_id_and_arch() {
+        // The committed aarch64 fixture — `file(1)` reports
+        // BuildID[md5/uuid]=bca64abfec40dbb631bb8f1c37414472. The other unit
+        // tests only cover the non-ELF "unknown" fallback; pin that `symbolic`
+        // returns BOTH the canonical GNU build-id AND the arch for a real ELF,
+        // so a version bump that drifted either surfaces here.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/elf/libsymbol1.so");
+        let bytes = std::fs::read(&fixture).unwrap();
+        let (build_id, arch) = parse_elf_identity(&bytes);
+        assert_eq!(
+            build_id.as_deref(),
+            Some("bca64abfec40dbb631bb8f1c37414472")
+        );
+        assert_eq!(arch, "arm64");
+    }
+
+    #[test]
     fn extract_libs_collects_so_entries_skips_others_and_extracts_bytes() {
         let dir = tempfile::tempdir().unwrap();
         let zip_path = dir.path().join("native-debug-symbols.zip");
