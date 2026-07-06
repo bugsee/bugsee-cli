@@ -198,7 +198,7 @@ dependencies = [
 
 [[package]]
 name = "bugsee-cli"
-version = "0.7.0"
+version = "0.7.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1173,9 +1173,9 @@ checksum = "6b947ae49db0d222b1dbc6b113ce7248a3fc3a6ca21b696717bfc000ba4484d8"
 
 [[package]]
 name = "memmap2"
-version = "0.9.10"
+version = "0.9.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "714098028fe011992e1c3962653c96b2d578c4b4bce9036e15ff220319b1e0e3"
+checksum = "d1219ed1b7f229ee7104d281dd01d6802fe28bb6e95d292942c4daacdeb798c0"
 dependencies = [
  "libc",
 ]
@@ -2017,9 +2017,9 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 
 [[package]]
 name = "symbolic-common"
-version = "13.6.0"
+version = "13.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2dd5edfa38a9ff82e3f394bed19a5f953e2b40d3acf51535a45bb3653c3aabd"
+checksum = "dddd4e6e0693d88f584394027d97d4c4b7748c2fa86be4441703db5fa8b78a95"
 dependencies = [
  "debugid",
  "memmap2",
@@ -2029,9 +2029,9 @@ dependencies = [
 
 [[package]]
 name = "symbolic-debuginfo"
-version = "13.6.0"
+version = "13.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "737039de1ddb6cad35779b9fe6388c279b0fbf712453d052230f2b1270d089d6"
+checksum = "c998cd54903adacdef2ea65782b356436168bcab75307c993ac33e7e9d42810e"
 dependencies = [
  "debugid",
  "elementtree",
@@ -2062,9 +2062,9 @@ dependencies = [
 
 [[package]]
 name = "symbolic-ppdb"
-version = "13.6.0"
+version = "13.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f414178bf567ac7faf18e84ffcc81bb8d5b4ccb6c06da7c78cf8e65d4627c9ae"
+checksum = "9d1e452e9ef272bbee5afde4c7652f2c186ec654a69bd619105cece1f71dbb48"
 dependencies = [
  "flate2",
  "indexmap",

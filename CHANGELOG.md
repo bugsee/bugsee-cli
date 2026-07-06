@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] - 2026-07-06
+
+### Changed
+- Bumped `symbolic-common` / `symbolic-debuginfo` `13.6.0` → `13.8.0`. The ELF
+  `code_id` and Mach-O `debug_id` the CLI reads are stable across major-13
+  minors, so this stays identifier-compatible with the worker's `symbolic`.
+
+### Tests
+- Pinned `symbolic`'s identifier extraction with real-bytes fixtures across every
+  arch/format the CLI parses, so a future crate bump that drifted an identifier
+  is caught: ELF `code_id` **and** `arch` on a real aarch64 `.so`; Mach-O
+  `debug_id` + `arch` for **x86_64, arm64, and fat/universal** binaries (a new
+  hand-assembled, toolchain-free synthesizer exercises symbolic's multi-arch
+  iteration); and the `xcode` IPA main-executable UUID extraction's positive path
+  (previously only its `None` cases were covered).
+
 ## [0.7.0] - 2026-06-25
 
 ### Added
@@ -154,6 +170,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.1]: https://github.com/bugsee/bugsee-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/bugsee/bugsee-cli/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/bugsee/bugsee-cli/compare/v0.5.0...v0.6.0
 [0.5.0]: https://github.com/bugsee/bugsee-cli/compare/v0.4.0...v0.5.0
