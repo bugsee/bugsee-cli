@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.7.1"
+version = "0.7.2"
 edition = "2021"
 rust-version = "1.79"
 authors = ["Bugsee"]
@@ -68,8 +68,8 @@ futures-util = "0.3"
 # `code_id` (GNU build-id) the per-`.so` native upload reads is a stable,
 # major-13 value, so a newer minor here stays identifier-compatible with the
 # worker's 13.1.1.
-symbolic-common = "13.8.0"
-symbolic-debuginfo = "13.8.0"
+symbolic-common = "13.9.0"
+symbolic-debuginfo = "13.9.0"
 
 # Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
 # load-path lines). Used in cli/ios_deps.rs only.
