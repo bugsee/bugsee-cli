@@ -6,6 +6,31 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.3] - 2026-07-16
+
+### Fixed
+- **Security — credential leak in logs.** The app token (embedded in
+  registration paths) and S3 SigV2 signatures (in presigned-PUT query strings)
+  no longer reach error messages or logs. A transport-error path echoed the full
+  `reqwest` URL at the DEFAULT log level — and to the `xcode post-action` daemon
+  log file — leaking both; it now scrubs the URL (`without_url()`), and the
+  debug-level URL log fields are redacted via a shared `redact_url` helper.
+
+### Changed
+- Hardening from an adversarial review:
+  - `update` refuses a non-HTTPS download base except loopback, and caps
+    artefact (512 MiB) / metadata (1 MiB) download sizes so a hostile or
+    misconfigured origin can't OOM the host before the SHA-256 check.
+  - `update` archive extraction lists and rejects absolute / `..`-traversal
+    entries before unpacking.
+  - `sourcemaps inject` rejects `..` / absolute `//# sourceMappingURL=` targets,
+    so a crafted bundle can't steer it at a file outside the bundle directory.
+  - per-`.so` native-upload staging ZIPs are uniquely named, preventing a path
+    collision under concurrent upload if two libraries shared a build-id.
+  - chunked-upload buffers are bounded to the actual chunk length instead of the
+    raw server-provided `chunk_size` (a large `chunk_size` for a small artefact
+    no longer over-allocates).
+
 ## [0.7.2] - 2026-07-11
 
 ### Changed
@@ -177,6 +202,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.3]: https://github.com/bugsee/bugsee-cli/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/bugsee/bugsee-cli/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/bugsee/bugsee-cli/compare/v0.7.0...v0.7.1
 [0.7.0]: https://github.com/bugsee/bugsee-cli/compare/v0.6.0...v0.7.0
