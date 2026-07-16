@@ -34,6 +34,48 @@ fn download_base() -> String {
         .unwrap_or_else(|| DOWNLOAD_BASE.to_string())
 }
 
+/// Upper bound on the update artefact we will buffer in memory. Real CLI
+/// archives are tens of MB; this is a generous ceiling so a misconfigured or
+/// hostile override cannot OOM the host before the SHA-256 check runs.
+const MAX_UPDATE_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+/// Upper bound on a metadata sidecar (`version.txt`, `sha256.sum`) — these are
+/// a handful of bytes; anything large is a wrong/hostile endpoint.
+const MAX_UPDATE_TEXT_BYTES: u64 = 1024 * 1024;
+
+/// Reject an update base that could serve the replacement binary over an
+/// unauthenticated channel. HTTPS is required (rustls authenticates the host);
+/// plain `http://` is allowed ONLY for loopback, which the e2e tests and local
+/// mirrors use. A non-loopback `http://` `BUGSEE_CLI_UPDATE_BASE_URL` would let
+/// a network attacker serve a matching (artifact, sha256) pair — the hash
+/// sidecar is same-origin, so http gives no integrity — leading to code
+/// execution as the invoking user once `self_replace` swaps the binary.
+fn ensure_safe_base(base: &str) -> anyhow::Result<()> {
+    let u = reqwest::Url::parse(base)
+        .map_err(|e| anyhow::anyhow!("invalid update base {base:?}: {e}"))?;
+    match u.scheme() {
+        "https" => Ok(()),
+        "http" => {
+            let host = u.host_str().unwrap_or("");
+            let host = host.trim_start_matches('[').trim_end_matches(']');
+            let loopback = host == "localhost"
+                || host
+                    .parse::<std::net::IpAddr>()
+                    .map(|ip| ip.is_loopback())
+                    .unwrap_or(false);
+            if loopback {
+                Ok(())
+            } else {
+                anyhow::bail!(
+                    "refusing insecure update source {base:?}: http:// is only allowed for \
+                     loopback — use https:// (the sha256 sidecar is same-origin, so http \
+                     provides no download integrity)"
+                )
+            }
+        }
+        other => anyhow::bail!("unsupported scheme {other:?} in update base {base:?}"),
+    }
+}
+
 #[derive(Args, Debug)]
 pub struct UpdateArgs {
     /// Check whether a newer compatible version is available and report it,
@@ -118,6 +160,7 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
     })?;
 
     let base = download_base();
+    ensure_safe_base(&base)?;
 
     // Resolve the target version.
     let target = match args.version.as_deref() {
@@ -383,6 +426,12 @@ async fn fetch_text(url: &str) -> anyhow::Result<String> {
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_UPDATE_TEXT_BYTES)
+    {
+        anyhow::bail!("update metadata at {url} is implausibly large; refusing to read");
+    }
     Ok(resp.text().await?)
 }
 
@@ -396,13 +445,16 @@ async fn install(base: &str, version: &str, triple: &str, dest: &Path) -> anyhow
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
-    let bytes = client
-        .get(&art_url)
-        .send()
-        .await?
-        .error_for_status()?
-        .bytes()
-        .await?;
+    let resp = client.get(&art_url).send().await?.error_for_status()?;
+    if resp
+        .content_length()
+        .is_some_and(|n| n > MAX_UPDATE_ARTIFACT_BYTES)
+    {
+        anyhow::bail!(
+            "update artifact at {art_url} exceeds the {MAX_UPDATE_ARTIFACT_BYTES}-byte cap"
+        );
+    }
+    let bytes = resp.bytes().await?;
     let expected = parse_sha256_sidecar(&fetch_text(&sha_url).await?);
     let actual = sha256_hex(&bytes);
     if !expected.eq_ignore_ascii_case(&actual) {
@@ -411,6 +463,32 @@ async fn install(base: &str, version: &str, triple: &str, dest: &Path) -> anyhow
 
     let archive = dest.join(art_url.rsplit('/').next().unwrap_or("bugsee-cli-archive"));
     std::fs::write(&archive, &bytes)?;
+
+    // Defense-in-depth: list the archive and refuse any entry that is absolute
+    // or contains a `..` traversal BEFORE extracting. Modern tar already rejects
+    // these by default, but verifying explicitly makes the containment
+    // guarantee independent of the host tar's behaviour.
+    let listing = std::process::Command::new("tar")
+        .args(["-tf", &archive.to_string_lossy()])
+        .output()?;
+    if !listing.status.success() {
+        anyhow::bail!("failed to list archive {archive:?} before extraction");
+    }
+    for entry in String::from_utf8_lossy(&listing.stdout).lines() {
+        let e = entry.trim();
+        if e.is_empty() {
+            continue;
+        }
+        let unsafe_entry = e.starts_with('/')
+            || e.starts_with('\\')
+            || Path::new(e)
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            || e.contains("..\\");
+        if unsafe_entry {
+            anyhow::bail!("refusing archive {archive:?}: unsafe path entry {e:?}");
+        }
+    }
 
     // System `tar` extracts both `.tar.xz` (macOS/Linux) and `.zip` (Windows 10+
     // bsdtar), auto-detecting compression by content. `--strip-components=1`
@@ -460,6 +538,20 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ensure_safe_base_requires_https_except_loopback() {
+        assert!(ensure_safe_base("https://download.bugsee.com/cli").is_ok());
+        // Loopback http is allowed (e2e tests / local mirror).
+        assert!(ensure_safe_base("http://127.0.0.1:8080/cli").is_ok());
+        assert!(ensure_safe_base("http://localhost:8080/cli").is_ok());
+        // Non-loopback http is refused (no download integrity).
+        assert!(ensure_safe_base("http://evil.example.com/cli").is_err());
+        assert!(ensure_safe_base("http://10.0.0.5/cli").is_err());
+        // Non-http(s) schemes rejected.
+        assert!(ensure_safe_base("ftp://mirror/cli").is_err());
+        assert!(ensure_safe_base("not a url").is_err());
+    }
 
     // ── version math (cap semantics) ───────────────────────────────
 

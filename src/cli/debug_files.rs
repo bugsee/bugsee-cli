@@ -659,7 +659,18 @@ async fn upload_one_so(
         .and_then(|n| n.to_str())
         .unwrap_or("lib.so");
 
-    let zip_path = work_dir.join(format!("{build_id}.zip"));
+    // Name the staging ZIP after the extracted `.so`'s on-disk filename, which
+    // `elf::extract_libs` already made unique with an index prefix
+    // (`<i>_<basename>`). Keying it on `build_id` instead would collide under
+    // the concurrent `buffer_unordered` upload if two libraries shared a
+    // build-id — two tasks would `File::create` the same path and interleave
+    // writes into a corrupt ZIP with the wrong SHA-1.
+    let zip_stem = lib
+        .path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("lib.so");
+    let zip_path = work_dir.join(format!("{zip_stem}.zip"));
     compress::pack_single_entry(&lib.path, entry_name, &zip_path, ctx.strategy)?;
     let hash = elf::sha1_hex_of_file(&zip_path)?;
 

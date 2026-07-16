@@ -275,10 +275,19 @@ async fn put_chunk(
     // memory so retries can re-issue the body. One chunk at a time keeps peak
     // memory at ~chunk_size regardless of artefact size.
     let mut f = std::fs::File::open(file)?;
-    f.seek(SeekFrom::Start(index as u64 * chunk_size as u64))?;
-    let mut chunk = vec![0u8; chunk_size];
+    let file_len = f.metadata()?.len();
+    let offset = index as u64 * chunk_size as u64;
+    f.seek(SeekFrom::Start(offset))?;
+    // Allocate only what this chunk actually holds — `min(chunk_size, bytes
+    // remaining after `offset`)`. The server can legitimately hand back a huge
+    // `chunk_size` (to make a small artefact a single chunk); allocating the raw
+    // `chunk_size` would then reserve gigabytes for a few-KB upload. Bounding by
+    // the remaining file length (which the CLI produced) keeps peak memory sane
+    // without capping the server's `chunk_size`.
+    let this_chunk = (file_len.saturating_sub(offset)).min(chunk_size as u64) as usize;
+    let mut chunk = vec![0u8; this_chunk];
     let mut filled = 0usize;
-    while filled < chunk_size {
+    while filled < this_chunk {
         let n = f.read(&mut chunk[filled..])?;
         if n == 0 {
             break;

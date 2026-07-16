@@ -117,7 +117,7 @@ pub async fn register(
         app_token
     );
 
-    tracing::debug!(url = %metadata_url, ?metadata, "POST metadata");
+    tracing::debug!(url = %http::redact_url(&metadata_url), ?metadata, "POST metadata");
     // The POST is NOT retried on a retriable status (the server may have created
     // the symbol record, so a status-retry could double-create); transport
     // retries are safe — the server dedups by hash/uuid. Telemetry header lands
@@ -191,7 +191,7 @@ pub async fn put_payload(
     presigned_url: &str,
     payload: &Path,
 ) -> Result<()> {
-    tracing::debug!(presigned_url, "PUT payload");
+    tracing::debug!(url = %http::redact_url(presigned_url), "PUT payload");
     let payload_bytes = tokio::fs::read(payload).await?;
     // The PUT is idempotent (overwrite of the same key) — retry on transport
     // AND retriable status.

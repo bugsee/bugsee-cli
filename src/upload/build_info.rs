@@ -139,7 +139,7 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
     // Read the bundle into memory so retries can re-issue the body. The
     // build-info bundle is small (typically < 5 MB compressed).
     let body = tokio::fs::read(&zip_path).await?;
-    tracing::debug!(presigned_url = %presigned, body_len = body.len(), "PUT build-info bundle");
+    tracing::debug!(url = %http::redact_url(&presigned), body_len = body.len(), "PUT build-info bundle");
     // The PUT to the presigned S3 URL is idempotent (an overwrite of the same
     // key), so retrying on a retriable 5xx is safe.
     //
@@ -199,7 +199,7 @@ async fn register(
     body.insert("request_build_info_upload".into(), Value::Bool(true));
 
     let url = builds_url(endpoint, app_token);
-    tracing::debug!(%url, "POST build registration");
+    tracing::debug!(url = %http::redact_url(&url), "POST build registration");
     let resp = http::send_with_retry(policy, "build registration POST", false, || {
         client
             .post(&url)

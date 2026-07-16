@@ -185,7 +185,7 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         // PUT the artefact ZIP. Idempotent overwrite of the same S3 key, so a
         // retriable 5xx is safe to retry.
         let body = tokio::fs::read(&zip_path).await?;
-        tracing::debug!(endpoint = %reg.artifact_endpoint, body_len = body.len(), "PUT artefact");
+        tracing::debug!(endpoint = %http::redact_url(&reg.artifact_endpoint), body_len = body.len(), "PUT artefact");
         let put = http::send_with_retry(policy, "artefact PUT", true, || {
             client
                 .put(&reg.artifact_endpoint)
@@ -285,7 +285,7 @@ async fn register_single(
     metadata: &Map<String, Value>,
 ) -> Result<Registration> {
     let url = build_info::builds_url(endpoint, app_token);
-    tracing::debug!(%url, "POST build registration");
+    tracing::debug!(url = %http::redact_url(&url), "POST build registration");
     let resp = http::send_with_retry(policy, "build registration POST", false, || {
         client
             .post(&url)

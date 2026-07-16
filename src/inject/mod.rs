@@ -138,7 +138,11 @@ fn paired_map(js_path: &Path, content: &str) -> Option<PathBuf> {
             .next()
             .unwrap_or("")
             .trim();
-        if !url.is_empty() && !url.starts_with("data:") {
+        // Only follow a relative URL that stays within the bundle's directory.
+        // The URL comes from an (attacker-controllable) `//# sourceMappingURL=`
+        // comment; without this guard `../../x.json` would let `inject` re-serialize
+        // and annotate a JSON file outside the bundle tree.
+        if !url.is_empty() && !url.starts_with("data:") && is_contained_relative(url) {
             let cand = dir.join(url);
             if cand.is_file() {
                 return Some(cand);
@@ -147,6 +151,16 @@ fn paired_map(js_path: &Path, content: &str) -> Option<PathBuf> {
     }
     let sibling = PathBuf::from(format!("{}.map", js_path.display()));
     sibling.is_file().then_some(sibling)
+}
+
+/// True if `url` is a plain relative path that cannot escape its base directory:
+/// no `..` component, not absolute, no Windows drive/UNC prefix or root. Only
+/// `Normal` / `CurDir` (`.`) components are allowed.
+fn is_contained_relative(url: &str) -> bool {
+    use std::path::Component;
+    Path::new(url)
+        .components()
+        .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
 /// Insert both `debug_id` and `debugId` into a `.map` JSON (no-op if either is
@@ -207,6 +221,19 @@ pub fn read_debug_id(map_path: &Path) -> Result<Option<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn is_contained_relative_rejects_traversal_and_absolute() {
+        assert!(is_contained_relative("bundle.js.map"));
+        assert!(is_contained_relative("./maps/bundle.js.map"));
+        assert!(is_contained_relative("maps/bundle.js.map"));
+        // Escapes are rejected so a `//# sourceMappingURL=` comment can't steer
+        // `inject` at a file outside the bundle directory.
+        assert!(!is_contained_relative("../secret.json"));
+        assert!(!is_contained_relative("../../etc/x.json"));
+        assert!(!is_contained_relative("maps/../../escape.json"));
+        assert!(!is_contained_relative("/etc/passwd"));
+    }
 
     #[test]
     fn debug_id_is_deterministic_and_content_derived() {

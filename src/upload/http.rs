@@ -140,6 +140,14 @@ where
                 );
             }
             Err(e) => {
+                // Scrub the URL from the reqwest error: its `Display` appends
+                // the full request URL, and ours embed secrets — the app token
+                // in registration paths (`/apps/<token>/…`) and the SigV2
+                // signature in presigned-PUT query params. `without_url()` drops
+                // it so neither leaks into the error string (surfaced by `main`
+                // at the DEFAULT level) or the retry warning (also default-level,
+                // and persisted to the daemon log in `xcode post-action`).
+                let e = e.without_url();
                 if attempt >= policy.max_attempts {
                     return Err(Error::UploadTransport(format!("{what}: {e}")));
                 }
@@ -149,6 +157,43 @@ where
         tokio::time::sleep(policy.backoff(attempt)).await;
         attempt = attempt.saturating_add(1);
     }
+}
+
+/// Redact secrets from a URL before it goes to a log field.
+///
+/// Two credentials live in the URLs this crate handles: the app token, embedded
+/// in registration paths as the segment right after `apps`
+/// (`…/apps/<token>/builds`, `…/apps/<token>/symbols`); and the SigV2 signature,
+/// carried in presigned-S3-PUT query params (`?X-Amz-Signature=…`). This drops
+/// the entire query (and fragment) and masks the token segment, keeping
+/// `scheme://host/path` so the endpoint is still identifiable in logs without
+/// leaking the write credential or the signature. An unparseable input yields a
+/// placeholder rather than echoing raw (possibly secret) bytes.
+pub fn redact_url(raw: &str) -> String {
+    let mut u = match reqwest::Url::parse(raw) {
+        Ok(u) => u,
+        Err(_) => return "<unparseable-url>".to_string(),
+    };
+    u.set_query(None);
+    u.set_fragment(None);
+    if let Some(segments) = u
+        .path_segments()
+        .map(|it| it.map(|s| s.to_string()).collect::<Vec<_>>())
+    {
+        let mut out = Vec::with_capacity(segments.len());
+        let mut after_apps = false;
+        for seg in &segments {
+            // Alphanumeric mask (no `<>`) so `set_path` doesn't percent-encode it.
+            if after_apps && !seg.is_empty() {
+                out.push("APP_TOKEN_REDACTED");
+            } else {
+                out.push(seg.as_str());
+            }
+            after_apps = seg == "apps";
+        }
+        u.set_path(&format!("/{}", out.join("/")));
+    }
+    u.to_string()
 }
 
 /// Truncate a string for log / error output, honouring UTF-8 boundaries so a
@@ -340,5 +385,71 @@ mod tests {
             "all 3 attempts should be made on transport error"
         );
         assert_eq!(err.exit_code(), crate::exit_code::ExitCode::UploadTransport);
+    }
+
+    #[test]
+    fn redact_url_masks_app_token_and_drops_signature_query() {
+        let out = redact_url(
+            "https://api.bugsee.com/v2/apps/SECRET_TOKEN/builds?X-Amz-Signature=DEADBEEF&Expires=1",
+        );
+        assert!(!out.contains("SECRET_TOKEN"), "token leaked: {out}");
+        assert!(!out.contains("DEADBEEF"), "signature leaked: {out}");
+        assert!(
+            out.contains("APP_TOKEN_REDACTED"),
+            "token not masked: {out}"
+        );
+        assert!(!out.contains('?'), "query not dropped: {out}");
+        assert!(
+            out.starts_with("https://api.bugsee.com/"),
+            "scheme/host lost: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_url_drops_presigned_s3_credentials_keeps_object_path() {
+        let out = redact_url(
+            "https://bkt.s3.amazonaws.com/final/build-info/abc.json?X-Amz-Credential=AKIA&X-Amz-Signature=SIG123",
+        );
+        assert!(!out.contains("SIG123"), "signature leaked: {out}");
+        assert!(!out.contains("AKIA"), "credential leaked: {out}");
+        assert!(!out.contains('?'), "query not dropped: {out}");
+        // The object key is not a secret and stays for debuggability.
+        assert!(
+            out.contains("/final/build-info/abc.json"),
+            "path lost: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_url_on_unparseable_returns_placeholder_not_raw() {
+        assert_eq!(redact_url("this is not a url"), "<unparseable-url>");
+    }
+
+    #[tokio::test]
+    async fn transport_error_string_does_not_leak_token_or_signature() {
+        // Every attempt fails at the transport layer (closed loopback port), so
+        // the returned error is `UploadTransport`. It must carry NEITHER the app
+        // token (in the path) NOR the SigV2 signature (in the query) — reqwest's
+        // error `Display` would append the whole URL if not scrubbed.
+        let client = reqwest::Client::new();
+        let policy = RetryPolicy {
+            max_attempts: 1,
+            base_delay: Duration::from_millis(1),
+            max_delay: Duration::from_millis(1),
+        };
+        let url = "http://127.0.0.1:1/v2/apps/SECRET_TOKEN/builds?X-Amz-Signature=DEADBEEFSIG";
+        let err = send_with_retry(policy, "test POST", false, || client.post(url).body("x"))
+            .await
+            .unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            !msg.contains("SECRET_TOKEN"),
+            "token leaked in error: {msg}"
+        );
+        assert!(
+            !msg.contains("DEADBEEFSIG"),
+            "signature leaked in error: {msg}"
+        );
+        assert!(!msg.contains("127.0.0.1"), "url leaked in error: {msg}");
     }
 }
