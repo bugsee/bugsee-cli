@@ -142,13 +142,12 @@ jobs:
         # newest release, and manual backfills must be run oldest→newest
         # so `latest` ends on the highest version.
         #
-        # NO `--provenance`: sigstore provenance requires a PUBLIC source
-        # repository, and bugsee/bugsee-cli is private — npm rejects the
-        # publish with `E422 … Unsupported … repository visibility:
-        # "private"`. OIDC Trusted Publishing (the auth) works fine for a
-        # private repo; only the provenance ATTESTATION is gated on public
-        # visibility. If this repo is ever made public, re-add
-        # `--provenance` to restore the signed build attestation.
+        # `--provenance` emits a sigstore build-provenance attestation
+        # (supply-chain integrity). It requires a PUBLIC source repo, and
+        # bugsee/bugsee-cli is public — so it's enabled. If the repo ever
+        # goes private again, drop this flag: npm rejects provenance from
+        # private repos with `E422 … repository visibility: "private"`
+        # (OIDC auth itself is unaffected by visibility).
         #
         # Do NOT add `env: NODE_AUTH_TOKEN: ...` — even an empty value
         # makes npm prefer broken token auth over OIDC.
@@ -156,4 +155,4 @@ jobs:
         run: |
           tarball="$GITHUB_WORKSPACE/release-assets/bugsee-cli-npm-package.tar.gz"
           ls -la "$tarball"
-          npm publish "$tarball" --access public
+          npm publish "$tarball" --access public --provenance
