@@ -104,7 +104,7 @@ uuid = { version = "1", features = ["v3", "v4", "v5", "serde"] }
 # md-5 matches Java `UUID.nameUUIDFromBytes` for legacy mapping-derived BUILD_UUIDs.)
 sha1 = "0.10"
 sha2 = "0.10"
-md-5 = "0.10"
+md-5 = "0.11"
 hex = "0.4"
 
 # File discovery
