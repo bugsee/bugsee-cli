@@ -12,11 +12,23 @@ name: Publish to npm
 # Release asset (via `installers = [..., "npm"]`); we just download
 # the asset and publish ourselves.
 #
-# Trigger is `workflow_dispatch` (same pattern as mirror-to-s3.yml):
-# the `release: published` event would NOT fire downstream workflows
-# because dist's `Release` workflow creates the release using the
-# default GITHUB_TOKEN, and GitHub deliberately suppresses recursive
-# workflow chains in that case.
+# Triggers:
+#   - `workflow_run` on the dist `Release` workflow completing — the
+#     AUTOMATED path, so every tag-push release publishes to npm without
+#     a manual step. We use `workflow_run` (NOT `release: published`)
+#     because dist's Release workflow creates the release with the
+#     default GITHUB_TOKEN, and GitHub deliberately suppresses
+#     `release`/`push` workflow chains triggered that way — whereas
+#     `workflow_run` (another workflow completing) is NOT suppressed, so
+#     it fires reliably. Guarded to a SUCCESSFUL, tag-`push`-triggered
+#     Release whose tag looks like `vX.Y.Z` (PR-mode Release runs and
+#     failed releases are skipped). By the time Release has completed,
+#     the npm tarball asset is already attached to the release.
+#   - `workflow_dispatch` with a `tag` input — the MANUAL path, for
+#     backfilling missing versions or re-publishing a specific release.
+#
+# Both paths converge on the `resolve` step, which normalizes the tag
+# and gates publication on a version-tag match.
 #
 # Hard requirements for npm Trusted Publishing (per npm docs):
 #   - `permissions: id-token: write` to mint the OIDC token
@@ -33,20 +45,53 @@ on:
         description: 'Release tag to publish (e.g. v0.1.2)'
         required: true
         type: string
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 permissions:
   id-token: write
   contents: read
 
 concurrency:
-  group: npm-publish-${{ github.event.inputs.tag }}
+  # workflow_dispatch → inputs.tag; workflow_run → the Release run's tag
+  # (head_branch is the tag name for a tag-push-triggered run).
+  group: npm-publish-${{ github.event.inputs.tag || github.event.workflow_run.head_branch }}
   cancel-in-progress: false
 
 jobs:
   publish:
     name: publish to npm via OIDC
     runs-on: ubuntu-latest
+    # Manual dispatch always runs. The automated path runs only for a
+    # SUCCESSFUL Release that was triggered by a tag PUSH whose ref looks
+    # like a version tag — this filters out PR-mode Release runs (which
+    # complete with event == 'pull_request') and failed releases. The
+    # exact `vX.Y.Z` shape is re-checked in `resolve` as a belt-and-braces
+    # guard (`startsWith(..., 'v')` alone would also match e.g. `vnext`).
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
     steps:
+      - name: Resolve release tag
+        id: resolve
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            tag="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "should_publish=true" >> "$GITHUB_OUTPUT"
+            echo "Resolved release tag: $tag"
+          else
+            echo "should_publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::'$tag' is not a version tag (vX.Y.Z); skipping npm publish."
+          fi
+
       - name: Setup Node
         # DELIBERATELY no `registry-url:` here — setup-node@v6 with that
         # option writes an .npmrc containing
@@ -54,23 +99,26 @@ jobs:
         # tells npm to use token auth instead of OIDC. We want the
         # opposite: no .npmrc, so npm 11.5+ auto-uses the OIDC token
         # minted from `permissions: id-token: write` above.
+        if: steps.resolve.outputs.should_publish == 'true'
         uses: actions/setup-node@v6
         with:
           node-version: '22'
 
       - name: Upgrade npm to satisfy Trusted Publishing floor (≥ 11.5.1)
         # Node 22's bundled npm is below the OIDC floor as of 2026.
+        if: steps.resolve.outputs.should_publish == 'true'
         run: |
           npm install -g npm@latest
           node --version
           npm --version
 
       - name: Download npm package tarball from release
+        if: steps.resolve.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p release-assets
-          gh release download "${{ github.event.inputs.tag }}" \
+          gh release download "${{ steps.resolve.outputs.tag }}" \
             --repo "${{ github.repository }}" \
             --dir release-assets \
             --pattern 'bugsee-cli-npm-package.tar.gz'
@@ -89,9 +137,23 @@ jobs:
         # npm as a git spec (`owner/repo`) and routed through git
         # ls-remote, failing with a confusing SSH/permission error.
         #
+        # `--tag` is intentionally omitted so each publish moves
+        # `dist-tags.latest`; the automated path always runs for the
+        # newest release, and manual backfills must be run oldest→newest
+        # so `latest` ends on the highest version.
+        #
+        # NO `--provenance`: sigstore provenance requires a PUBLIC source
+        # repository, and bugsee/bugsee-cli is private — npm rejects the
+        # publish with `E422 … Unsupported … repository visibility:
+        # "private"`. OIDC Trusted Publishing (the auth) works fine for a
+        # private repo; only the provenance ATTESTATION is gated on public
+        # visibility. If this repo is ever made public, re-add
+        # `--provenance` to restore the signed build attestation.
+        #
         # Do NOT add `env: NODE_AUTH_TOKEN: ...` — even an empty value
         # makes npm prefer broken token auth over OIDC.
+        if: steps.resolve.outputs.should_publish == 'true'
         run: |
           tarball="$GITHUB_WORKSPACE/release-assets/bugsee-cli-npm-package.tar.gz"
           ls -la "$tarball"
-          npm publish "$tarball" --access public --provenance
+          npm publish "$tarball" --access public
