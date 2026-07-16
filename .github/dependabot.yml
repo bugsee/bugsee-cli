@@ -1,0 +1,45 @@
+# Dependabot keeps bugsee-cli's Rust crates and GitHub Actions current.
+# Version updates are batched weekly (minor/patch grouped into one PR each) to
+# limit noise; Dependabot security updates land out-of-band as soon as an
+# advisory is published (enable "Dependabot security updates" in repo settings).
+version: 2
+updates:
+  # Rust crate dependencies (Cargo.toml / Cargo.lock).
+  - package-ecosystem: "cargo"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 10
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    groups:
+      # One PR per week for all non-major bumps; majors come individually so
+      # they get explicit review.
+      cargo-minor-patch:
+        patterns: ["*"]
+        update-types: ["minor", "patch"]
+    ignore:
+      # `symbolic-common` / `symbolic-debuginfo` MUST stay on major 13 to remain
+      # identifier-compatible with the worker's `symbolic`: the ELF `code_id` and
+      # Mach-O `debug_id` the CLI extracts are stable across major-13 minors, but
+      # a major bump (14.x) could diverge from what the worker reads and silently
+      # break symbolication. Minor/patch within 13.x are still proposed (the
+      # arch/format identifier-pinning tests guard those); a major is not.
+      - dependency-name: "symbolic-common"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "symbolic-debuginfo"
+        update-types: ["version-update:semver-major"]
+
+  # GitHub Actions pinned in the CI / release / npm-publish / mirror workflows.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      github-actions:
+        patterns: ["*"]
