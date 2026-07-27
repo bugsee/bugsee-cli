@@ -6,7 +6,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
-use crate::symbols::{dsym, elf, proguard, sourcemap};
+use crate::symbols::{dsym, elf, pdb, proguard, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
 
@@ -21,7 +21,8 @@ pub enum DebugFilesCommand {
         paths: Vec<PathBuf>,
 
         /// Restrict discovery to a specific debug-file type. If unset, defaults to `proguard`.
-        /// Supported: `proguard`, `elf`, `dsym`, `sourcemaps`; other types are scaffold-only.
+        /// Supported: `proguard`, `elf`, `dsym`, `pdb`, `sourcemaps`; other types are
+        /// scaffold-only. A Rust project uses `elf` on Linux, `dsym` on macOS, `pdb` on Windows.
         #[arg(long, value_enum)]
         r#type: Option<DebugFileType>,
 
@@ -93,7 +94,8 @@ pub enum DebugFileType {
     Elf,
     /// Windows PE (scaffold — not yet processed).
     Pe,
-    /// Windows PDB (scaffold — not yet processed).
+    /// Windows PDB — the debug info a `*-pc-windows-msvc` build emits next to
+    /// the binary. Keyed by the PDB debug id (GUID + age).
     Pdb,
     /// .NET Portable PDB (scaffold — not yet processed).
     PortablePdb,
@@ -143,10 +145,11 @@ pub async fn dispatch(
                 DebugFileType::Proguard => {}
                 DebugFileType::Elf => {}
                 DebugFileType::Dsym => {}
+                DebugFileType::Pdb => {}
                 DebugFileType::Sourcemaps => {}
                 other => {
                     return Err(config_invalid(format!(
-                        "supported types are --type proguard, elf, dsym, and sourcemaps; \
+                        "supported types are --type proguard, elf, dsym, pdb, and sourcemaps; \
                          got {other:?} (other formats are scaffold-only)"
                     )));
                 }
@@ -219,6 +222,13 @@ pub async fn dispatch(
             if kind == DebugFileType::Dsym {
                 return run_dsym_upload(
                     &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
+                )
+                .await;
+            }
+
+            if kind == DebugFileType::Pdb {
+                return run_pdb_upload(
+                    &paths, &endpoint, &app_token, &version, &build, strategy, dry_run,
                 )
                 .await;
             }
@@ -452,6 +462,150 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// subdirectory). The recursive scan lets a caller point at an Xcode archive's
 /// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
 /// itself. De-duplicated.
+/// Find `.pdb` files under `paths`.
+///
+/// An explicitly-passed file is trusted as-is (so a bad one produces a clear
+/// parse error rather than a silent skip); a directory is walked and each
+/// candidate confirmed by its MSF container magic rather than by extension —
+/// a Rust `*-pc-windows-msvc` build drops the PDB next to the `.exe` in
+/// `target/<profile>/`, alongside plenty of unrelated files.
+fn discover_pdbs(paths: &[PathBuf]) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for p in paths {
+        if p.is_file() {
+            if seen.insert(p.clone()) {
+                out.push(p.clone());
+            }
+            continue;
+        }
+        if !p.is_dir() {
+            tracing::warn!(path = %p.display(), "not a file or directory; skipping");
+            continue;
+        }
+        for entry in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+            let ep = entry.path();
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            // Extension first (cheap), then confirm the container magic.
+            if ep.extension().and_then(|e| e.to_str()) != Some("pdb") {
+                continue;
+            }
+            if pdb::looks_like_pdb(ep) && seen.insert(ep.to_path_buf()) {
+                out.push(ep.to_path_buf());
+            }
+        }
+    }
+    out
+}
+
+/// Pack and upload one or more Windows `.pdb` files, keyed by their debug id.
+///
+/// The debug id (GUID + age) is the identity a Windows module reports at crash
+/// time and the key the worker stores (`symbolfiles/pdb.py`, same `symbolic`
+/// major) — so producer and consumer agree by construction. Each PDB is packed
+/// as a single Zstd entry; the worker auto-detects the `pdb` format from the
+/// unzipped container and re-derives the same debug id.
+#[allow(clippy::too_many_arguments)]
+async fn run_pdb_upload(
+    paths: &[PathBuf],
+    endpoint: &str,
+    app_token: &str,
+    version: &str,
+    build: &str,
+    strategy: Strategy,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let candidates = discover_pdbs(paths);
+    if candidates.is_empty() {
+        return Err(input_not_found("no .pdb files found in the given paths"));
+    }
+    tracing::info!(count = candidates.len(), "discovered PDB files");
+
+    let client = if dry_run {
+        None
+    } else {
+        Some(http::build_client()?)
+    };
+    let work_dir = tempfile::tempdir()?;
+
+    let mut uploaded = 0u32;
+    let mut already_existed = 0u32;
+    let mut skipped = 0u32;
+    for pdb_path in &candidates {
+        let identity = match pdb::identify(pdb_path) {
+            Ok(id) => id,
+            Err(e) => {
+                tracing::warn!(path = %pdb_path.display(), error = %e, "not a readable PDB; skipping");
+                skipped += 1;
+                continue;
+            }
+        };
+        // In practice a PDB carries exactly one object; key on the first and log
+        // any others so a surprising multi-object container is visible.
+        let primary = &identity.slices[0];
+        for extra in identity.slices.iter().skip(1) {
+            tracing::warn!(uuid = %extra.uuid, arch = %extra.arch, "ignoring extra PDB object");
+        }
+        tracing::info!(
+            path = %pdb_path.display(),
+            debug_id = %primary.uuid,
+            arch = %primary.arch,
+            "identified PDB",
+        );
+
+        let entry_name = pdb_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("app.pdb");
+        let zip_path = work_dir.path().join(format!("{entry_name}.zip"));
+        compress::pack_single_entry(pdb_path, entry_name, &zip_path, strategy)?;
+        let hash = elf::sha1_hex_of_file(&zip_path)?;
+
+        if dry_run {
+            tracing::info!(path = %pdb_path.display(), debug_id = %primary.uuid, "dry-run: not uploading");
+            uploaded += 1;
+            continue;
+        }
+
+        let metadata = presigned::Metadata {
+            uuid: Some(&primary.uuid),
+            version,
+            build,
+            hash: Some(&hash),
+            transform: None,
+            uuids: None,
+            overwrite: None,
+        };
+        let outcome = presigned::upload(
+            client.as_ref().expect("client built when not dry-run"),
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            &zip_path,
+        )
+        .await?;
+        match outcome {
+            presigned::Outcome::Uploaded => {
+                tracing::info!(debug_id = %primary.uuid, "uploaded");
+                uploaded += 1;
+            }
+            presigned::Outcome::AlreadyExists => {
+                tracing::info!(debug_id = %primary.uuid, "already on server, skipped");
+                already_existed += 1;
+            }
+        }
+    }
+
+    tracing::info!(uploaded, already_existed, skipped, "PDB upload complete");
+    if uploaded == 0 && already_existed == 0 {
+        return Err(input_invalid("no PDB files could be identified"));
+    }
+    Ok(())
+}
+
 fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
     fn is_dsym_bundle(p: &std::path::Path) -> bool {
         p.is_dir()
