@@ -6,6 +6,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`debug-files upload --type rust`** — one command for a Cargo project,
+  whatever target it built for. A Rust project's symbols are a `.dSYM` (Apple),
+  a `.pdb` (`*-pc-windows-msvc`), or the ELF binary itself keyed by its GNU
+  build-id (Linux/Android); this discovers whichever is present and routes each
+  to the same upload path its `--type`-specific command would use.
+  - Discovery is **content-based** (container magic, not host OS), so a
+    cross-compiled `target/<triple>/release` uploads correctly from any host.
+  - Cargo intermediates — `deps/`, `build/`, `incremental/`, `.fingerprint/` —
+    are skipped; walking them would register a symbol document per dependency
+    and build script.
+  - Loose ELF binaries are uploaded per-file, keyed by build-id with the
+    Breakpad transform (the existing `--type elf` path takes AGP's pre-built
+    `native-debug-symbols.zip` and is unchanged).
+  - `--uuid` is rejected: every Rust debug format carries its own identity, and
+    that identity is what the SDK reports for the module at crash time.
+- **Build-configuration preflight for Rust.** Each format has a setting that,
+  when missing, yields an upload that is accepted and then resolves nothing —
+  no DWARF (`debug = 0`), no `.dSYM` (`split-debuginfo` not `"packed"`), no
+  build-id (missing `-Wl,--build-id`). Near-misses found during the walk are
+  warned about with the exact stanza that fixes them, and a walk that finds
+  nothing uploadable fails with the full recipe instead of a bare "not found".
+  Verified against real `cargo build --release` output in both directions.
+
+### Fixed
+- Cargo publishes the profile-root `.dSYM` as a **symlink** into `deps/`, which
+  `walkdir` does not follow — combined with skipping `deps/`, a correctly
+  configured macOS build would have been reported as missing its debug info and
+  advised to set `split-debuginfo`, which it already had.
+
 ## [0.7.3] - 2026-07-16
 
 ### Fixed

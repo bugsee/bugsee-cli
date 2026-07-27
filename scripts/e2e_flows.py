@@ -103,6 +103,71 @@ def free_port():
     return p
 
 
+PDB_GUID = "dfb8e43a-f242-3d73-a453-aeb6a777ef75"
+PDB_DEBUG_ID = PDB_GUID + "-1"
+
+
+def synth_pdb(guid_hex, pdbi_age=7, dbi_age=1, machine=0x8664):
+    """A minimal but genuinely parseable MSF 7.0 container.
+
+    Carries only the two streams a reader needs to derive an identity: the PDB
+    info stream (GUID + age) and the DBI header (age + machine type). Lets the
+    pdb flow run on every OS — no MSVC toolchain required — which matters
+    because Windows is the one platform that actually produces these.
+    """
+    import struct
+
+    page, pages = 4096, 6
+    f = bytearray(page * pages)
+
+    def u32(off, v):
+        f[off:off + 4] = struct.pack("<I", v)
+
+    def u16(off, v):
+        f[off:off + 2] = struct.pack("<H", v)
+
+    # stream table: count, per-stream sizes, then per-stream page numbers.
+    # Only streams 1 (PDB info) and 3 (DBI) hold data; stream 4 exists solely
+    # to be the global symbol table, which the reader insists on.
+    st = bytearray(32)
+    for i, v in enumerate([5, 0, 32, 0, 64, 0, 4, 5]):
+        st[i * 4:i * 4 + 4] = struct.pack("<I", v)
+
+    # page 0: superblock. The block-map page numbers follow the 52-byte header.
+    f[:32] = b"Microsoft C/C++ MSF 7.00\r\n\x1aDS\x00\x00\x00"
+    u32(32, page)          # page_size
+    u32(36, 1)             # free_page_map
+    u32(40, pages)         # pages_used
+    u32(44, len(st))       # directory_size
+    u32(48, 0)             # reserved
+    u32(52, 2)             # -> page 2
+    u32(2 * page, 3)       # page 2 -> page 3
+    f[3 * page:3 * page + len(st)] = st
+
+    # page 4: stream 1 — version (VC70), signature, age, GUID, names_size.
+    g = guid_hex.replace("-", "")
+    pdbi = 4 * page
+    u32(pdbi, 20000404)
+    u32(pdbi + 4, 0x12345678)
+    u32(pdbi + 8, pdbi_age)
+    u32(pdbi + 12, int(g[0:8], 16))
+    u16(pdbi + 16, int(g[8:12], 16))
+    u16(pdbi + 18, int(g[12:16], 16))
+    f[pdbi + 20:pdbi + 28] = bytes.fromhex(g[16:32])
+    u32(pdbi + 28, 0)
+
+    # page 5: stream 3 — the DBI header. Its age wins over the PDB info age.
+    dbi = 5 * page
+    u32(dbi, 0xFFFFFFFF)   # signature
+    u32(dbi + 4, 19990903)  # version (V70)
+    u32(dbi + 8, dbi_age)
+    u16(dbi + 12, 0xFFFF)  # gs_symbols_stream (none)
+    u16(dbi + 16, 0xFFFF)  # ps_symbols_stream (none)
+    u16(dbi + 20, 4)       # symbol_records_stream -> empty stream 4
+    u16(dbi + 58, machine)
+    return bytes(f)
+
+
 def make_fixtures(fix):
     os.makedirs(fix, exist_ok=True)
     with open(os.path.join(fix, "mapping.txt"), "w") as f:
@@ -119,6 +184,31 @@ def make_fixtures(fix):
     import zipfile as zf
     with zf.ZipFile(os.path.join(fix, "native-debug-symbols.zip"), "w") as z:
         z.writestr("arm64-v8a/libfoo.so", b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 256)
+    # A Rust MSVC build drops the PDB into target/<profile>/ next to unrelated
+    # files, so the flow points at a directory, not the file.
+    tgt = os.path.join(fix, "target", "release")
+    os.makedirs(tgt, exist_ok=True)
+    with open(os.path.join(tgt, "app.pdb"), "wb") as f:
+        f.write(synth_pdb(PDB_GUID))
+    with open(os.path.join(tgt, "app.exe"), "wb") as f:
+        f.write(b"MZ" + b"\x00" * 512)
+    # --type rust points at a Cargo profile dir and discovers whatever the
+    # target produced. Reuse the PDB (the *-pc-windows-msvc case); `deps/` holds
+    # a DIFFERENT symbol that must never be uploaded — walking Cargo's
+    # intermediates would register a document per dependency.
+    rtgt = os.path.join(fix, "rust_target", "release")
+    os.makedirs(os.path.join(rtgt, "deps"), exist_ok=True)
+    with open(os.path.join(rtgt, "app.pdb"), "wb") as f:
+        f.write(synth_pdb(PDB_GUID))
+    with open(os.path.join(rtgt, "deps", "app-9f8a7b6c.pdb"), "wb") as f:
+        f.write(synth_pdb("ffffffffffffffffffffffffffffffff"))
+    with open(os.path.join(rtgt, "app.d"), "w") as f:
+        f.write("app: src/main.rs\n")
+    # A profile dir with build output but no debug symbols — the stock
+    # `cargo build --release` case, which must fail with the build recipe.
+    os.makedirs(os.path.join(fix, "rust_bare", "release"), exist_ok=True)
+    with open(os.path.join(fix, "rust_bare", "release", "app.d"), "w") as f:
+        f.write("app: src/main.rs\n")
     with open(os.path.join(fix, "payload.json"), "w") as f:
         json.dump({"version": "1.2.3", "build": "42", "platform": "android"}, f)
     with open(os.path.join(fix, "deps.json"), "w") as f:
@@ -137,6 +227,23 @@ def make_fixtures(fix):
             subprocess.run(["dsymutil", exe, "-o", dsym], check=True, capture_output=True)
         except Exception as e:
             print(f"  [warn] dSYM fixture build failed, skipping dsym flow: {e}")
+
+        # Reproduce the REAL macOS Cargo layout: the bundle is built inside
+        # deps/ and the profile root gets a SYMLINK to it. walkdir does not
+        # follow symlinks and deps/ is skipped, so mishandling this loses the
+        # bundle and then tells a correctly-configured build to set
+        # split-debuginfo. Kept separate from the PDB fixture so each flow
+        # makes exactly one registration POST to assert against.
+        if os.path.isdir(dsym) and hasattr(os, "symlink"):
+            mtgt = os.path.join(fix, "rust_mac", "release")
+            os.makedirs(os.path.join(mtgt, "deps"), exist_ok=True)
+            real = os.path.join(mtgt, "deps", "app-e5e456b0c12af5f0.dSYM")
+            try:
+                shutil.copytree(dsym, real)
+                shutil.copy(exe, os.path.join(mtgt, "app"))
+                os.symlink(real, os.path.join(mtgt, "app.dSYM"))
+            except Exception as e:
+                print(f"  [warn] rust/macOS dSYM layout fixture failed: {e}")
 
 
 def run(binpath, flow, args, expect_code=0):
@@ -188,11 +295,29 @@ def main():
     results["elf"] = run(binpath, "elf", ["debug-files", "upload", "--type", "elf",
                                           os.path.join(fix, "native-debug-symbols.zip"),
                                           "--uuid", "11111111-2222-3333-4444-555555555555"] + v)
+    results["pdb"] = run(binpath, "pdb", ["debug-files", "upload", "--type", "pdb",
+                                          os.path.join(fix, "target", "release")] + v)
     if os.path.isdir(os.path.join(fix, "App.dSYM")):
         results["dsym"] = run(binpath, "dsym", ["debug-files", "upload", "--type", "dsym",
                                                 os.path.join(fix, "App.dSYM")] + v)
     else:
         print("  [SKIP] dsym (no Apple toolchain on this host)")
+
+    # --type rust: point at a Cargo profile dir, upload whatever it produced.
+    results["rust"] = run(binpath, "rust", ["debug-files", "upload", "--type", "rust",
+                                            os.path.join(fix, "rust_target", "release")] + v)
+    # A stock release build has nothing uploadable — exit 10 (InputNotFound),
+    # substantive, so an integrator does not silently fall back.
+    results["rust_no_symbols_exits_10"] = run(
+        binpath, "rust_bare", ["debug-files", "upload", "--type", "rust",
+                               os.path.join(fix, "rust_bare", "release")] + v,
+        expect_code=10)
+    macdir = os.path.join(fix, "rust_mac", "release")
+    if os.path.isdir(macdir):
+        results["rust_symlinked_dsym"] = run(
+            binpath, "rust_mac", ["debug-files", "upload", "--type", "rust", macdir] + v)
+    else:
+        print("  [SKIP] rust_symlinked_dsym (no Apple toolchain on this host)")
 
     pj = os.path.join(fix, "payload.json")
     results["build_single"] = run(binpath, "build_single", ["upload", "build", "--payload-json", pj,
@@ -219,6 +344,27 @@ def main():
     except Exception as e:
         print("  [warn] could not verify sourcemap key:", e)
         results["sourcemap_keyed_by_debug_id"] = False
+    try:
+        # The upload key must be the PDB's own debug id (GUID + age) — the
+        # identity a crashing Windows module reports — not the PE code id.
+        post = json.load(open(cappath("pdb__symbols_post.json")))
+        results["pdb_keyed_by_debug_id"] = (post.get("uuid") == PDB_DEBUG_ID)
+        if not results["pdb_keyed_by_debug_id"]:
+            print(f"  [warn] pdb uuid was {post.get('uuid')!r}, expected {PDB_DEBUG_ID!r}")
+    except Exception as e:
+        print("  [warn] could not verify pdb key:", e)
+        results["pdb_keyed_by_debug_id"] = False
+    try:
+        # --type rust must key the upload by the artifact's own identity, and
+        # must have registered the PROFILE-ROOT symbol — not the different one
+        # planted in deps/, which proves Cargo intermediates are skipped.
+        post = json.load(open(cappath("rust__symbols_post.json")))
+        results["rust_keyed_by_root_artifact"] = (post.get("uuid") == PDB_DEBUG_ID)
+        if not results["rust_keyed_by_root_artifact"]:
+            print(f"  [warn] rust uuid was {post.get('uuid')!r}, expected {PDB_DEBUG_ID!r}")
+    except Exception as e:
+        print("  [warn] could not verify rust key:", e)
+        results["rust_keyed_by_root_artifact"] = False
     try:
         bp = json.load(open(cappath("build_single__builds_post.json")))
         results["build_requests_artifact_upload"] = (bp.get("request_artifact_upload") is True)

@@ -56,8 +56,12 @@ builds the tokio runtime, and dispatches.
   I/O flows through it. `build` (artefact registration + single-PUT), `chunked`
   (chunked artefact protocol), `build_info` (metadata-bundle ZIP), `presigned`
   (two-stage POST-metadata-then-PUT symbol upload).
-- `src/symbols/` — per-format identification/packaging (dSYM, ELF, ProGuard,
-  source map).
+- `src/symbols/` — per-format identification/packaging (dSYM, ELF, PDB,
+  ProGuard, source map). `rust` sits ACROSS the others: a Cargo target's symbols
+  are a `.dSYM`, a `.pdb`, or the ELF itself depending on the triple, so it
+  classifies by container magic (never host OS — cross-compilation is normal),
+  skips Cargo intermediates, and diagnoses the build settings that silently
+  produce unusable symbols.
 - `src/compress/` — the ZIP + zstd packer (the wire format).
 - `src/inject/` — source-map debug-id injection.
 - `src/daemon.rs` — the Unix double-fork for `xcode post-action`'s background mode.

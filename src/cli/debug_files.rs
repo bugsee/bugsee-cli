@@ -6,7 +6,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
-use crate::symbols::{dsym, elf, pdb, proguard, sourcemap};
+use crate::symbols::{dsym, elf, pdb, proguard, rust, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
 
@@ -21,8 +21,10 @@ pub enum DebugFilesCommand {
         paths: Vec<PathBuf>,
 
         /// Restrict discovery to a specific debug-file type. If unset, defaults to `proguard`.
-        /// Supported: `proguard`, `elf`, `dsym`, `pdb`, `sourcemaps`; other types are
-        /// scaffold-only. A Rust project uses `elf` on Linux, `dsym` on macOS, `pdb` on Windows.
+        /// Supported: `proguard`, `rust`, `elf`, `dsym`, `pdb`, `sourcemaps`; other types are
+        /// scaffold-only. For a Cargo project use `--type rust`, which discovers whichever
+        /// format the target produced (`.dSYM` / `.pdb` / build-id ELF) and reports the build
+        /// settings needed when it finds none.
         #[arg(long, value_enum)]
         r#type: Option<DebugFileType>,
 
@@ -42,6 +44,10 @@ pub enum DebugFilesCommand {
         /// or crash symbolication never resolves). If the supplied value differs
         /// from what the CLI would have computed, a warning is logged but the
         /// override wins.
+        ///
+        /// Required for `--type elf`; REJECTED for `--type dsym` and
+        /// `--type pdb`, whose identity is read out of the file itself and
+        /// could never match an override at crash time.
         #[arg(long)]
         uuid: Option<String>,
 
@@ -59,9 +65,10 @@ pub enum DebugFilesCommand {
         zstd_level: Option<i64>,
 
         /// Force a re-upload even if the server already has the symbol. For
-        /// `--type dsym` this bypasses the pre-upload UUID dedup, re-packing and
-        /// re-uploading the bundle. (Other types dedup server-side by content
-        /// hash on the metadata POST.)
+        /// `--type dsym` and `--type pdb` — the two that declare their identity
+        /// up front — this bypasses the pre-upload dedup, re-packing and
+        /// re-uploading the file. (Other types dedup server-side by content hash
+        /// on the metadata POST.)
         #[arg(long)]
         force: bool,
 
@@ -103,6 +110,13 @@ pub enum DebugFileType {
     Breakpad,
     /// Android R8 / ProGuard `mapping.txt` (the default when `--type` is unset).
     Proguard,
+    /// Rust (Cargo) project — discovers whichever debug format the target
+    /// emitted: an Apple `.dSYM` bundle, a Windows `.pdb`, or the ELF binary
+    /// itself keyed by its GNU build-id. Classification is by container magic,
+    /// so a cross-compiled `target/<triple>/release` works from any host.
+    /// Cargo intermediates (`deps/`, `build/`, `incremental/`, `.fingerprint/`)
+    /// are skipped.
+    Rust,
     /// JVM bytecode debug info (scaffold — not yet processed).
     Jvm,
     /// Source bundle (scaffold — not yet processed).
@@ -143,14 +157,15 @@ pub async fn dispatch(
             let kind = r#type.unwrap_or(DebugFileType::Proguard);
             match kind {
                 DebugFileType::Proguard => {}
+                DebugFileType::Rust => {}
                 DebugFileType::Elf => {}
                 DebugFileType::Dsym => {}
                 DebugFileType::Pdb => {}
                 DebugFileType::Sourcemaps => {}
                 other => {
                     return Err(config_invalid(format!(
-                        "supported types are --type proguard, elf, dsym, pdb, and sourcemaps; \
-                         got {other:?} (other formats are scaffold-only)"
+                        "supported types are --type proguard, rust, elf, dsym, pdb, and \
+                         sourcemaps; got {other:?} (other formats are scaffold-only)"
                     )));
                 }
             }
@@ -174,6 +189,21 @@ pub async fn dispatch(
                 return Err(config_invalid(
                     "--uuid does not apply to --type dsym — the server extracts Mach-O UUIDs \
                      from the dSYM bundle itself, one per architecture slice",
+                ));
+            }
+            if kind == DebugFileType::Pdb && parsed_override.is_some() {
+                return Err(config_invalid(
+                    "--uuid does not apply to --type pdb — the identity is the PDB's own \
+                     debug id (GUID + age), read from the container; an override could \
+                     never match what a crashing Windows module reports",
+                ));
+            }
+            if kind == DebugFileType::Rust && parsed_override.is_some() {
+                return Err(config_invalid(
+                    "--uuid does not apply to --type rust — every Rust debug format carries \
+                     its own identity (Mach-O UUID, PDB debug id, or GNU build-id), which is \
+                     what the SDK reports for that module at crash time; an override could \
+                     never match it",
                 ));
             }
 
@@ -228,7 +258,14 @@ pub async fn dispatch(
 
             if kind == DebugFileType::Pdb {
                 return run_pdb_upload(
-                    &paths, &endpoint, &app_token, &version, &build, strategy, dry_run,
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
+                )
+                .await;
+            }
+
+            if kind == DebugFileType::Rust {
+                return run_rust_upload(
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
                 )
                 .await;
             }
@@ -456,12 +493,6 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
-/// Recursively discover `.dSYM` bundles under the given paths. An explicit
-/// `.dSYM` directory is taken as-is; a directory is walked for any `*.dSYM`
-/// bundle (a directory named `*.dSYM` with a `Contents/Resources/DWARF`
-/// subdirectory). The recursive scan lets a caller point at an Xcode archive's
-/// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
-/// itself. De-duplicated.
 /// Find `.pdb` files under `paths`.
 ///
 /// An explicitly-passed file is trusted as-is (so a bad one produces a clear
@@ -488,8 +519,14 @@ fn discover_pdbs(paths: &[PathBuf]) -> Vec<PathBuf> {
             if !entry.file_type().is_file() {
                 continue;
             }
-            // Extension first (cheap), then confirm the container magic.
-            if ep.extension().and_then(|e| e.to_str()) != Some("pdb") {
+            // Extension first (cheap), then confirm the container magic. The
+            // comparison is case-insensitive: Windows filesystems are, and
+            // older MSVC/CMake tooling emits `APP.PDB`.
+            if !ep
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| e.eq_ignore_ascii_case("pdb"))
+            {
                 continue;
             }
             if pdb::looks_like_pdb(ep) && seen.insert(ep.to_path_buf()) {
@@ -507,6 +544,9 @@ fn discover_pdbs(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// major) — so producer and consumer agree by construction. Each PDB is packed
 /// as a single Zstd entry; the worker auto-detects the `pdb` format from the
 /// unzipped container and re-derives the same debug id.
+///
+/// Because the debug id is declared up front, the server can dedup BEFORE
+/// signing an upload URL — `force` (-> `overwrite`) is what bypasses that skip.
 #[allow(clippy::too_many_arguments)]
 async fn run_pdb_upload(
     paths: &[PathBuf],
@@ -515,6 +555,7 @@ async fn run_pdb_upload(
     version: &str,
     build: &str,
     strategy: Strategy,
+    force: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let candidates = discover_pdbs(paths);
@@ -576,7 +617,7 @@ async fn run_pdb_upload(
             hash: Some(&hash),
             transform: None,
             uuids: None,
-            overwrite: None,
+            overwrite: if force { Some(true) } else { None },
         };
         let outcome = presigned::upload(
             client.as_ref().expect("client built when not dry-run"),
@@ -606,6 +647,201 @@ async fn run_pdb_upload(
     Ok(())
 }
 
+/// Discover and upload a Cargo project's debug symbols, whatever format the
+/// target produced.
+///
+/// A Rust project has no single symbol format — it is a `.dSYM` for Apple
+/// targets, a `.pdb` for `*-pc-windows-msvc`, and the ELF binary itself
+/// (keyed by its GNU build-id) for Linux/Android. Requiring the user to know
+/// which, and to name paths inside `target/`, is the ergonomic gap this closes:
+/// point at `target/release` (or a cross-compiled `target/<triple>/release`)
+/// and each discovered artifact is routed to the same upload path its
+/// `--type`-specific command would use. Classification is by container magic,
+/// so a Linux binary cross-compiled on a Mac is still recognized as ELF.
+///
+/// The preflight is the other half. Every format has a Cargo setting that, if
+/// missing, yields an upload that succeeds and then resolves nothing — no
+/// DWARF (`debug = 0`), no `.dSYM` (`split-debuginfo` not `"packed"`), no
+/// build-id (missing `-Wl,--build-id`). Each near-miss found during the walk is
+/// reported with the exact stanza that fixes it, and a walk that finds nothing
+/// uploadable fails with the full recipe rather than a bare "not found".
+#[allow(clippy::too_many_arguments)]
+async fn run_rust_upload(
+    paths: &[PathBuf],
+    endpoint: &str,
+    app_token: &str,
+    version: &str,
+    build: &str,
+    strategy: Strategy,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let findings = rust::discover(paths);
+
+    tracing::info!(
+        dsyms = findings.dsyms.len(),
+        pdbs = findings.pdbs.len(),
+        elves = findings.elves.len(),
+        "discovered Rust debug symbols"
+    );
+
+    // Advice is emitted BEFORE the uploads: a partially-configured build (say,
+    // a dSYM present but `debug = 0`) still uploads, and the warning must not
+    // scroll past underneath a wall of upload logs.
+    for line in rust::preflight_advice(&findings) {
+        tracing::warn!("{line}");
+    }
+
+    if findings.is_empty() {
+        return Err(input_not_found(rust::nothing_found_advice(paths)));
+    }
+
+    // Each format keeps its own upload semantics — dSYM and PDB declare their
+    // identity up front so the server can dedup before a byte is packed, while
+    // ELF is keyed per-file by build-id with the Breakpad transform.
+    if !findings.dsyms.is_empty() {
+        run_dsym_upload(
+            &findings.dsyms,
+            endpoint,
+            app_token,
+            version,
+            build,
+            strategy,
+            force,
+            dry_run,
+        )
+        .await?;
+    }
+    if !findings.pdbs.is_empty() {
+        run_pdb_upload(
+            &findings.pdbs,
+            endpoint,
+            app_token,
+            version,
+            build,
+            strategy,
+            force,
+            dry_run,
+        )
+        .await?;
+    }
+    if !findings.elves.is_empty() {
+        run_rust_elf_upload(
+            &findings.elves,
+            endpoint,
+            app_token,
+            version,
+            build,
+            strategy,
+            dry_run,
+        )
+        .await?;
+    }
+
+    tracing::info!(
+        artifacts = findings.uploadable_count(),
+        "Rust symbol upload complete"
+    );
+    Ok(())
+}
+
+/// Upload loose ELF binaries, one symbol document per file, keyed by build-id.
+///
+/// Distinct from [`run_elf_upload`], which takes AGP's pre-built
+/// `native-debug-symbols.zip`: a Cargo build produces the binary directly on
+/// disk, with no archive to unpack and no caller-supplied `--uuid` — the GNU
+/// build-id inside each file is the identity, and it is the same value the
+/// Rust SDK reports for that module at crash time.
+#[allow(clippy::too_many_arguments)]
+async fn run_rust_elf_upload(
+    candidates: &[rust::ElfCandidate],
+    endpoint: &str,
+    app_token: &str,
+    version: &str,
+    build: &str,
+    strategy: Strategy,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let client = if dry_run {
+        None
+    } else {
+        Some(http::build_client()?)
+    };
+    let work_dir = tempfile::tempdir()?;
+
+    let mut uploaded = 0u32;
+    let mut already_existed = 0u32;
+    for (i, cand) in candidates.iter().enumerate() {
+        tracing::info!(
+            path = %cand.path.display(),
+            build_id = %cand.build_id,
+            arch = %cand.arch,
+            debug_info = cand.has_debug_info,
+            "identified ELF",
+        );
+
+        let entry_name = cand
+            .path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("binary");
+        // Index-prefix the staging ZIP: two targets in one tree can share a
+        // basename (`target/<triple-a>/release/app`, `.../<triple-b>/...`) and
+        // would otherwise write the same staging path.
+        let zip_path = work_dir.path().join(format!("{i}_{entry_name}.zip"));
+        compress::pack_single_entry(&cand.path, entry_name, &zip_path, strategy)?;
+        let hash = elf::sha1_hex_of_file(&zip_path)?;
+
+        if dry_run {
+            tracing::info!(
+                path = %cand.path.display(),
+                build_id = %cand.build_id,
+                "dry-run: not uploading"
+            );
+            uploaded += 1;
+            continue;
+        }
+
+        let metadata = presigned::Metadata {
+            uuid: Some(&cand.build_id),
+            version,
+            build,
+            hash: Some(&hash),
+            transform: Some("breakpad"),
+            uuids: None,
+            overwrite: None,
+        };
+        let outcome = presigned::upload(
+            client.as_ref().expect("client built when not dry-run"),
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            &zip_path,
+        )
+        .await?;
+        match outcome {
+            presigned::Outcome::Uploaded => {
+                tracing::info!(build_id = %cand.build_id, "uploaded");
+                uploaded += 1;
+            }
+            presigned::Outcome::AlreadyExists => {
+                tracing::info!(build_id = %cand.build_id, "already on server, skipped");
+                already_existed += 1;
+            }
+        }
+    }
+
+    tracing::info!(uploaded, already_existed, "ELF upload complete");
+    Ok(())
+}
+
+/// Recursively discover `.dSYM` bundles under the given paths. An explicit
+/// `.dSYM` directory is taken as-is; a directory is walked for any `*.dSYM`
+/// bundle (a directory named `*.dSYM` with a `Contents/Resources/DWARF`
+/// subdirectory). The recursive scan lets a caller point at an Xcode archive's
+/// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
+/// itself. De-duplicated.
 fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
     fn is_dsym_bundle(p: &std::path::Path) -> bool {
         p.is_dir()
@@ -1450,5 +1686,448 @@ mod dsym_discovery_tests {
         let f = tmp.path().join("a.txt");
         std::fs::write(&f, b"x").unwrap();
         assert!(discover_dsyms(&[f, tmp.path().join("nope")]).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rust_upload_tests {
+    use super::*;
+    use crate::error::classify;
+    use crate::exit_code::ExitCode;
+    use crate::symbols::pdb::fixture::{synth_pdb, MACHINE_AMD64};
+    use std::io::Read;
+    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zip::ZipArchive;
+
+    /// The committed aarch64 ELF fixture. `file(1)` reports
+    /// BuildID=bca64abfec40dbb631bb8f1c37414472 — the identity the upload must
+    /// be keyed by, and the same `code_id` the Rust SDK reports for a module.
+    const FIXTURE_BUILD_ID: &str = "bca64abfec40dbb631bb8f1c37414472";
+
+    fn write_elf(dir: &std::path::Path, name: &str) -> PathBuf {
+        let bytes = std::fs::read(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/elf/libsymbol1.so"),
+        )
+        .unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, bytes).unwrap();
+        p
+    }
+
+    /// An ELF binary keyed by its own build-id, packed as a single Zstd entry
+    /// and declared with the Breakpad transform — the same contract the NDK
+    /// `.so` path uses, so the worker needs no Rust-specific handling.
+    #[tokio::test]
+    async fn elf_is_keyed_by_build_id_with_the_breakpad_transform() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_elf(tmp.path(), "myapp");
+
+        let server = MockServer::start().await;
+        let put_url = format!("{}/elf-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .and(header("X-Bugsee-Uploader", "cli"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/elf-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        run_rust_upload(
+            &[tmp.path().to_path_buf()],
+            &uri,
+            "TKN",
+            "1.2.3",
+            "42",
+            Strategy::Zstd(11),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let post = received
+            .iter()
+            .find(|r| r.url.path() == "/apps/TKN/symbols")
+            .unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+        assert_eq!(body["uuid"], FIXTURE_BUILD_ID);
+        assert_eq!(body["transform"], "breakpad");
+        assert_eq!(body["version"], "1.2.3");
+        assert_eq!(body["build"], "42");
+        assert!(body["hash"].as_str().is_some_and(|h| h.len() == 40));
+
+        let put = received
+            .iter()
+            .find(|r| r.url.path() == "/elf-put")
+            .unwrap();
+        let mut zip = ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
+        assert_eq!(zip.len(), 1);
+        let mut entry = zip.by_name("myapp").unwrap();
+        assert_eq!(entry.compression(), zip::CompressionMethod::Zstd);
+        let mut got = Vec::new();
+        entry.read_to_end(&mut got).unwrap();
+        assert!(got.starts_with(b"\x7fELF"), "the ELF itself is the payload");
+    }
+
+    /// Cargo's intermediates hold a hash-suffixed copy of the binary and an
+    /// object per dependency. Uploading them would register a symbol document
+    /// per crate — so the walk must reach exactly one artifact here.
+    #[tokio::test]
+    async fn cargo_intermediates_do_not_become_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_elf(tmp.path(), "myapp");
+        std::fs::create_dir_all(tmp.path().join("deps")).unwrap();
+        write_elf(&tmp.path().join("deps"), "myapp-9f8a7b6c");
+        std::fs::create_dir_all(tmp.path().join("build/foo-123")).unwrap();
+        write_elf(&tmp.path().join("build/foo-123"), "build-script-build");
+
+        let server = MockServer::start().await;
+        let put_url = format!("{}/elf-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .expect(1) // <- exactly one registration, not three
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/elf-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        run_rust_upload(
+            &[tmp.path().to_path_buf()],
+            &uri,
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+    }
+
+    /// The headline ergonomic fix: a stock `cargo build --release` produces
+    /// nothing uploadable, and the failure must hand back the whole recipe
+    /// rather than "not found".
+    #[tokio::test]
+    async fn nothing_found_returns_the_full_cargo_recipe() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("myapp.d"), b"myapp: src/main.rs").unwrap();
+
+        let err = run_rust_upload(
+            &[tmp.path().to_path_buf()],
+            "http://127.0.0.1:1",
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+
+        let msg = err.to_string();
+        assert!(msg.contains("debug = 1"), "names the DWARF setting: {msg}");
+        assert!(msg.contains("split-debuginfo"), "names the Apple setting");
+        assert!(msg.contains("--build-id"), "names the ELF setting");
+        // Substantive, not structural — a caller must not silently fall back.
+        assert_eq!(classify(&err), ExitCode::InputNotFound);
+    }
+
+    /// A mixed tree (cross-compiled workspace) routes each format to its own
+    /// upload path in one invocation.
+    #[tokio::test]
+    async fn a_mixed_tree_uploads_every_format_in_one_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_elf(tmp.path(), "linux-app");
+        std::fs::write(
+            tmp.path().join("win-app.pdb"),
+            synth_pdb(
+                "dfb8e43a-f242-3d73-a453-aeb6a777ef75".parse().unwrap(),
+                1,
+                1,
+                MACHINE_AMD64,
+            ),
+        )
+        .unwrap();
+        let dwarf = tmp.path().join("mac-app.dSYM/Contents/Resources/DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join("mac-app"), b"\xcf\xfa\xed\xfe stub").unwrap();
+
+        // Dry-run: the dSYM stub is not a parseable Mach-O, so this asserts
+        // routing + discovery without depending on a real fat binary fixture.
+        let findings = rust::discover(&[tmp.path().to_path_buf()]);
+        assert_eq!(findings.elves.len(), 1);
+        assert_eq!(findings.pdbs.len(), 1);
+        assert_eq!(findings.dsyms.len(), 1);
+        assert_eq!(findings.uploadable_count(), 3);
+    }
+
+    #[tokio::test]
+    async fn dry_run_makes_no_network_calls() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_elf(tmp.path(), "myapp");
+        // Unroutable endpoint — any real request would error the run.
+        run_rust_upload(
+            &[tmp.path().to_path_buf()],
+            "http://127.0.0.1:1",
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod pdb_upload_tests {
+    use super::*;
+    use crate::error::{classify, Error};
+    use crate::exit_code::ExitCode;
+    use crate::symbols::pdb::fixture::{synth_pdb, MACHINE_AMD64};
+    use std::io::Read;
+    use uuid::Uuid;
+    use wiremock::matchers::{header, method, path as wm_path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+    use zip::ZipArchive;
+
+    const GUID: &str = "dfb8e43a-f242-3d73-a453-aeb6a777ef75";
+    /// What `synth_pdb` below resolves to — GUID + DBI age.
+    const DEBUG_ID: &str = "dfb8e43a-f242-3d73-a453-aeb6a777ef75-1";
+
+    fn write_pdb(dir: &std::path::Path, name: &str) -> PathBuf {
+        let guid: Uuid = GUID.parse().unwrap();
+        let p = dir.join(name);
+        std::fs::write(&p, synth_pdb(guid, 1, 1, MACHINE_AMD64)).unwrap();
+        p
+    }
+
+    fn names(found: &[PathBuf]) -> Vec<String> {
+        let mut n: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn discovery_is_case_insensitive_and_confirmed_by_the_magic() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdb(tmp.path(), "app.pdb");
+        // Windows filesystems are case-insensitive and older toolchains emit
+        // an uppercase extension — skipping it would lose the only symbol file.
+        write_pdb(tmp.path(), "OTHER.PDB");
+        std::fs::create_dir(tmp.path().join("deps")).unwrap();
+        write_pdb(&tmp.path().join("deps"), "nested.pdb");
+        // Right extension, not an MSF container.
+        std::fs::write(tmp.path().join("notes.pdb"), b"just text").unwrap();
+        // Real container, but `target/<profile>/` is full of files we must not
+        // treat as symbols.
+        std::fs::write(
+            tmp.path().join("app.exe"),
+            synth_pdb(GUID.parse().unwrap(), 1, 1, MACHINE_AMD64),
+        )
+        .unwrap();
+
+        let found = discover_pdbs(&[tmp.path().to_path_buf()]);
+        assert_eq!(names(&found), vec!["OTHER.PDB", "app.pdb", "nested.pdb"]);
+    }
+
+    #[test]
+    fn explicit_file_is_trusted_and_reachable_twice_only_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pdb = write_pdb(tmp.path(), "app.pdb");
+        // An explicitly-named file bypasses the sniff, so a bad one produces a
+        // clear parse error instead of a silent skip.
+        let odd = tmp.path().join("no-extension");
+        std::fs::write(&odd, b"not a container").unwrap();
+        assert_eq!(discover_pdbs(std::slice::from_ref(&odd)), vec![odd]);
+
+        let found = discover_pdbs(&[tmp.path().to_path_buf(), pdb.clone()]);
+        assert_eq!(found.iter().filter(|p| **p == pdb).count(), 1);
+    }
+
+    /// Drives the two-stage presigned upload and returns the captured metadata
+    /// POST body plus the PUT'd zip bytes.
+    async fn run_upload_capture(
+        dir: &std::path::Path,
+        force: bool,
+    ) -> (serde_json::Value, Vec<u8>) {
+        let server = MockServer::start().await;
+        let put_url = format!("{}/pdb-put", server.uri());
+
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .and(header("X-Bugsee-Uploader", "cli"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/pdb-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        run_pdb_upload(
+            &[dir.to_path_buf()],
+            &uri,
+            "TKN",
+            "1.2.3",
+            "42",
+            Strategy::Zstd(11),
+            force,
+            false,
+        )
+        .await
+        .unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let post = received
+            .iter()
+            .find(|r| r.url.path() == "/apps/TKN/symbols")
+            .unwrap();
+        let put = received
+            .iter()
+            .find(|r| r.url.path() == "/pdb-put")
+            .unwrap();
+        (
+            serde_json::from_slice(&post.body).unwrap(),
+            put.body.clone(),
+        )
+    }
+
+    /// The wire shape the appserver and worker consume. The `uuid` is the PDB's
+    /// own debug id — the key a crashing Windows module resolves against.
+    #[tokio::test]
+    async fn keys_the_upload_by_the_pdb_debug_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdb(tmp.path(), "app.pdb");
+
+        let (body, put_zip) = run_upload_capture(tmp.path(), false).await;
+
+        assert_eq!(body["uuid"], DEBUG_ID);
+        assert_eq!(body["version"], "1.2.3");
+        assert_eq!(body["build"], "42");
+        assert!(body["hash"].as_str().is_some_and(|h| h.len() == 40));
+        // PDBs carry no Breakpad transform and declare a single id, not a list.
+        assert!(body.get("transform").is_none());
+        assert!(body.get("uuids").is_none());
+        // Absent (not `false`) unless --force: the server dedups by default.
+        assert!(body.get("overwrite").is_none());
+
+        // PUT body is a zip whose single entry is the PDB, Zstd-compressed.
+        let mut zip = ZipArchive::new(std::io::Cursor::new(put_zip)).unwrap();
+        assert_eq!(zip.len(), 1);
+        let mut entry = zip.by_name("app.pdb").unwrap();
+        assert_eq!(entry.compression(), zip::CompressionMethod::Zstd);
+        let mut got = Vec::new();
+        entry.read_to_end(&mut got).unwrap();
+        assert!(got.starts_with(b"Microsoft C/C++ MSF 7.00"));
+    }
+
+    /// `--force` must reach the wire: the pdb POST declares its uuid up front,
+    /// so without `overwrite` the server skips signing an upload URL and there
+    /// is no way to replace a bad artefact.
+    #[tokio::test]
+    async fn force_asks_the_server_to_overwrite() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdb(tmp.path(), "app.pdb");
+
+        let (body, _) = run_upload_capture(tmp.path(), true).await;
+        assert_eq!(body["overwrite"], true);
+    }
+
+    #[tokio::test]
+    async fn dry_run_packs_without_network() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdb(tmp.path(), "app.pdb");
+        // Unroutable endpoint — a network call would error.
+        run_pdb_upload(
+            &[tmp.path().to_path_buf()],
+            "http://127.0.0.1:1",
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn no_pdbs_found_is_a_substantive_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = run_pdb_upload(
+            &[tmp.path().to_path_buf()],
+            "http://127.0.0.1:1",
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no .pdb files found"));
+        // Not a structural error — the caller must NOT fall back to its own path.
+        assert_eq!(classify(&err), ExitCode::InputNotFound);
+    }
+
+    /// A `.pdb` that cannot be parsed is warned about and skipped, but a run in
+    /// which nothing at all was identified must still fail loudly.
+    #[tokio::test]
+    async fn unparseable_pdbs_fail_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("broken.pdb"), b"not a container").unwrap();
+        let err = run_pdb_upload(
+            &[tmp.path().join("broken.pdb")],
+            "http://127.0.0.1:1",
+            "TKN",
+            "1.0",
+            "1",
+            Strategy::Zstd(11),
+            false,
+            true,
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err.downcast_ref::<Error>(),
+            Some(Error::InputInvalid(_))
+        ));
+        assert_eq!(classify(&err), ExitCode::InputInvalid);
     }
 }

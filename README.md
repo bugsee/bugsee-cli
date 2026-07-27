@@ -42,14 +42,57 @@ All subcommands print JSON to stdout and exit 0 on parseable failure (empty list
 ```
 bugsee-cli debug-files upload <paths>... \
     --version <X> --build <Y> \
-    [--type proguard|elf|dsym] \
+    [--type proguard|rust|elf|dsym|pdb|sourcemaps] \
     [--uuid <UUID>]   # override the auto-computed debug-id (caller owns it)
     [--icon <PATH>]   # attach launcher icon to the symbol zip
     [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
+    [--force]         # re-upload even if the server already has it (dsym/pdb)
     [--dry-run]
 ```
 
-The upload flow itself. ProGuard, ELF, and dSYM types are working; other types are planned via [`debug-files convert`](#debug-files-convert-planned) once their wire format stabilises.
+The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, and sourcemap types are working; other types are planned via [`debug-files convert`](#debug-files-convert-planned) once their wire format stabilises.
+
+#### Rust (Cargo) projects — `--type rust`
+
+A Rust project has no single symbol format: it is a `.dSYM` bundle for Apple targets, a `.pdb` for `*-pc-windows-msvc`, and the ELF binary itself (keyed by its GNU build-id) for Linux/Android. `--type rust` discovers whichever the build produced, so one command covers every target:
+
+```sh
+bugsee-cli debug-files upload --type rust target/release --version 1.4.0 --build 250
+```
+
+- **Content-based discovery.** Artifacts are classified by container magic, not by host OS, so a cross-compiled `target/x86_64-unknown-linux-gnu/release` uploads correctly from a Mac.
+- **Cargo intermediates are skipped** — `deps/`, `build/`, `incremental/`, `.fingerprint/`. Walking them would register a symbol document for every dependency and build script.
+- **Symlinked `.dSYM`s are followed.** Cargo writes the real bundle into `deps/` and leaves a symlink at the profile root; that symlink is the only path to it once `deps/` is skipped.
+- **`--uuid` is rejected.** Every Rust debug format carries its own identity (Mach-O UUID / PDB debug id / GNU build-id), and that identity is what the SDK reports for the module at crash time — an override could never match it.
+
+**Build configuration is required.** A stock `cargo build --release` emits nothing uploadable, and each format has a setting that, if missing, produces an upload that is accepted and then resolves nothing. The command reports whichever is missing and exits `10` when it finds no symbols at all:
+
+```toml
+# Cargo.toml
+[profile.release]
+debug = 1                       # emit DWARF at all
+split-debuginfo = "packed"      # macOS/iOS: collect it into a .dSYM
+```
+
+```toml
+# .cargo/config.toml — Linux/Android only
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,--build-id"]
+```
+
+CI recipe (GitHub Actions):
+
+```yaml
+- run: cargo build --release
+- run: |
+    curl -fsSL https://download.bugsee.com/cli/install.sh | sh
+    bugsee-cli debug-files upload --type rust target/release \
+      --version "${{ github.ref_name }}" --build "${{ github.run_number }}"
+  env:
+    BUGSEE_APP_TOKEN: ${{ secrets.BUGSEE_APP_TOKEN }}
+```
+
+Pass `--dry-run` to verify discovery and see the preflight warnings without uploading.
 
 ### `vcs-metadata`
 
