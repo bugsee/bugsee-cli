@@ -1,0 +1,12 @@
+{
+  "format": "il2cpp-linemap",
+  "target": "ios",
+  "images": [
+    {"arch": "arm64", "uuid": "11111111-1111-1111-1111-111111111111"}
+  ],
+  "items": [
+    {"entry": "LineNumberMappings.json"},
+    {"entry": "MethodMap.tsv"},
+    {"entry": "il2cppFileRoot.txt"}
+  ]
+}

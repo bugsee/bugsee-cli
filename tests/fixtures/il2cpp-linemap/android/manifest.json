@@ -1,0 +1,13 @@
+{
+  "format": "il2cpp-linemap",
+  "target": "android",
+  "images": [
+    {"arch": "arm64-v8a", "uuid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+    {"arch": "armeabi-v7a", "uuid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+  ],
+  "items": [
+    {"entry": "LineNumberMappings.json"},
+    {"entry": "MethodMap.tsv"},
+    {"entry": "il2cppFileRoot.txt"}
+  ]
+}

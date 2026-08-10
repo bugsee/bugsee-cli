@@ -42,15 +42,26 @@ All subcommands print JSON to stdout and exit 0 on parseable failure (empty list
 ```
 bugsee-cli debug-files upload <paths>... \
     --version <X> --build <Y> \
-    [--type proguard|rust|elf|dsym|pdb|sourcemaps] \
-    [--uuid <UUID>]   # override the auto-computed debug-id (caller owns it)
-    [--icon <PATH>]   # attach launcher icon to the symbol zip
+    [--type proguard|rust|elf|dsym|pdb|sourcemaps|il2cpp-linemap] \
+    [--uuid <UUID>]   # override / IL2CPP module id(s); comma-separate for multi-ABI \
+    [--icon <PATH>]   # attach launcher icon to the symbol zip \
     [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
-    [--force]         # re-upload even if the server already has it (dsym/pdb)
+    [--force]         # re-upload even if the server already has it (dsym/pdb/il2cpp-linemap)
     [--dry-run]
 ```
 
-The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, and sourcemap types are working; other types are planned via [`debug-files convert`](#debug-files-convert-planned) once their wire format stabilises.
+The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, sourcemap, and Unity IL2CPP line-map types are working; other types are planned via [`debug-files convert`](#debug-files-convert-planned) once their wire format stabilises.
+
+#### Unity IL2CPP — `--type il2cpp-linemap`
+
+Uploads `LineNumberMappings.json` (+ sibling `MethodMap.tsv` / `il2cppFileRoot.txt`) as format `il2cpp-linemap`, keyed by the IL2CPP module UUID(s) (`libil2cpp` / `UnityFramework`). See [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md).
+
+```sh
+bugsee-cli debug-files upload path/to/Symbols/LineNumberMappings.json \
+  --type il2cpp-linemap \
+  --version 1.2.3 --build 45 \
+  --uuid <arm64-build-id>,<armeabi-build-id>
+```
 
 #### Rust (Cargo) projects — `--type rust`
 
@@ -231,6 +242,14 @@ Every metadata `POST` sets `X-Bugsee-Uploader: cli`. The in-language fallback up
 | Homebrew tap + curl installer | iOS / generic CI |
 
 Target platforms: macOS arm64 + x86_64, Linux x86_64 + aarch64 (glibc; musl if Alpine CI demand exists), Windows x86_64.
+
+## Design notes
+
+| Doc | Topic |
+|---|---|
+| [`docs/upload-unification.md`](docs/upload-unification.md) | Build-info bundle, chunked upload, cross-platform producers |
+| [`docs/upload-unification-activation.md`](docs/upload-unification-activation.md) | Rollout / activation |
+| [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md) | Unity IL2CPP `LineNumberMappings.json` / MethodMap design (format `il2cpp-linemap`) |
 
 ## Layout
 

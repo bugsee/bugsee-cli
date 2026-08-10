@@ -12,6 +12,7 @@
 
 use assert_cmd::Command;
 use predicates::str::contains;
+use std::path::PathBuf;
 
 const CONFIG_INVALID: i32 = 20;
 
@@ -81,6 +82,54 @@ fn uuid_override_is_rejected_for_rust() {
     .stderr(contains("--uuid does not apply to --type rust"));
 }
 
+/// Multi-bundle discovery with one UUID list must refuse (exit 11) rather
+/// than stamp the same identity onto android+ios maps.
+#[test]
+fn il2cpp_linemap_refuses_multiple_bundles_under_one_uuid_list() {
+    const INPUT_INVALID: i32 = 11;
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/il2cpp-linemap");
+
+    upload(
+        "il2cpp-linemap",
+        &[
+            "--uuid",
+            "android-only-id",
+            root.to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .code(INPUT_INVALID)
+    .stderr(contains("found 2 LineNumberMappings.json bundles"))
+    .stderr(contains("refuse to apply one UUID list"));
+}
+
+/// A single platform fixture still dry-runs successfully.
+#[test]
+fn il2cpp_linemap_dry_run_accepts_one_bundle() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/il2cpp-linemap/android");
+
+    upload(
+        "il2cpp-linemap",
+        &["--uuid", "deadbeefcafebabe", root.to_str().unwrap()],
+    )
+    .assert()
+    .success()
+    .stderr(contains("dry-run: not uploading"));
+}
+
+/// Missing `--uuid` for il2cpp-linemap is configuration (exit 20), same as elf.
+#[test]
+fn il2cpp_linemap_missing_uuid_is_config_invalid() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/il2cpp-linemap/android");
+
+    upload("il2cpp-linemap", &[root.to_str().unwrap()])
+        .assert()
+        .code(CONFIG_INVALID)
+        .stderr(contains("--uuid is required"));
+}
+
 /// The ergonomic contract: pointing `--type rust` at a directory with no debug
 /// symbols must hand back the Cargo settings that produce them, not a bare
 /// "nothing found". Exit 10 (`InputNotFound`) is substantive — the caller is
@@ -98,3 +147,4 @@ fn rust_with_no_symbols_reports_the_build_settings_to_fix() {
         .stderr(contains("split-debuginfo"))
         .stderr(contains("--build-id"));
 }
+

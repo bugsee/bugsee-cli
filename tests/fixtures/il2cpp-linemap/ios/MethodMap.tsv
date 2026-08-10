@@ -1,0 +1,3 @@
+PlayerController_Update_m3F2A7B1C	MyGame.PlayerController::Update()
+GameManager_Start_mA8C1D2E3	MyGame.GameManager::Start()
+Button_OnPointerClick_mDEADBEEF	UnityEngine.UI.Button::OnPointerClick(PointerEventData)

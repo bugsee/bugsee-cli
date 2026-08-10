@@ -50,10 +50,17 @@ pub struct Metadata<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub transform: Option<&'a str>,
 
+    /// Explicit SymbolFile format (e.g. `il2cpp-linemap`). When absent the
+    /// worker infers format from zip contents.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format: Option<&'a str>,
+
     /// dSYM: the Mach-O slice UUIDs declared up front so the server can dedup
     /// BEFORE signing an upload URL — when every UUID is already present it
     /// responds with `DuplicateSymbolsFoundError` (code 16004) and the PUT is
     /// skipped. (`Outcome::AlreadyExists`.)
+    ///
+    /// Also used by `il2cpp-linemap` for multi-ABI module UUID lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub uuids: Option<&'a [String]>,
 
@@ -248,6 +255,7 @@ mod tests {
             build: "2",
             hash: None,
             transform: None,
+            format: None,
             uuids: Some(&uuids),
             overwrite: Some(true),
         };
@@ -267,12 +275,67 @@ mod tests {
             build: "2",
             hash: Some("h"),
             transform: None,
+            format: None,
             uuids: None,
             overwrite: None,
         };
         let v2 = serde_json::to_value(&m2).unwrap();
         assert!(v2.get("uuids").is_none());
         assert!(v2.get("overwrite").is_none());
+    }
+
+    #[test]
+    fn metadata_serializes_il2cpp_linemap_format() {
+        let uuids = vec!["deadbeef".to_string(), "cafebabe".to_string()];
+        let m = Metadata {
+            uuid: Some("deadbeef"),
+            version: "1.0",
+            build: "42",
+            hash: Some("abc"),
+            transform: None,
+            format: Some("il2cpp-linemap"),
+            uuids: Some(&uuids),
+            overwrite: Some(true),
+        };
+        let v = serde_json::to_value(&m).unwrap();
+        assert_eq!(v["format"], "il2cpp-linemap");
+        assert_eq!(v["uuids"], serde_json::json!(["deadbeef", "cafebabe"]));
+        assert_eq!(v["overwrite"], true);
+    }
+
+    #[tokio::test]
+    async fn register_sends_il2cpp_linemap_format_on_wire() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps/TKN/symbols"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 16004 })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let uuids = vec!["aaa".to_string(), "bbb".to_string()];
+        let m = Metadata {
+            uuid: Some("aaa"),
+            version: "1",
+            build: "1",
+            hash: Some("h"),
+            transform: None,
+            format: Some("il2cpp-linemap"),
+            uuids: Some(&uuids),
+            overwrite: None,
+        };
+        let client = http::build_client().unwrap();
+        let reg = register(&client, RetryPolicy::none(), &server.uri(), "TKN", &m)
+            .await
+            .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists));
+
+        let reqs = server.received_requests().await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
+        assert_eq!(body["format"], "il2cpp-linemap");
+        assert_eq!(body["uuids"], serde_json::json!(["aaa", "bbb"]));
     }
 
     #[tokio::test]
@@ -294,6 +357,7 @@ mod tests {
             build: "1",
             hash: None,
             transform: None,
+            format: None,
             uuids: Some(&uuids),
             overwrite: None,
         };
@@ -326,6 +390,7 @@ mod tests {
             build: "1",
             hash: None,
             transform: None,
+            format: None,
             uuids: None,
             overwrite: None,
         };

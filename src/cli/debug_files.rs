@@ -6,7 +6,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
-use crate::symbols::{dsym, elf, pdb, proguard, rust, sourcemap};
+use crate::symbols::{dsym, elf, il2cpp_linemap, pdb, proguard, rust, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
 
@@ -21,10 +21,11 @@ pub enum DebugFilesCommand {
         paths: Vec<PathBuf>,
 
         /// Restrict discovery to a specific debug-file type. If unset, defaults to `proguard`.
-        /// Supported: `proguard`, `rust`, `elf`, `dsym`, `pdb`, `sourcemaps`; other types are
-        /// scaffold-only. For a Cargo project use `--type rust`, which discovers whichever
-        /// format the target produced (`.dSYM` / `.pdb` / build-id ELF) and reports the build
-        /// settings needed when it finds none.
+        /// Supported: `proguard`, `rust`, `elf`, `dsym`, `pdb`, `sourcemaps`,
+        /// `il2cpp-linemap`; other types are scaffold-only. For a Cargo project use
+        /// `--type rust`, which discovers whichever format the target produced
+        /// (`.dSYM` / `.pdb` / build-id ELF) and reports the build settings needed
+        /// when it finds none.
         #[arg(long, value_enum)]
         r#type: Option<DebugFileType>,
 
@@ -48,8 +49,25 @@ pub enum DebugFilesCommand {
         /// Required for `--type elf`; REJECTED for `--type dsym` and
         /// `--type pdb`, whose identity is read out of the file itself and
         /// could never match an override at crash time.
+        ///
+        /// For `--type il2cpp-linemap`, pass one or more IL2CPP module UUIDs
+        /// (comma-separate values, and/or repeat `--uuid`, and/or append via
+        /// `--il2cpp-uuid` for multi-ABI Android build-ids).
+        #[arg(long, action = clap::ArgAction::Append)]
+        uuid: Vec<String>,
+
+        /// Additional IL2CPP module UUID(s) for `--type il2cpp-linemap`
+        /// (multi-ABI). Prefer repeating `--uuid` or comma-separating;
+        /// this flag exists so callers can append without rewriting the
+        /// primary `--uuid` value.
+        #[arg(long = "il2cpp-uuid", value_name = "UUID")]
+        il2cpp_uuids: Vec<String>,
+
+        /// Optional path to `il2cppFileRoot.txt` (or its contents file) when
+        /// packing `--type il2cpp-linemap` and the sibling was not next to the
+        /// JSON.
         #[arg(long)]
-        uuid: Option<String>,
+        il2cpp_root: Option<PathBuf>,
 
         /// Attach a launcher icon to the symbol zip. Matches the existing
         /// Gradle-plugin layout (entry name: `icon.<ext>` next to `mapping.txt`).
@@ -64,11 +82,11 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         zstd_level: Option<i64>,
 
-        /// Force a re-upload even if the server already has the symbol. For
-        /// `--type dsym` and `--type pdb` — the two that declare their identity
-        /// up front — this bypasses the pre-upload dedup, re-packing and
-        /// re-uploading the file. (Other types dedup server-side by content hash
-        /// on the metadata POST.)
+        /// Force a re-upload even if the server already has the symbol. Applies
+        /// to `--type dsym`, `--type pdb`, `--type rust` (when those declare
+        /// identity up front), and `--type il2cpp-linemap` — sets `overwrite` on
+        /// the metadata POST so format-scoped peers are replaced. Other types
+        /// (proguard, elf, sourcemaps) ignore this flag today.
         #[arg(long)]
         force: bool,
 
@@ -126,6 +144,11 @@ pub enum DebugFileType {
     /// JS source maps (React Native / web). Keyed by the debug-id embedded by
     /// `bugsee-cli sourcemaps inject` (or a caller-supplied `--uuid`).
     Sourcemaps,
+    /// Unity IL2CPP `LineNumberMappings.json` (+ MethodMap / il2cppFileRoot)
+    /// bundle. Keyed by the IL2CPP module UUID(s) (`libil2cpp` / UnityFramework);
+    /// pass `--uuid` (comma-separated and/or repeated) and/or `--il2cpp-uuid`
+    /// for multi-ABI.
+    Il2cppLinemap,
 }
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
@@ -148,6 +171,8 @@ pub async fn dispatch(
             version,
             build,
             uuid: uuid_override,
+            il2cpp_uuids,
+            il2cpp_root,
             icon,
             no_zstd,
             zstd_level,
@@ -162,22 +187,35 @@ pub async fn dispatch(
                 DebugFileType::Dsym => {}
                 DebugFileType::Pdb => {}
                 DebugFileType::Sourcemaps => {}
+                DebugFileType::Il2cppLinemap => {}
                 other => {
                     return Err(config_invalid(format!(
-                        "supported types are --type proguard, rust, elf, dsym, pdb, and \
-                         sourcemaps; got {other:?} (other formats are scaffold-only)"
+                        "supported types are --type proguard, rust, elf, dsym, pdb, \
+                         sourcemaps, and il2cpp-linemap; got {other:?} (other formats \
+                         are scaffold-only)"
                     )));
                 }
             }
 
             let strategy = compress::resolve_strategy(no_zstd, zstd_level)?;
 
-            let parsed_override = match uuid_override.as_deref() {
-                None => None,
-                Some(s) => Some(
-                    Uuid::parse_str(s)
+            // GNU build-ids (Android libil2cpp) are 40-hex, not UUID-shaped.
+            // Only parse as Uuid for types that require a real UUID. `--uuid`
+            // may be repeated (Append); non-il2cpp types take at most one.
+            let parsed_override = if kind == DebugFileType::Il2cppLinemap
+                || uuid_override.is_empty()
+            {
+                None
+            } else if uuid_override.len() > 1 {
+                return Err(config_invalid(
+                    "--uuid may be repeated only for --type il2cpp-linemap; \
+                     other types accept a single --uuid value",
+                ));
+            } else {
+                Some(
+                    Uuid::parse_str(&uuid_override[0])
                         .map_err(|e| input_invalid(format!("--uuid is not a valid UUID: {e}")))?,
-                ),
+                )
             };
 
             if kind != DebugFileType::Proguard && icon.is_some() {
@@ -279,6 +317,24 @@ pub async fn dispatch(
                     &build,
                     parsed_override,
                     strategy,
+                    dry_run,
+                )
+                .await;
+            }
+
+            if kind == DebugFileType::Il2cppLinemap {
+                let mut uuid_args = uuid_override;
+                uuid_args.extend(il2cpp_uuids);
+                return run_il2cpp_linemap_upload(
+                    &paths,
+                    &endpoint,
+                    &app_token,
+                    &version,
+                    &build,
+                    &uuid_args,
+                    il2cpp_root.as_deref(),
+                    strategy,
+                    force,
                     dry_run,
                 )
                 .await;
@@ -409,6 +465,7 @@ async fn run_proguard_upload(
             build,
             hash: Some(&identity.content_sha1_hex),
             transform: None,
+            format: Some("mapping"),
             uuids: None,
             overwrite: None,
         };
@@ -616,6 +673,7 @@ async fn run_pdb_upload(
             build,
             hash: Some(&hash),
             transform: None,
+            format: Some("pdb"),
             uuids: None,
             overwrite: if force { Some(true) } else { None },
         };
@@ -808,6 +866,7 @@ async fn run_rust_elf_upload(
             build,
             hash: Some(&hash),
             transform: Some("breakpad"),
+            format: Some("elf"),
             uuids: None,
             overwrite: None,
         };
@@ -1070,6 +1129,7 @@ async fn upload_one_so(
         build: ctx.build,
         hash: Some(&hash),
         transform: Some("breakpad"),
+        format: Some("elf"),
         uuids: None,
         overwrite: None,
     };
@@ -1091,6 +1151,140 @@ async fn upload_one_so(
         }
     }
     Ok(outcome)
+}
+
+/// Pack and upload a Unity IL2CPP LineNumberMappings bundle.
+///
+/// Requires one or more module UUID(s) (`--uuid` / `--il2cpp-uuid`) — typically
+/// all Android ABI build-ids for `libil2cpp.so`, or the UnityFramework Mach-O
+/// UUID(s). Siblings `MethodMap.tsv` and `il2cppFileRoot.txt` are packed when
+/// present next to the JSON.
+#[allow(clippy::too_many_arguments)]
+async fn run_il2cpp_linemap_upload(
+    paths: &[PathBuf],
+    endpoint: &str,
+    app_token: &str,
+    version: &str,
+    build: &str,
+    uuid_args: &[String],
+    il2cpp_root: Option<&Path>,
+    strategy: Strategy,
+    force: bool,
+    dry_run: bool,
+) -> anyhow::Result<()> {
+    let uuids = il2cpp_linemap::parse_uuids(uuid_args)?;
+    let bundles = il2cpp_linemap::discover(paths);
+    il2cpp_linemap::require_bundles(paths, &bundles)?;
+
+    if bundles.len() > 1 {
+        return Err(input_invalid(format!(
+            "found {} LineNumberMappings.json bundles under the given paths; \
+             refuse to apply one UUID list to multiple maps (pass a single \
+             bundle path, or upload each map separately with its own --uuid)",
+            bundles.len()
+        )));
+    }
+
+    let client = if dry_run {
+        None
+    } else {
+        Some(http::build_client()?)
+    };
+
+    let mut uploaded = 0u32;
+    let mut already_existed = 0u32;
+    for bundle in &bundles {
+        let _ = il2cpp_linemap::read_file_root(bundle, il2cpp_root)?;
+        tracing::info!(
+            path = %bundle.json_path.display(),
+            uuids = ?uuids,
+            has_method_map = bundle.method_map.is_some(),
+            has_file_root = bundle.file_root.is_some() || il2cpp_root.is_some(),
+            "identified il2cpp-linemap bundle"
+        );
+
+        let tmpdir = tempfile::tempdir()?;
+        let zip_path = tmpdir.path().join("il2cpp-linemap.zip");
+        let manifest_path = tmpdir.path().join(il2cpp_linemap::MANIFEST);
+        let packed_items = il2cpp_linemap::packed_item_names(
+            bundle.method_map.is_some(),
+            bundle.file_root.is_some() || il2cpp_root.is_some(),
+        );
+        std::fs::write(
+            &manifest_path,
+            il2cpp_linemap::manifest_json(&uuids, None, &packed_items),
+        )?;
+
+        // If the caller passed --il2cpp-root, stage a copy so the zip always
+        // carries il2cppFileRoot.txt even when the sibling was missing.
+        let staged_root = if let Some(root) = il2cpp_root {
+            let dest = tmpdir.path().join(il2cpp_linemap::FILE_ROOT);
+            std::fs::copy(root, &dest)?;
+            Some(dest)
+        } else {
+            None
+        };
+
+        let mut entries = vec![ZipEntry::compressed(
+            il2cpp_linemap::LINE_NUMBER_MAPPINGS,
+            &bundle.json_path,
+        )];
+        if let Some(ref mm) = bundle.method_map {
+            entries.push(ZipEntry::compressed(il2cpp_linemap::METHOD_MAP, mm));
+        }
+        let root_src = staged_root.as_deref().or(bundle.file_root.as_deref());
+        if let Some(root) = root_src {
+            entries.push(ZipEntry::compressed(il2cpp_linemap::FILE_ROOT, root));
+        }
+        entries.push(ZipEntry::compressed(
+            il2cpp_linemap::MANIFEST,
+            &manifest_path,
+        ));
+
+        let zip_size = compress::pack_entries(&entries, &zip_path, strategy)?;
+        let hash = elf::sha1_hex_of_file(&zip_path)?;
+        tracing::info!(zip_size, ?strategy, sha1 = %hash, "packed");
+
+        if dry_run {
+            tracing::info!(path = %bundle.json_path.display(), "dry-run: not uploading");
+            uploaded += 1;
+            continue;
+        }
+
+        let primary = &uuids[0];
+        let metadata = presigned::Metadata {
+            uuid: Some(primary),
+            version,
+            build,
+            hash: Some(&hash),
+            transform: None,
+            format: Some("il2cpp-linemap"),
+            uuids: Some(&uuids),
+            overwrite: if force { Some(true) } else { None },
+        };
+        let outcome = presigned::upload(
+            client.as_ref().expect("client built when not dry-run"),
+            RetryPolicy::default(),
+            endpoint,
+            app_token,
+            &metadata,
+            &zip_path,
+        )
+        .await?;
+        match outcome {
+            presigned::Outcome::Uploaded => {
+                tracing::info!(uuids = ?uuids, "uploaded il2cpp-linemap");
+                uploaded += 1;
+            }
+            presigned::Outcome::AlreadyExists => {
+                tracing::info!(uuids = ?uuids, "already on server, skipped");
+                already_existed += 1;
+            }
+        }
+    }
+
+    tracing::info!(uploaded, already_existed, "il2cpp-linemap upload complete");
+    Ok(())
 }
 
 /// Pack and upload one or more JS source maps, keyed by their debug-id.
@@ -1201,6 +1395,7 @@ async fn run_sourcemap_upload(
             build,
             hash: Some(&identity.content_sha1_hex),
             transform: None,
+            format: Some("sourcemap"),
             uuids: None,
             overwrite: None,
         };
@@ -1341,6 +1536,7 @@ pub(crate) async fn run_dsym_upload(
             build,
             hash: None,
             transform: None,
+            format: Some("dsym"),
             uuids: Some(&slice_uuids),
             overwrite: if force { Some(true) } else { None },
         };
