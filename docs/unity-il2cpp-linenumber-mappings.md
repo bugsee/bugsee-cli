@@ -121,27 +121,31 @@ address→map apply model.
 
 ---
 
-## 5. Bugsee gap (pre-epic)
+## 5. Implementation status (2026-08-11)
 
-| Layer | Gap |
+Worker host: GitHub [`bugsee/bugsee-background-worker`](https://github.com/bugsee/bugsee-background-worker).
+
+| Layer | Status |
 |---|---|
-| `bugsee-cli` | No `--type il2cpp-linemap` |
-| Appserver | No format; UUID-only dedup; `formatBatch` last-wins |
-| Worker | No LNM/MethodMap apply; iOS path basename strip |
-| Unity SDK | No Editor collect; Phase A string frames only |
+| `bugsee-cli` | **Shipped** — `--type il2cpp-linemap` (`1540fe7` on `main`); siblings auto-discovered; fixtures under `tests/fixtures/il2cpp-linemap/` |
+| Appserver | **Shipped** — `format: il2cpp-linemap`, UUID(s) required, format-scoped uniqueness, multi-format batch lookup (`2ecf6c26` on `master`) |
+| Worker | **Shipped on GitHub `main`** — PR [#19](https://github.com/bugsee/bugsee-background-worker/pull/19) → `32230b9`; apply in `crash/il2cpp_apply.py`; detect/parse under `symbolfiles/il2cpp_linemap.py` |
+| Unity SDK | **WIP** — uncommitted `Editor/BugseeIl2CppLinemapUpload.cs` + `BugseeIl2CppModuleIdentity.cs`; ExceptionPipeline / NDK / iOS bridge still open |
 
 Do **not** reuse `mapping` / `sourcemap` / BMF/BSF processors.
+
+**Backend epic complete.** Remaining: Unity Editor collect + SDK crash capture so maps and address frames reach the worker in the field.
 
 ---
 
 ## 6. Implementation sequencing
 
-1. **B0** Fixtures (Android + iOS; multi-ABI build-ids preferred).
-2. **B1a** Worker offline spike (fixtures on disk).
-3. **B2** Appserver format + format-aware dedup + multi-format lookup.
-4. **B1b** Worker production apply (after B2).
-5. **B3** `bugsee-cli --type il2cpp-linemap`.
-6. **B4** Unity Editor/CI collect (after B1b–B3).
+1. ~~**B0** Fixtures~~ — done.
+2. ~~**B1a** Worker offline spike~~ — done.
+3. ~~**B2** Appserver format + format-aware dedup + multi-format lookup~~ — done on `master`.
+4. ~~**B1b** Worker production apply~~ — merged to GitHub `main` ([#19](https://github.com/bugsee/bugsee-background-worker/pull/19)).
+5. ~~**B3** `bugsee-cli --type il2cpp-linemap`~~ — done on `main`.
+6. **B4** Unity Editor/CI collect — WIP uncommitted in `cross/bugsee-unity`.
 
 ---
 

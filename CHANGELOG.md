@@ -6,7 +6,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.4] - 2026-08-11
+
 ### Added
+- **`debug-files upload --type il2cpp-linemap`** — upload Unity IL2CPP
+  `LineNumberMappings.json` (+ sibling `MethodMap.tsv` / `il2cppFileRoot.txt`)
+  keyed by `libil2cpp` / `UnityFramework` module UUID(s). See
+  [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md).
 - **`debug-files upload --type rust`** — one command for a Cargo project,
   whatever target it built for. A Rust project's symbols are a `.dSYM` (Apple),
   a `.pdb` (`*-pc-windows-msvc`), or the ELF binary itself keyed by its GNU
@@ -232,6 +238,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.4]: https://github.com/bugsee/bugsee-cli/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/bugsee/bugsee-cli/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/bugsee/bugsee-cli/compare/v0.7.1...v0.7.2
 [0.7.1]: https://github.com/bugsee/bugsee-cli/compare/v0.7.0...v0.7.1
