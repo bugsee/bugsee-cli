@@ -91,11 +91,7 @@ fn il2cpp_linemap_refuses_multiple_bundles_under_one_uuid_list() {
 
     upload(
         "il2cpp-linemap",
-        &[
-            "--uuid",
-            "android-only-id",
-            root.to_str().unwrap(),
-        ],
+        &["--uuid", "android-only-id", root.to_str().unwrap()],
     )
     .assert()
     .code(INPUT_INVALID)
@@ -106,8 +102,8 @@ fn il2cpp_linemap_refuses_multiple_bundles_under_one_uuid_list() {
 /// A single platform fixture still dry-runs successfully.
 #[test]
 fn il2cpp_linemap_dry_run_accepts_one_bundle() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/il2cpp-linemap/android");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/il2cpp-linemap/android");
 
     upload(
         "il2cpp-linemap",
@@ -121,8 +117,8 @@ fn il2cpp_linemap_dry_run_accepts_one_bundle() {
 /// Missing `--uuid` for il2cpp-linemap is configuration (exit 20), same as elf.
 #[test]
 fn il2cpp_linemap_missing_uuid_is_config_invalid() {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/il2cpp-linemap/android");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/il2cpp-linemap/android");
 
     upload("il2cpp-linemap", &[root.to_str().unwrap()])
         .assert()
@@ -147,4 +143,3 @@ fn rust_with_no_symbols_reports_the_build_settings_to_fix() {
         .stderr(contains("split-debuginfo"))
         .stderr(contains("--build-id"));
 }
-

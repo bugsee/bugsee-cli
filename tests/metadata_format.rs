@@ -115,8 +115,8 @@ async fn sourcemap_upload_sends_format_sourcemap() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn il2cpp_linemap_upload_sends_format_il2cpp_linemap() {
     let server = MockServer::start().await;
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/il2cpp-linemap/android");
+    let root =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/il2cpp-linemap/android");
 
     let put_url = format!("{}/put/sym", server.uri());
     Mock::given(method("POST"))
