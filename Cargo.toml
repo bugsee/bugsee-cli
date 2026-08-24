@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.7.4"
+version = "0.7.5"
 edition = "2021"
 # Real floor, not an aspiration: the locked tree requires 1.88 (`gimli`,
 # `globset`, `plist`, `time`). Verify a bump with `cargo +<ver> check
