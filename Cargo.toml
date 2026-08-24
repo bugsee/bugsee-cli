@@ -88,7 +88,7 @@ plist = "1"
 
 # Compression — zstd is the wire format (level 9–11 typical); zip writes archives with Z_STANDARD entries
 zstd = { version = "0.13", features = ["zstdmt"] }
-zip = { version = "2", default-features = false, features = ["zstd", "deflate"] }
+zip = { version = "7", default-features = false, features = ["zstd", "deflate"] }
 
 # gzip — `.xcactivitylog` build logs are gzip of an SLF0 token stream. Already
 # in the dependency tree via `zip`/`reqwest`, so this direct dep adds no new
