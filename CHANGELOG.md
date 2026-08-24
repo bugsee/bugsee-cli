@@ -6,6 +6,63 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.5] - 2026-08-24
+
+Dependency and security maintenance. **No functional changes** — the CLI
+surface, exit codes, stdout JSON shapes, and upload wire format are byte-for-byte
+identical to 0.7.4, so no integrator needs to move its version floor. Upgrade for
+the dependency fixes below.
+
+### Security
+- **`quick-xml` 0.39.4 -> 0.41.0** (via `plist`) — fixes two denial-of-service
+  advisories in XML parsing: [RUSTSEC-2026-0194] (quadratic run time when a start
+  tag is checked for duplicate attribute names) and [RUSTSEC-2026-0195] (unbounded
+  namespace-declaration allocation in `NsReader` enabling memory exhaustion). This
+  code is reachable: `build-env read-plist` parses XML `Info.plist` files through
+  `plist`.
+- **`time` 0.3.48 -> 0.3.55** (via `plist`) — 0.3.48 was yanked upstream and had
+  shipped since before 0.7.4.
+- **`anyhow` 1.0.102 -> 1.0.104** — fixes unsoundness in `Error::downcast_mut()`.
+  Not reachable here (this crate only calls `downcast_ref`), included for hygiene.
+- Advisories that do **not** apply to the shipped binary, for the record:
+  `quinn-proto` [RUSTSEC-2026-0185] and `h2` [RUSTSEC-2026-0258] are absent from
+  the release build — `reqwest` is configured without `http2`, and `h2` is pulled
+  in only by the `wiremock` dev-dependency. Verified by inspecting compiled
+  artifacts, not the lockfile.
+
+### Changed
+- `zip` 2.4.2 -> 8.6.0 (two major bumps). The upload ZIP is unchanged: entry
+  names, STORED artefacts, method 93 (Z_STANDARD) mappings, and the fixed
+  1980-01-01 timestamps all produce byte-identical archives to 0.7.4.
+- `sha1`, `sha2`, and `md-5` 0.10 -> 0.11 (RustCrypto `digest` 0.11). Content
+  fingerprints, chunk identities, and the md5-derived Java-compatible
+  `BUILD_UUID`s are unchanged.
+- Routine bumps: `tokio` 1.52 -> 1.53, plus `clap`, `serde`, `serde_json`,
+  `regex`, `uuid`, `globset`, `libc`, `plist`, `thiserror`, `futures-util`.
+- **Declared MSRV corrected to 1.88** (`rust-version`). The previous `1.79` was
+  inaccurate and had been for several releases — the locked tree already required
+  1.88 via `gimli`, `globset`, `plist`, and `time`. This documents reality rather
+  than dropping support: no toolchain that could build 0.7.4 loses the ability to
+  build 0.7.5. Only affects building from source; released binaries are unaffected.
+
+### Removed
+- `indicatif` — declared but referenced nowhere in the source. Also prunes
+  `console`, `encode_unicode`, `portable-atomic`, `unicode-width`, and the
+  unmaintained `number_prefix` ([RUSTSEC-2025-0119]).
+
+### Fixed
+- **Tag releases were broken.** Dependabot's action bumps rewrote pins inside
+  `.github/workflows/release.yml`, which cargo-dist generates and its `plan` job
+  verifies; since `plan` is the first job of the release workflow, a `vX.Y.Z` tag
+  push would have failed before building any artefact. `[workspace.metadata.dist]`
+  now sets `allow-dirty = ["ci"]`. CI/release only — no effect on the binary.
+
+[RUSTSEC-2026-0194]: https://rustsec.org/advisories/RUSTSEC-2026-0194
+[RUSTSEC-2026-0195]: https://rustsec.org/advisories/RUSTSEC-2026-0195
+[RUSTSEC-2026-0185]: https://rustsec.org/advisories/RUSTSEC-2026-0185
+[RUSTSEC-2026-0258]: https://rustsec.org/advisories/RUSTSEC-2026-0258
+[RUSTSEC-2025-0119]: https://rustsec.org/advisories/RUSTSEC-2025-0119
+
 ## [0.7.4] - 2026-08-11
 
 ### Added
@@ -238,6 +295,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.5]: https://github.com/bugsee/bugsee-cli/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/bugsee/bugsee-cli/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/bugsee/bugsee-cli/compare/v0.7.2...v0.7.3
 [0.7.2]: https://github.com/bugsee/bugsee-cli/compare/v0.7.1...v0.7.2
