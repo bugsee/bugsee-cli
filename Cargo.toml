@@ -102,7 +102,7 @@ uuid = { version = "1", features = ["v3", "v4", "v5", "serde"] }
 
 # Hashing (sha1 for content fingerprints + chunk identity; sha2 for stronger hashes;
 # md-5 matches Java `UUID.nameUUIDFromBytes` for legacy mapping-derived BUILD_UUIDs.)
-sha1 = "0.10"
+sha1 = "0.11"
 sha2 = "0.11"
 md-5 = "0.11"
 hex = "0.4"
