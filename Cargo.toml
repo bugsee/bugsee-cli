@@ -116,7 +116,6 @@ anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
-indicatif = "0.18"
 tempfile = "3"
 
 # In-place self-replacement of the running executable for `bugsee-cli update`.
