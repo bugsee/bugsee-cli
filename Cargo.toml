@@ -2,7 +2,10 @@
 name = "bugsee-cli"
 version = "0.7.4"
 edition = "2021"
-rust-version = "1.79"
+# Real floor, not an aspiration: the locked tree requires 1.88 (`gimli`,
+# `globset`, `plist`, `time`). Verify a bump with `cargo +<ver> check
+# --all-targets` — CI builds `stable`, so it will NOT catch MSRV drift.
+rust-version = "1.88"
 authors = ["Bugsee"]
 description = "Bugsee CLI — cross-platform symbol collection, conversion, and upload."
 readme = "README.md"
