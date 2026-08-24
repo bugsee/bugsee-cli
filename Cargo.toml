@@ -36,6 +36,21 @@ lto = "thin"
 [workspace.metadata.dist]
 # The preferred dist version to use in CI (Cargo.toml SemVer syntax)
 cargo-dist-version = "0.32.0"
+# Stop `dist plan` from verifying `.github/workflows/release.yml` byte-for-byte
+# against the generator.
+#
+# WHY: dependabot bumps action pins across ALL workflows and cannot be told to
+# skip one file, so it keeps rewriting `actions/checkout@vN` inside the
+# dist-GENERATED release.yml. `plan` is the first job of the release workflow,
+# so merging such a PR breaks the next `vX.Y.Z` tag push — that happened twice
+# (PR #1, then PR #11). No published cargo-dist emits a newer checkout pin, so
+# there is no version to upgrade into; the mismatch is unavoidable.
+#
+# COST: release.yml is no longer auto-verified, so a change to the dist config
+# BELOW (targets, installers, publish-jobs, ...) will NOT be reflected in the
+# workflow and nothing will warn you. After editing any of it, re-run
+# `dist generate` and commit the result in the same change.
+allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
 # The installers to generate for each app
