@@ -51,7 +51,7 @@ jobs:
       # workflow_dispatch) so the latest scripts get published to the stable
       # cli/install.* URLs on every mirror run.
       - name: Checkout (for install scripts)
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Configure AWS credentials (OIDC)
         uses: aws-actions/configure-aws-credentials@v6

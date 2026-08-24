@@ -100,7 +100,7 @@ jobs:
         # opposite: no .npmrc, so npm 11.5+ auto-uses the OIDC token
         # minted from `permissions: id-token: write` above.
         if: steps.resolve.outputs.should_publish == 'true'
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: '22'
 
