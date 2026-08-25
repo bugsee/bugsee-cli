@@ -7,18 +7,34 @@ name: Mirror release to download.bugsee.com
 # The bucket is served as plain S3 (no CloudFront), so no invalidation
 # step is needed — clients re-hit S3 directly when Cache-Control expires.
 #
-# Why `workflow_dispatch` (manual trigger) and not `release: published`:
-# GitHub does NOT fire downstream workflow events for activity initiated
-# by the default `GITHUB_TOKEN` — and `dist`'s release.yml uses exactly
-# that token to publish the Release. This is documented behavior
-# (https://docs.github.com/en/actions/security-for-github-actions/security-guides/automatic-token-authentication#using-the-github_token-in-a-workflow):
-# the safeguard prevents recursive workflow chains. Either the release
-# needs to be published with a PAT / GitHub App, or we trigger this
-# workflow manually. Manual is simpler for v0.1; switching is one-line.
+# Triggers:
+#   - `workflow_run` on the dist `Release` workflow completing — the
+#     AUTOMATED path, so every tag-push release reaches the CDN without a
+#     manual step. This workflow used to be dispatch-ONLY, on the theory
+#     that a downstream chain was impossible: GitHub suppresses `release`
+#     / `push` events for activity initiated by the default GITHUB_TOKEN,
+#     and dist's release.yml publishes the Release with exactly that
+#     token. That reasoning holds for `release:`/`push:` but NOT for
+#     `workflow_run`, which fires on another WORKFLOW completing and is
+#     not suppressed — npm-publish.yml has been chaining off Release this
+#     way successfully. Same mechanism, same guards, adopted here.
+#
+#     Being manual had a real cost: v0.7.4 shipped to GitHub and npm but
+#     was never mirrored, so download.bugsee.com served 0.7.3 for six
+#     weeks and `bugsee-cli update` (which reads cli/v<major>.x/version.txt)
+#     never offered it. Nothing failed — the release simply stopped short
+#     of the CDN, silently.
+#   - `workflow_dispatch` with a `tag` input — the MANUAL path, for
+#     backfilling a missed version or re-mirroring a specific release.
+#
+# Both paths converge on the `resolve` job, which normalizes the tag and
+# gates the mirror on a `vX.Y.Z` match.
 #
 # AWS credentials come via GitHub OIDC against a dedicated IAM role
-# (`arn:aws:iam::*:role/bugsee-cli-deploy`) whose trust policy restricts
-# AssumeRole to this repo on `refs/tags/v*` only.
+# (`arn:aws:iam::*:role/bugsee-cli-deploy`). NOTE: a `workflow_run` run
+# executes from the DEFAULT BRANCH — `github.ref` is `refs/heads/main`,
+# exactly as for a `workflow_dispatch` from main — so the OIDC subject is
+# unchanged by this switch and the existing trust policy covers it.
 
 on:
   workflow_dispatch:
@@ -27,29 +43,82 @@ on:
         description: 'Release tag to mirror (e.g. v0.1.0)'
         required: true
         type: string
+  workflow_run:
+    workflows: ["Release"]
+    types: [completed]
 
 # OIDC token write + repo read for `gh release download` + checkout.
 permissions:
   id-token: write
   contents: read
 
-# Don't cancel an in-flight mirror if a second release lands quickly —
-# both should publish. Group by tag so the same release doesn't race
-# itself if the workflow re-runs.
+# GLOBAL group (not per-tag): `cli/latest/` is a single mutable prefix that
+# every run rewrites, so two mirrors must never overlap. `cancel-in-progress:
+# false` queues instead of cancelling. Caveat: if a THIRD run queues while one
+# is pending, GitHub cancels the pending one — so a large backfill should be
+# driven one tag at a time, waiting for each to finish.
 concurrency:
-  group: s3-mirror-${{ github.event.inputs.tag }}
+  group: s3-mirror
   cancel-in-progress: false
 
 jobs:
+  # Split out so the credentialed job below needs no per-step `if:` guards —
+  # a new step can't silently run against a tag we meant to skip.
+  resolve:
+    name: resolve release tag
+    runs-on: ubuntu-latest
+    # Manual dispatch always runs. The automated path runs only for a
+    # SUCCESSFUL Release triggered by a tag PUSH whose ref looks like a version
+    # tag — filtering out PR-mode Release runs (which complete with
+    # event == 'pull_request') and failed releases. The exact `vX.Y.Z` shape is
+    # re-checked below, since `startsWith(..., 'v')` would also match `vnext`.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       startsWith(github.event.workflow_run.head_branch, 'v'))
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      should_mirror: ${{ steps.resolve.outputs.should_mirror }}
+    steps:
+      - name: Resolve release tag
+        id: resolve
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            tag="${{ github.event.inputs.tag }}"
+          else
+            # For a tag-push-triggered run, head_branch is the tag name.
+            tag="${{ github.event.workflow_run.head_branch }}"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+          if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
+            echo "should_mirror=true" >> "$GITHUB_OUTPUT"
+            echo "Resolved release tag: $tag"
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            # A hand-typed tag that isn't a version is a typo, not a
+            # no-op — fail loudly rather than "succeeding" without mirroring.
+            echo "::error::'$tag' is not a version tag (vX.Y.Z)."
+            exit 1
+          else
+            echo "should_mirror=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::'$tag' is not a version tag (vX.Y.Z); skipping mirror."
+          fi
+
   mirror:
     name: mirror to s3
+    needs: resolve
+    if: needs.resolve.outputs.should_mirror == 'true'
     runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.resolve.outputs.tag }}
     steps:
       # The install scripts (installer/*.sh, *.ps1) are repo files, NOT release
       # assets and NOT version-scoped (they read cli/latest/version.txt at run
-      # time). Check out the workflow's ref (the default branch on a
-      # workflow_dispatch) so the latest scripts get published to the stable
-      # cli/install.* URLs on every mirror run.
+      # time). Check out the workflow's ref (the default branch for both
+      # workflow_dispatch and workflow_run) so the latest scripts get published
+      # to the stable cli/install.* URLs on every mirror run.
       - name: Checkout (for install scripts)
         uses: actions/checkout@v7
 
@@ -63,8 +132,9 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          set -euo pipefail
           mkdir -p assets
-          gh release download "${{ github.event.inputs.tag }}" \
+          gh release download "$TAG" \
             --repo "${{ github.repository }}" \
             --dir assets \
             --pattern '*'
@@ -79,8 +149,9 @@ jobs:
         # flag if the bucket has Object Ownership = "Bucket owner
         # enforced" (ACLs disabled — modern default for new buckets).
         run: |
+          set -euo pipefail
           aws s3 cp assets/ \
-            "s3://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/" \
+            "s3://${{ vars.S3_BUCKET }}/cli/$TAG/" \
             --recursive \
             --acl public-read \
             --cache-control "public, max-age=31536000, immutable"
@@ -90,12 +161,28 @@ jobs:
         # the cache short so users running `curl … | sh` always pick up
         # the newest installer. `must-revalidate` forces a conditional
         # request once max-age expires (304 if unchanged — cheap).
+        #
+        # ADVANCE-ONLY, like the version pointers below: mirroring an OLDER
+        # tag must not drag `latest` backwards. Without this guard, a backfill
+        # run after a newer release would leave cli/latest/version.txt pointing
+        # at the new version while the binaries beside it were the old one —
+        # a silent mismatch. Ordering is now a property of the workflow rather
+        # than something the operator has to get right by hand.
         run: |
+          set -euo pipefail
+          VER="${TAG#v}"
+          CUR=$(aws s3 cp "s3://${{ vars.S3_BUCKET }}/cli/latest/version.txt" - 2>/dev/null | tr -d '[:space:]' || true)
+          if [ -n "$CUR" ] && [ "$(printf '%s\n%s\n' "$CUR" "$VER" | sort -V | tail -1)" != "$VER" ]; then
+            echo "cli/latest/ already at $CUR (newer than $VER) — leaving the alias alone"
+            echo "latest_updated=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
           aws s3 cp assets/ \
             "s3://${{ vars.S3_BUCKET }}/cli/latest/" \
             --recursive \
             --acl public-read \
             --cache-control "public, max-age=300, must-revalidate"
+          echo "latest_updated=true" >> "$GITHUB_ENV"
 
       - name: Publish version pointers (latest + per-major)
         # Tiny, schema-stable discovery files the auto-update logic reads. Each
@@ -111,8 +198,7 @@ jobs:
         # live) never regresses a pointer.
         run: |
           set -euo pipefail
-          VER="${{ github.event.inputs.tag }}"
-          VER="${VER#v}"            # v0.5.0 -> 0.5.0
+          VER="${TAG#v}"            # v0.5.0 -> 0.5.0
           MAJOR="${VER%%.*}"        # 0.5.0  -> 0
           printf '%s\n' "$VER" > version.txt
 
@@ -151,9 +237,14 @@ jobs:
 
       - name: Summary
         run: |
-          VER="${{ github.event.inputs.tag }}"; VER="${VER#v}"; MAJOR="${VER%%.*}"
-          echo "Mirrored ${{ github.event.inputs.tag }} to:"
-          echo "  https://${{ vars.S3_BUCKET }}/cli/${{ github.event.inputs.tag }}/"
-          echo "  https://${{ vars.S3_BUCKET }}/cli/latest/   (version.txt -> $VER)"
+          set -euo pipefail
+          VER="${TAG#v}"; MAJOR="${VER%%.*}"
+          echo "Mirrored $TAG to:"
+          echo "  https://${{ vars.S3_BUCKET }}/cli/$TAG/"
+          if [ "${latest_updated:-true}" = "true" ]; then
+            echo "  https://${{ vars.S3_BUCKET }}/cli/latest/   (version.txt -> $VER)"
+          else
+            echo "  cli/latest/ left untouched — a newer version is already published there"
+          fi
           echo "  https://${{ vars.S3_BUCKET }}/cli/v${MAJOR}.x/version.txt -> $VER"
           echo "  https://${{ vars.S3_BUCKET }}/cli/install.sh  +  cli/install.ps1"
