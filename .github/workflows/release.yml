@@ -96,6 +96,8 @@ jobs:
         with:
           name: artifacts-plan-dist-manifest
           path: plan-dist-manifest.json
+          # Hand-added (see allow-dirty in Cargo.toml): same-run handoff only.
+          retention-days: 1
 
   # Build and packages all the platform-specific things
   build-local-artifacts:
@@ -174,6 +176,8 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+          # Hand-added (see allow-dirty in Cargo.toml): same-run handoff only.
+          retention-days: 1
 
   # Build and package all the platform-agnostic(ish) things
   build-global-artifacts:
@@ -221,6 +225,8 @@ jobs:
           path: |
             ${{ steps.cargo-dist.outputs.paths }}
             ${{ env.BUILD_MANIFEST_NAME }}
+          # Hand-added (see allow-dirty in Cargo.toml): same-run handoff only.
+          retention-days: 1
   # Determines if we should publish/announce
   host:
     needs:
@@ -265,6 +271,8 @@ jobs:
           # Overwrite the previous copy
           name: artifacts-dist-manifest
           path: dist-manifest.json
+          # Hand-added (see allow-dirty in Cargo.toml): same-run handoff only.
+          retention-days: 1
       # Create a GitHub Release while uploading all files to it
       - name: "Download GitHub Artifacts"
         uses: actions/download-artifact@v8
