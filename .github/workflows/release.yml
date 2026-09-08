@@ -70,6 +70,16 @@ jobs:
         with:
           name: cargo-dist-cache
           path: ~/.cargo/bin/dist
+          # NOT dist-generated -- hand-added, see allow-dirty in Cargo.toml.
+          #
+          # WHY: this artifact only hands the `dist` binary from `plan` to the
+          # build/global jobs inside THIS run; it is dead weight afterwards.
+          # Without this it inherits the repo default retention, and 40 copies
+          # at 9.2 MB each filled the org's 931 MiB shared-storage quota, which
+          # then failed unrelated repos' uploads (bugsee-cocoa PR #56).
+          #
+          # Re-add this line if `dist generate` ever overwrites it.
+          retention-days: 1
       # sure would be cool if github gave us proper conditionals...
       # so here's a doubly-nested ternary-via-truthiness to try to provide the best possible
       # functionality based on whether this is a pull_request, and whether it's from a fork.
