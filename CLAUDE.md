@@ -159,6 +159,25 @@ installers). Two workflows then chain off it automatically via `workflow_run` �
 `cli/v<major>.x/version.txt` pointer that `bugsee-cli update` reads). Both also
 keep a `workflow_dispatch` path for backfilling a missed version.
 
+`npm-publish.yml` has TWO independent jobs, because npm ships two packages
+for the same binary: `publish` takes the cargo-dist-generated
+`bugsee-cli-npm-package.tar.gz` release asset straight to `@bugsee/bugsee-cli`
+(a single package whose postinstall downloads the binary), while
+`publish-optional-deps` runs `npm/build.mjs` over the release's binary archives
+to assemble and publish `@bugsee/cli` plus its five `@bugsee/cli-<platform>`
+packages (per-`os`/`cpu` `optionalDependencies`, so nothing downloads at install
+time). Six packages, platform packages FIRST — npm skips an unresolvable
+optional dependency silently, so the front package must never be live ahead of
+them. See `npm/README.md`. Each package needs its own Trusted Publisher entry on
+npmjs.com pointing at `npm-publish.yml` — and that entry lives on a PACKAGE's
+settings page, so it cannot be added for a name that has never been published.
+A new name therefore needs one manual token-auth publish first; the runbook is
+`npm/README.md` ("First-publish bootstrap"). Skipping it fails only at publish
+time, with a 404 on the `PUT` that reads as though the package does not exist
+rather than as a missing trust configuration. The publish loop is written to be
+resumable for exactly that reason — npm versions are immutable, so a partial
+first run would otherwise wedge the version permanently.
+
 `workflow_run` is the trigger because GitHub suppresses `release:`/`push:`
 chains for activity initiated by the default `GITHUB_TOKEN`, which is what dist
 publishes the Release with; `workflow_run` fires on another WORKFLOW completing
@@ -171,9 +190,21 @@ not hand-edit it for anything except the action pins dependabot manages. That
 config sets `allow-dirty = ["ci"]`, so `dist plan` no longer verifies the file
 against the generator (dependabot's action bumps kept breaking that check, and
 with it tag releases). The cost is that dist-config changes no longer propagate
-on their own: after editing `targets`, `installers`, `publish-jobs`, or
-`cargo-dist-version`, run `dist generate` and commit the regenerated workflow in
-the SAME change, or the release will still run the old plan.
+on their own — and the flag disables the WRITER too, so `dist generate` (and
+`--check`) are silent no-ops for release.yml, and clearing the flag to force a
+regenerate would revert the hand-added `retention-days: 1` lines and the
+dependabot-maintained `actions/checkout` pin. After editing `targets`,
+`installers`, `publish-jobs`, or `cargo-dist-version`, verify with `dist plan
+--output-format=json` (computed live; it is what the workflow's first job runs)
+and hand-edit release.yml only if the plan needs something the file cannot
+already express. A `targets` change does not: the build matrix — `container` and
+`packages_install` included, which is how a cross-compiled leg would build under
+cargo-xwin — comes from `plan` at run time. (Adding a triple is still a release
+risk for a different reason: dist's `host` job needs EVERY
+`build-local-artifacts` leg, nothing validates a new leg before a tag push
+(`ci.yml` has no target matrix, `pr-run-mode = "plan"`), and a failed leg means
+no Release — hence no S3 mirror and no npm publish, since both chain off
+`workflow_run.conclusion == 'success'`. See bugsee/bugsee-cli#20.)
 
 New capabilities are activated by integrators via a version FLOOR: each integrator
 pins a minimum CLI version and only uses a new command/flag when the resolved

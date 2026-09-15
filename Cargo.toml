@@ -48,8 +48,20 @@ cargo-dist-version = "0.32.0"
 #
 # COST: release.yml is no longer auto-verified, so a change to the dist config
 # BELOW (targets, installers, publish-jobs, ...) will NOT be reflected in the
-# workflow and nothing will warn you. After editing any of it, re-run
-# `dist generate` and commit the result in the same change.
+# workflow and nothing will warn you.
+#
+# Note `allow-dirty = ["ci"]` ALSO disables the writer, not just the check:
+# `dist generate` and `dist generate --check` are both silent no-ops for
+# release.yml while this is set. So "just re-run `dist generate`" does not
+# work, and clearing this key to force a regenerate would revert the
+# hand-added `retention-days: 1` lines (see their own comments in release.yml)
+# and the `actions/checkout` pin dependabot maintains. After editing the
+# config below, verify with `dist plan --output-format=json` — which is
+# computed live and is what the workflow's first job runs — and hand-edit
+# release.yml ONLY if the plan shows something the file cannot already
+# express. A `targets` change is not such a case: the build matrix
+# (including `container` / `packages_install` for cross-compiled legs) comes
+# from `plan` at run time, so release.yml needs no edit for a new triple.
 allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"

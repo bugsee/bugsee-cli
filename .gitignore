@@ -21,3 +21,8 @@ target
 # OS
 .DS_Store
 Thumbs.db
+
+# Assembled npm packages (npm/build.mjs output) and local `npm pack` tarballs.
+npm/dist/
+npm/**/*.tgz
+npm/cli/vendor/
