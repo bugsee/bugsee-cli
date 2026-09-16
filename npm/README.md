@@ -136,6 +136,13 @@ What it does per name, and why:
    expired session must never be read as "unconfigured", or the script ends up
    advising you to revoke a perfectly good entry.
 
+   On `unknown` the script retries once with an UNCAPTURED `npm trust list`.
+   npm's trust commands need an interactive 2FA challenge — it prints
+   "Authenticate your account at: …" and waits on the terminal — and a captured
+   stdout swallows that prompt, so npm fails with `EOTP`. Follow the prompt when
+   it appears; a session already warm from an earlier command prompts for
+   nothing.
+
    `--allow-publish` requires npm >= 11.15. An OLDER npm accepts the command
    without it and creates an entry carrying no publish permission — which looks
    configured and still 404s on release day. The script detects that and routes

@@ -87,15 +87,39 @@ fi
 # only ever be tested against fixtures invented to match it — that proves the
 # parser self-consistent and nothing about npm. The text path remains as a
 # fallback for an npm whose --json is missing or empty.
+# `trust_state` with one uncaptured retry, which is what makes it work at all on a
+# cold session.
+#
+# `trust_state` captures npm's output, and npm's trust commands need an
+# INTERACTIVE 2FA handshake: npm wants to print "Authenticate your account at:
+# <url>" and wait on the TERMINAL. A captured stdout swallows that, so npm fails
+# with EOTP and `trust_state` correctly reports `unknown`. One UNCAPTURED call
+# lets the handshake happen with stdio attached; the session then covers the
+# captured reads. Only done when needed, so a warm session prompts for nothing.
+#
+# A separate function ONLY so the test harness can drive it: the fixtures stub npm
+# out, so nothing about this retry was observable while it sat inline in the
+# caller — and a mutation removing it passed all 28 of them.
+trust_state_interactive() {
+  local pkg="$1" state
+  state="$(trust_state "$pkg")"
+  if [ "$state" = unknown ]; then
+    echo "  auth:     npm needs an interactive 2FA challenge — follow its prompt"
+    $TRUST_NPM trust list "$pkg" || true
+    state="$(trust_state "$pkg")"
+  fi
+  printf '%s' "$state"
+}
+
 trust_state() {
-  local pkg="$1" out status
+  local pkg="$1" out rc
 
   out="$($TRUST_NPM trust list "$pkg" --json 2>/dev/null)"
-  status=$?
-  if [ "$status" -ne 0 ] || [ -z "$out" ]; then
+  rc=$?
+  if [ "$rc" -ne 0 ] || [ -z "$out" ]; then
     out="$($TRUST_NPM trust list "$pkg" 2>/dev/null)"
-    status=$?
-    [ "$status" -ne 0 ] && { echo unknown; return 0; }
+    rc=$?
+    [ "$rc" -ne 0 ] && { echo unknown; return 0; }
     printf '%s' "$out" | awk -v WORKFLOW="$WORKFLOW" -v REPO="$REPO" '
       # LINE-oriented, with an entry boundary at a REPEATED key. Do not assume
       # npm separates entries with a blank line: if it does not, a paragraph
@@ -241,7 +265,9 @@ JSON
   fi
 
   # 2. Attach the trusted publisher, so npm-publish.yml's OIDC can publish it.
-  case "$(trust_state "$pkg")" in
+  state="$(trust_state_interactive "$pkg")"
+
+  case "$state" in
     granted)
       echo "  trust:    already grants publish for $WORKFLOW"
       ;;
