@@ -1,0 +1,43 @@
+{
+  "name": "@bugsee/cli",
+  "version": "0.0.0-dev",
+  "description": "Bugsee CLI — cross-platform symbol collection, conversion, and upload.",
+  "keywords": [
+    "bugsee",
+    "symbols",
+    "dsym",
+    "sourcemaps",
+    "proguard",
+    "crash-reporting"
+  ],
+  "homepage": "https://github.com/bugsee/bugsee-cli",
+  "repository": "https://github.com/bugsee/bugsee-cli",
+  "author": "Bugsee",
+  "bin": {
+    "bugsee-cli": "bin/bugsee-cli.js"
+  },
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "bin",
+    "lib",
+    "scripts",
+    "README.md"
+  ],
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "engines": {
+    "node": ">=14.18"
+  },
+  "optionalDependencies": {
+    "@bugsee/cli-darwin-arm64": "0.0.0-dev",
+    "@bugsee/cli-darwin-x64": "0.0.0-dev",
+    "@bugsee/cli-linux-arm64": "0.0.0-dev",
+    "@bugsee/cli-linux-x64": "0.0.0-dev",
+    "@bugsee/cli-win32-x64": "0.0.0-dev"
+  }
+}
