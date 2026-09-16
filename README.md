@@ -175,6 +175,49 @@ bugsee-cli sourcemaps inject <paths>... [--dry-run]
 bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b>
 ```
 
+### `xcode upload-dsyms`
+
+Uploads dSYMs from an Xcode **Run Script build phase**, with none of the
+`BUGSEE_BUILD_INFO_*` gating — it neither registers a build nor uploads
+build-info, so it is safe to run on every build. This is the shape a
+React Native / Flutter config plugin can generate (`withXcodeProject` edits
+`project.pbxproj`), as opposed to the scheme post-action, which means editing
+`.xcscheme` XML.
+
+```sh
+# Run Script build phase, after "Embed Frameworks"
+"$SRCROOT/path/to/bugsee-cli" xcode upload-dsyms --app-token "$BUGSEE_APP_TOKEN"
+```
+
+It reads `DWARF_DSYM_FOLDER_PATH`, which Xcode sets in every Run Script phase,
+and falls back to `<ARCHIVE_PATH>/dSYMs`.
+
+**A failure fails the build, on purpose.** A build phase that swallows errors
+means symbolication silently stops working and nobody notices until a crash
+report is unreadable:
+
+| Situation | Exit | Build |
+| --- | --- | --- |
+| Uploaded, or nothing to upload | `0` | continues |
+| Missing / rejected app token | `20` / `21` | **fails** |
+| Server error / network failure | `30` / `31` | **fails** |
+
+"Nothing to upload" — no dSYM folder, or a folder with no `.dSYM` bundles — is a
+success, not a failure: a target that produces no debug symbols is a normal
+state. Only real problems fail the build.
+
+`--no-fail` (or `BUGSEE_DSYM_UPLOAD_NO_FAIL=1`) opts out of all of it. Because
+that accepts in advance that failures go unseen, it also runs the upload in the
+**background** so the build never waits on it.
+
+> **Xcode 15+:** `ENABLE_USER_SCRIPT_SANDBOXING` defaults to `YES`, which stops a
+> build phase reading the dSYM folder. Set it to `NO` on the target, or declare
+> the folder in the phase's input file lists. The scheme post-action is
+> unaffected.
+
+For the full build-publish flow — build registration, build-info, size checks —
+use `xcode post-action` instead; see `bugsee-cli xcode post-action --help`.
+
 ### `debug-files convert` (planned)
 
 ```

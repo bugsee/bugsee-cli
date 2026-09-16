@@ -901,7 +901,7 @@ async fn run_rust_elf_upload(
 /// subdirectory). The recursive scan lets a caller point at an Xcode archive's
 /// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
 /// itself. De-duplicated.
-fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
     fn is_dsym_bundle(p: &std::path::Path) -> bool {
         p.is_dir()
             && p.extension().and_then(|e| e.to_str()) == Some("dSYM")

@@ -101,6 +101,33 @@ Size-check build gate (deliberately fails the build; only with --force-foregroun
 The app token and endpoint come from --app-token / --endpoint (or BUGSEE_APP_TOKEN /
 BUGSEE_ENDPOINT). In background mode the daemon's log goes to $PROJECT_TEMP_DIR/bugsee-cli.log.";
 
+const UPLOAD_DSYMS_ENV_HELP: &str = "\
+Environment variables (read from the Xcode build environment):
+
+  DWARF_DSYM_FOLDER_PATH   Folder to scan for .dSYM bundles. Xcode sets this in
+                           every Run Script phase. Takes precedence over
+                           ARCHIVE_PATH.
+  ARCHIVE_PATH             Fallback: <ARCHIVE_PATH>/dSYMs is scanned when
+                           DWARF_DSYM_FOLDER_PATH is unset or not a directory.
+  BUGSEE_DSYM_UPLOAD_NO_FAIL
+                           Truthy: never fail the build, and run the upload in
+                           the background. Same as --no-fail.
+  BUGSEE_APP_TOKEN         App token (or pass --app-token).
+  BUGSEE_ENDPOINT          API endpoint (or pass --endpoint).
+
+Exit codes:
+
+  0        Uploaded, or there was nothing to upload (no dSYM folder, or no
+           .dSYM bundles in it). Both are reported as warnings.
+  20 / 21  Missing or rejected app token.
+  30 / 31  Server error / network failure.
+
+With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every one of those becomes 0.
+
+Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which stops a build
+phase reading the dSYM folder. Set it to NO on the target, or declare the folder
+in the phase's input file lists.";
+
 /// `bugsee-cli xcode` argument shape.
 #[derive(Subcommand, Debug)]
 pub enum XcodeCommand {
@@ -127,6 +154,31 @@ pub enum XcodeCommand {
 
         #[command(flatten)]
         overrides: PostActionOverrides,
+    },
+
+    /// Upload dSYMs from an Xcode Run Script build phase, with no build-info registration.
+    ///
+    /// Reads `DWARF_DSYM_FOLDER_PATH` from the build environment (falling back
+    /// to `<ARCHIVE_PATH>/dSYMs`) and uploads every `.dSYM` bundle it finds.
+    /// None of the `BUGSEE_BUILD_INFO_*` gates apply: this neither registers a
+    /// build nor uploads build-info, so it is safe to run on every build.
+    ///
+    /// UNLIKE `post-action`, a genuine failure FAILS THE BUILD by design — a
+    /// rejected token, an unreachable endpoint or a server error exits non-zero
+    /// so whoever triggered the build finds out that symbolication is broken.
+    /// Finding no dSYMs to upload is NOT a failure: it warns and exits 0.
+    /// Pass `--no-fail` to opt out of that entirely.
+    #[command(after_long_help = UPLOAD_DSYMS_ENV_HELP)]
+    UploadDsyms {
+        /// Never fail the build: downgrade every upload error to a warning and
+        /// exit 0 (overrides BUGSEE_DSYM_UPLOAD_NO_FAIL; default: off).
+        ///
+        /// Because this accepts in advance that failures go unseen, it also
+        /// runs the upload in the BACKGROUND (detached, like `post-action`) so
+        /// the build does not wait for it. Without it the upload is
+        /// synchronous, which is what lets a failure reach the build.
+        #[arg(long)]
+        no_fail: bool,
     },
 }
 
@@ -341,6 +393,12 @@ pub async fn dispatch(
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
         }
+        XcodeCommand::UploadDsyms { no_fail } => {
+            let env: HashMap<String, String> = std::env::vars().collect();
+            let no_fail = upload_dsyms_no_fail(no_fail, &env);
+            let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
+            run_upload_dsyms(&env, &endpoint, app_token.as_deref(), no_fail).await
+        }
     }
 }
 
@@ -365,6 +423,15 @@ pub(crate) enum Gate {
 /// "Add Environment Variable" emits `KEY=""` when the value field is left
 /// blank — treating that as "off" would silently disable a user who thought
 /// they were accepting the default).
+/// Whether `upload-dsyms` is in no-fail mode: the `--no-fail` flag OR a truthy
+/// `BUGSEE_DSYM_UPLOAD_NO_FAIL`. Shared with [`crate::cli::should_daemonize`],
+/// which needs the same answer BEFORE the runtime starts in order to decide
+/// whether to detach — no-fail mode backgrounds the upload, since nothing is
+/// waiting on its result.
+pub(crate) fn upload_dsyms_no_fail(flag: bool, env: &HashMap<String, String>) -> bool {
+    flag || env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
+}
+
 fn env_truthy_default_true(value: Option<&String>) -> bool {
     match value {
         None => true,
@@ -1180,6 +1247,125 @@ async fn upload_dsyms(
     }
 }
 
+/// `xcode upload-dsyms` — dSYM upload with NO build-info gating, for a Run
+/// Script build phase.
+///
+/// Failure policy, which is the point of the command: "nothing to upload" is a
+/// SUCCESS (no dSYM folder, or a folder with no `.dSYM` bundles in it) and
+/// warns; anything actually broken — missing or rejected token, server error,
+/// network failure — propagates its typed error so the build fails and whoever
+/// triggered it learns that symbolication is broken. `no_fail` downgrades the
+/// second group to a warning too.
+///
+/// The emptiness decision is made HERE, by discovering bundles before
+/// uploading, rather than by catching `run_dsym_upload`'s `InputNotFound` —
+/// that error also covers a genuinely missing input path, and inferring intent
+/// from an error type is how "nothing to do" silently becomes "something broke".
+async fn run_upload_dsyms(
+    env: &HashMap<String, String>,
+    endpoint: &str,
+    app_token: Option<&str>,
+    no_fail: bool,
+) -> anyhow::Result<()> {
+    apply_no_fail(upload_dsyms_strict(env, endpoint, app_token).await, no_fail)
+}
+
+/// The no-fail downgrade, isolated so the policy is one readable rule rather
+/// than a flag threaded through every return path.
+///
+/// `Ok` passes through untouched — note that "nothing to upload" already
+/// arrives here as `Ok`, so no-fail mode is only ever about REAL failures:
+/// a rejected token, an unreachable endpoint, a server error.
+fn apply_no_fail(result: anyhow::Result<()>, no_fail: bool) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) if no_fail => {
+            tracing::warn!(
+                error = %e,
+                "Bugsee: dSYM upload failed, but --no-fail (BUGSEE_DSYM_UPLOAD_NO_FAIL) \
+                 is set — not failing the build. Symbolication for this build will be \
+                 incomplete."
+            );
+            Ok(())
+        }
+        Err(e) => Err(e),
+    }
+}
+
+/// The strict half of [`run_upload_dsyms`]: returns `Ok(())` when the upload
+/// succeeded OR there was genuinely nothing to upload, and a typed error for
+/// everything else. Kept separate so the no-fail downgrade is one obvious
+/// place rather than a flag threaded through every early return.
+async fn upload_dsyms_strict(
+    env: &HashMap<String, String>,
+    endpoint: &str,
+    app_token: Option<&str>,
+) -> anyhow::Result<()> {
+    // "Nothing to upload" #1: no folder to look in. A build phase on a target
+    // that produces no debug symbols is a normal, correct state.
+    let folder = match resolve_dsym_folder(env) {
+        Some(f) => f,
+        None => {
+            tracing::warn!(
+                dwarf_dsym_folder_path = trimmed(env, "DWARF_DSYM_FOLDER_PATH"),
+                archive_path = trimmed(env, "ARCHIVE_PATH"),
+                "Bugsee: no dSYM folder found — nothing to upload. Set \
+                 DEBUG_INFORMATION_FORMAT to `dwarf-with-dsym` if you expected symbols."
+            );
+            return Ok(());
+        }
+    };
+
+    // "Nothing to upload" #2: the folder exists but holds no bundles. Decided
+    // here rather than by interpreting `run_dsym_upload`'s InputNotFound, which
+    // cannot distinguish this from a genuinely bad input path.
+    let candidates = debug_files::discover_dsyms(std::slice::from_ref(&folder));
+    if candidates.is_empty() {
+        tracing::warn!(
+            folder = %folder.display(),
+            "Bugsee: no .dSYM bundles in the dSYM folder — nothing to upload."
+        );
+        return Ok(());
+    }
+    tracing::info!(
+        folder = %folder.display(),
+        count = candidates.len(),
+        "Bugsee: uploading dSYMs"
+    );
+
+    // From here on every failure is real, and the build should hear about it.
+    let app_token = app_token.ok_or_else(|| {
+        config_invalid("--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms`")
+    })?;
+
+    // Version/build are best-effort metadata: the `.app` is not always locatable
+    // from a build phase, and the server tolerates empty strings. Never fatal —
+    // missing metadata must not block the symbols themselves.
+    let bundle = find_app(env).map(|app| resolve_bundle_info(&app));
+    let version = bundle
+        .as_ref()
+        .and_then(|b| b.version.as_deref())
+        .unwrap_or("");
+    let build = bundle
+        .as_ref()
+        .and_then(|b| b.build.as_deref())
+        .unwrap_or("");
+
+    debug_files::run_dsym_upload(
+        std::slice::from_ref(&folder),
+        endpoint,
+        app_token,
+        version,
+        build,
+        Strategy::default(),
+        /* force */ false,
+        /* dry_run */ false,
+    )
+    .await?;
+    tracing::info!("Bugsee: dSYM upload complete");
+    Ok(())
+}
+
 /// Resolve the dSYM folder to scan. Prefers `$DWARF_DSYM_FOLDER_PATH` (set in
 /// every Run-Script env); falls back to `<archive>/dSYMs` for an archive
 /// action. Returns `None` when neither resolves to an existing directory.
@@ -1270,6 +1456,140 @@ mod tests {
             crate::cli::Command::Xcode(XcodeCommand::PostAction { overrides, .. }) => overrides,
             other => panic!("expected post-action, got {other:?}"),
         }
+    }
+
+    // ─── `upload-dsyms` failure classification (#19) ──────────────────
+    //
+    // The contract: "nothing to upload" is a SUCCESS; anything broken fails the
+    // build. Each test names the exit code an integrator would observe.
+
+    /// A directory shaped like a dSYM bundle — enough for `discover_dsyms`,
+    /// which checks for `<name>.dSYM/Contents/Resources/DWARF/`.
+    fn fake_dsym(parent: &std::path::Path, name: &str) {
+        let dwarf = parent
+            .join(format!("{name}.dSYM"))
+            .join("Contents")
+            .join("Resources")
+            .join("DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join(name), b"not-a-real-macho").unwrap();
+    }
+
+    fn exit_code_of(e: &anyhow::Error) -> crate::exit_code::ExitCode {
+        e.downcast_ref::<Error>()
+            .map(Error::exit_code)
+            .unwrap_or(crate::exit_code::ExitCode::Unexpected)
+    }
+
+    #[tokio::test]
+    async fn no_dsym_folder_is_success_not_failure() {
+        // Nothing to upload must never break a build.
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", "/nonexistent/path")]);
+        let r = run_upload_dsyms(&env, "https://example.invalid", Some("TKN"), false).await;
+        assert!(r.is_ok(), "expected exit 0, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn folder_without_dsym_bundles_is_success_not_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.txt"), b"no dsyms here").unwrap();
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let r = run_upload_dsyms(&env, "https://example.invalid", Some("TKN"), false).await;
+        assert!(r.is_ok(), "expected exit 0, got {r:?}");
+    }
+
+    #[tokio::test]
+    async fn missing_app_token_fails_the_build() {
+        // There ARE dSYMs to upload and we cannot upload them — the user needs
+        // to know, so this is exit 20 rather than a silent skip.
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App");
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let err = run_upload_dsyms(&env, "https://example.invalid", None, false)
+            .await
+            .expect_err("missing token must fail the build");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn no_fail_downgrades_a_missing_token_to_exit_zero() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App");
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let r = run_upload_dsyms(&env, "https://example.invalid", None, true).await;
+        assert!(r.is_ok(), "--no-fail must never fail the build, got {r:?}");
+    }
+
+    /// Every failure the issue calls out — bad token, connectivity, server —
+    /// must reach the build by default, and none of them may reach it under
+    /// --no-fail. Extends the coverage of
+    /// `no_fail_downgrades_a_missing_token_to_exit_zero` across error kinds.
+    #[test]
+    fn every_real_failure_fails_the_build_unless_no_fail_is_set() {
+        use crate::exit_code::ExitCode;
+        let cases: Vec<(Error, ExitCode)> = vec![
+            (
+                Error::ConfigInvalid("no token".into()),
+                ExitCode::ConfigInvalid,
+            ),
+            (Error::AppTokenRejected, ExitCode::AppTokenRejected),
+            (
+                Error::UploadServer {
+                    status: 503,
+                    message: "upstream down".into(),
+                },
+                ExitCode::UploadServer,
+            ),
+            (
+                Error::UploadTransport("connection refused".into()),
+                ExitCode::UploadTransport,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            let strict = apply_no_fail(Err(anyhow::Error::from(err)), false)
+                .expect_err("strict mode must propagate the failure");
+            assert_eq!(
+                exit_code_of(&strict),
+                expected,
+                "strict mode must surface {expected:?} so the build fails"
+            );
+        }
+
+        // Same kinds, no-fail set: the build must survive every one of them.
+        for err in [
+            Error::ConfigInvalid("no token".into()),
+            Error::AppTokenRejected,
+            Error::UploadServer {
+                status: 503,
+                message: "upstream down".into(),
+            },
+            Error::UploadTransport("connection refused".into()),
+        ] {
+            assert!(
+                apply_no_fail(Err(anyhow::Error::from(err)), true).is_ok(),
+                "--no-fail must swallow every failure kind"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn no_fail_is_set_by_flag_or_env_var() {
+        assert!(upload_dsyms_no_fail(true, &env_of(&[])));
+        assert!(upload_dsyms_no_fail(
+            false,
+            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")])
+        ));
+        assert!(!upload_dsyms_no_fail(false, &env_of(&[])));
+        // Xcode writes KEY="" for a blank value field — that is "unset", not
+        // "enabled", consistent with every other toggle here.
+        assert!(!upload_dsyms_no_fail(
+            false,
+            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")])
+        ));
     }
 
     #[test]
