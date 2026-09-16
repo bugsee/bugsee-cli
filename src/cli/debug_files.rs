@@ -1592,6 +1592,7 @@ pub(crate) async fn run_dsym_upload(
         uploaded,
         already_existed,
         skipped,
+        dry_run,
     })
 }
 
@@ -1607,6 +1608,12 @@ pub(crate) struct DsymUploadSummary {
     pub already_existed: u32,
     /// Bundles found but not uploaded because they could not be read.
     pub skipped: u32,
+    /// True when nothing was actually sent. In a dry run the loop validates and
+    /// `continue`s WITHOUT incrementing `uploaded`, so `{0, 0, skipped}` would
+    /// otherwise read as "could not read any of them" to a caller that only
+    /// inspects the counts. No current caller passes `dry_run`, but the struct
+    /// claims to report what the upload did, so it has to say when it did none.
+    pub dry_run: bool,
 }
 
 #[cfg(test)]

@@ -404,7 +404,13 @@ pub async fn dispatch(
         // are overlaid onto the env map so every downstream gate sees them as if
         // they were environment variables (CLI flag wins over a real env var).
         XcodeCommand::PostAction { overrides, .. } => {
-            let mut env: HashMap<String, String> = std::env::vars().collect();
+            // `vars_os`, not `vars`: the latter panics on a non-UTF-8 key or
+            // value anywhere in the environment (exit 101, outside the
+            // documented contract). See bugsee/bugsee-cli#29 for the same bug
+            // still open in vcs-metadata and build-env.
+            let mut env: HashMap<String, String> = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect();
             apply_overrides(&mut env, &overrides);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
@@ -558,18 +564,26 @@ pub(crate) fn should_run(env: &HashMap<String, String>) -> Gate {
 /// (`ARCHIVE_PATH/Products/Applications/*.app`), then the Build-action path
 /// (`TARGET_BUILD_DIR/WRAPPER_NAME`, then `EXECUTABLE_FOLDER_PATH`, then a
 /// single-`.app` scan of the build dir).
-pub(crate) fn find_app(env: &HashMap<String, String>) -> Option<PathBuf> {
+pub(crate) fn find_app(
+    env: &HashMap<String, String>,
+    allow_build_dir_fallback: bool,
+) -> Option<PathBuf> {
     let archive_path = trimmed(env, "ARCHIVE_PATH");
     if !archive_path.is_empty() && Path::new(archive_path).is_dir() {
-        // Fall THROUGH on a miss rather than returning None. From a post-action
-        // the archive is complete and this always hits; from a Run Script build
-        // phase during `xcodebuild archive` the directory exists but
-        // `Products/Applications` is not populated yet, because the archive is
-        // assembled after the phases run. Giving up there would register dSYMs
-        // with empty version/build in exactly the case `upload-dsyms` exists
-        // for.
-        if let Some(app) = find_app_in_archive(Path::new(archive_path)) {
-            return Some(app);
+        match find_app_in_archive(Path::new(archive_path)) {
+            Some(app) => return Some(app),
+            // Falling through is `upload-dsyms`-only, deliberately NOT shared
+            // with post-action. From a Run Script build phase during
+            // `xcodebuild archive` the archive directory exists but
+            // `Products/Applications` is not populated yet, so giving up would
+            // register dSYMs with empty version/build. But post-action in that
+            // same state previously SKIPPED cleanly, and falling through would
+            // have it package the ArchiveIntermediates `.app` — not yet signed
+            // or thinned — as the build artefact, measure the size-check
+            // against a different binary than the archived one, and register
+            // the build a second time when the real post-action runs.
+            None if !allow_build_dir_fallback => return None,
+            None => {}
         }
     }
     find_app_in_build_dir(env)
@@ -925,7 +939,7 @@ async fn run_post_action_inner(
     })?;
 
     // 3. Locate the `.app`.
-    let app_path = match find_app(env) {
+    let app_path = match find_app(env, /* allow_build_dir_fallback */ false) {
         Some(p) => p,
         None => {
             tracing::info!(
@@ -1357,6 +1371,24 @@ async fn upload_dsyms_strict(
     // "Nothing to upload" #2: the folder exists but holds no bundles. Decided
     // here rather than by interpreting `run_dsym_upload`'s InputNotFound, which
     // cannot distinguish this from a genuinely bad input path.
+    // Listing the folder BEFORE discovery, because `discover_dsyms` walks with
+    // `filter_map(Result::ok)` and `resolve_dsym_folder` tests `is_dir()` —
+    // both of which turn "permission denied" into "empty". That is the Xcode
+    // 15+ ENABLE_USER_SCRIPT_SANDBOXING case this command documents: the
+    // sandbox denies the directory LISTING, not the DWARF parse, so it would
+    // otherwise never reach the "could not read a bundle" path below and would
+    // exit 0 on this command's single most likely real failure.
+    if let Err(e) = std::fs::read_dir(&folder) {
+        return Err(Error::InputNotFound(format!(
+            "cannot read the dSYM folder {}: {e} — if this is a Run Script build \
+             phase, Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which \
+             blocks it; set it to NO on the target, or declare the folder in the \
+             phase's input file lists",
+            folder.display(),
+        ))
+        .into());
+    }
+
     let candidates = debug_files::discover_dsyms(std::slice::from_ref(&folder));
     if candidates.is_empty() {
         tracing::warn!(
@@ -1372,14 +1404,23 @@ async fn upload_dsyms_strict(
     );
 
     // From here on every failure is real, and the build should hear about it.
-    let app_token = app_token.ok_or_else(|| {
-        config_invalid("--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms`")
+    // `.filter` as well as `ok_or_else`: Xcode's "Add Environment Variable"
+    // writes KEY="" when the value field is left blank, and clap hands that
+    // through as Some(""). Without this it POSTs to `/apps//symbols`, burns the
+    // retry budget, and exits 31 — a network error for what is a misconfigured
+    // token.
+    let app_token = app_token.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
+        config_invalid(
+            "--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms` \
+             and must not be empty",
+        )
     })?;
 
     // Version/build are best-effort metadata: the `.app` is not always locatable
     // from a build phase, and the server tolerates empty strings. Never fatal —
     // missing metadata must not block the symbols themselves.
-    let bundle = find_app(env).map(|app| resolve_bundle_info(&app));
+    let bundle =
+        find_app(env, /* allow_build_dir_fallback */ true).map(|app| resolve_bundle_info(&app));
     let version = bundle
         .as_ref()
         .and_then(|b| b.version.as_deref())
@@ -1407,13 +1448,14 @@ async fn upload_dsyms_strict(
     // exists to prevent. Triggers: a truncated or partially-written dSYM, an
     // empty Contents/Resources/DWARF, or DWARF unreadable under
     // ENABLE_USER_SCRIPT_SANDBOXING.
-    if summary.uploaded == 0 && summary.already_existed == 0 && summary.skipped > 0 {
+    if summary.skipped > 0 && !summary.dry_run {
         return Err(input_invalid(format!(
-            "found {} dSYM bundle(s) under {} but could not read any of them — \
-             no symbols were uploaded (a truncated dSYM, an empty \
+            "{} of {} dSYM bundle(s) under {} could not be read, so those symbols \
+             were NOT uploaded (a truncated dSYM, an empty \
              Contents/Resources/DWARF, or DWARF unreadable under \
              ENABLE_USER_SCRIPT_SANDBOXING)",
             summary.skipped,
+            summary.skipped + summary.uploaded + summary.already_existed,
             folder.display(),
         )));
     }
@@ -1605,6 +1647,116 @@ mod tests {
         assert_eq!(exit_code_of(&err), crate::exit_code::ExitCode::InputInvalid);
     }
 
+    /// The fallback is `upload-dsyms`-only. post-action must keep skipping
+    /// cleanly on an unpopulated archive: falling through would have it package
+    /// the ArchiveIntermediates `.app` — unsigned, unthinned — as the build
+    /// artefact, size-check a different binary than the archived one, and
+    /// register the build a second time when the real post-action runs.
+    #[test]
+    fn the_build_dir_fallback_is_not_shared_with_post_action() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = tmp.path().join("App.xcarchive");
+        std::fs::create_dir_all(&archive).unwrap();
+        let build_dir = tmp.path().join("Build/Products/Release-iphoneos");
+        std::fs::create_dir_all(build_dir.join("App.app")).unwrap();
+
+        let env = env_of(&[
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("TARGET_BUILD_DIR", build_dir.to_str().unwrap()),
+            ("WRAPPER_NAME", "App.app"),
+        ]);
+        assert!(
+            find_app(&env, /* allow_build_dir_fallback */ false).is_none(),
+            "post-action must not adopt a build-dir .app when an archive is declared"
+        );
+        assert!(
+            find_app(&env, /* allow_build_dir_fallback */ true).is_some(),
+            "upload-dsyms must"
+        );
+    }
+
+    /// An unreadable dSYM FOLDER is the Xcode 15+ sandboxing case this command
+    /// documents — and the sandbox denies the directory listing, not the DWARF
+    /// parse, so it never reaches the "could not read any bundle" path. It must
+    /// not be mistaken for "nothing to upload".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_dsym_folder_fails_the_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("dsyms");
+        std::fs::create_dir_all(folder.join("App.dSYM/Contents/Resources/DWARF")).unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+
+        // Restore before asserting so the tempdir can always be cleaned up.
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let err = r.expect_err("an unreadable dSYM folder must not report success");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::InputNotFound
+        );
+    }
+
+    /// Xcode writes `KEY=""` when the value field is left blank, so an empty
+    /// token is a REALISTIC misconfiguration — and it must be reported as one
+    /// (exit 20) rather than as whatever the server says about `/apps//symbols`.
+    #[tokio::test]
+    async fn an_empty_app_token_is_a_config_error_not_a_network_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App");
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, "https://example.invalid", Some(""))
+            .await
+            .expect_err("an empty token must fail");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+    }
+
+    /// One good bundle and one unreadable one: the good one uploads and the
+    /// build goes green, so the unreadable binary's symbols are silently absent.
+    /// An app + an app extension whose `.appex.dSYM` was truncated is exactly
+    /// this shape — the same loss the command exists to prevent, scoped to one
+    /// binary instead of all of them.
+    #[tokio::test]
+    async fn a_partially_unreadable_folder_fails_the_build() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        fake_dsym(&folder, "Widget"); // alongside the real one
+
+        let server = MockServer::start().await;
+        let put_url = format!("{}/s3-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": 0, "endpoint": put_url })),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/s3-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, &server.uri(), Some("TKN"))
+            .await
+            .expect_err("one unreadable bundle must still fail the build");
+        assert_eq!(exit_code_of(&err), crate::exit_code::ExitCode::InputInvalid);
+    }
+
     /// A Run Script build phase during `xcodebuild archive` sees ARCHIVE_PATH
     /// set while `Products/Applications` is not populated yet — the archive is
     /// assembled after the phases run. `find_app` must not give up there, or
@@ -1627,7 +1779,7 @@ mod tests {
             ("WRAPPER_NAME", "App.app"),
         ]);
         assert_eq!(
-            find_app(&env).as_deref(),
+            find_app(&env, true).as_deref(),
             Some(app.as_path()),
             "an unpopulated archive must fall through to TARGET_BUILD_DIR"
         );
@@ -2378,7 +2530,7 @@ mod tests {
             .join("MyApp.app");
         std::fs::create_dir_all(&app).unwrap();
         let env = env_of(&[("ARCHIVE_PATH", archive.to_str().unwrap())]);
-        assert_eq!(find_app(&env), Some(app));
+        assert_eq!(find_app(&env, true), Some(app));
     }
 
     /// Build-dir layout: `$TARGET_BUILD_DIR/$WRAPPER_NAME`.
@@ -2391,7 +2543,7 @@ mod tests {
             ("TARGET_BUILD_DIR", tmp.path().to_str().unwrap()),
             ("WRAPPER_NAME", "MyApp.app"),
         ]);
-        assert_eq!(find_app(&env), Some(app));
+        assert_eq!(find_app(&env, true), Some(app));
     }
 
     /// Build-dir single-`.app` scan when WRAPPER_NAME is absent.
@@ -2401,7 +2553,7 @@ mod tests {
         let app = tmp.path().join("Only.app");
         std::fs::create_dir_all(&app).unwrap();
         let env = env_of(&[("TARGET_BUILD_DIR", tmp.path().to_str().unwrap())]);
-        assert_eq!(find_app(&env), Some(app));
+        assert_eq!(find_app(&env, true), Some(app));
     }
 
     /// No `.app` anywhere → None.
@@ -2409,7 +2561,7 @@ mod tests {
     fn find_app_none_when_absent() {
         let tmp = tempfile::tempdir().unwrap();
         let env = env_of(&[("TARGET_BUILD_DIR", tmp.path().to_str().unwrap())]);
-        assert_eq!(find_app(&env), None);
+        assert_eq!(find_app(&env, true), None);
     }
 
     /// Two `.app` dirs in the build dir with no WRAPPER_NAME is ambiguous →
@@ -2421,7 +2573,7 @@ mod tests {
         std::fs::create_dir_all(tmp.path().join("First.app")).unwrap();
         std::fs::create_dir_all(tmp.path().join("Second.app")).unwrap();
         let env = env_of(&[("TARGET_BUILD_DIR", tmp.path().to_str().unwrap())]);
-        assert_eq!(find_app(&env), None);
+        assert_eq!(find_app(&env, true), None);
     }
 
     /// A WRAPPER_NAME that exists as a dir but is NOT `.app`-suffixed must not
@@ -2438,7 +2590,7 @@ mod tests {
             ("WRAPPER_NAME", "NotAnApp"),
         ]);
         // WRAPPER_NAME is rejected (no `.app`); the single-`.app` scan finds Real.app.
-        assert_eq!(find_app(&env), Some(real));
+        assert_eq!(find_app(&env, true), Some(real));
     }
 
     // ── env_truthy tokens ──────────────────────────────────────────
