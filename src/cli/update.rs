@@ -718,7 +718,7 @@ mod tests {
 
     #[test]
     fn host_triple_is_known_on_this_host() {
-        // The test host is one of the 5 supported triples (CI + dev machines).
+        // The test host is one of the 6 supported triples (CI + dev machines).
         assert!(host_triple().is_some());
     }
 

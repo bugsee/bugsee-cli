@@ -29,7 +29,7 @@ function vendorPath(triple) {
  *
  *  1. The platform package installed as an optionalDependency. This is the
  *     normal path and the whole point of the package split: npm picks exactly
- *     one of the five by `os`/`cpu`, and it works under `--ignore-scripts`
+ *     one of the six by `os`/`cpu`, and it works under `--ignore-scripts`
  *     because nothing had to run to put the binary there.
  *  2. `vendor/`, where the postinstall fallback downloads to when (1) is
  *     unavailable — `--no-optional`, a registry mirror that carries only the

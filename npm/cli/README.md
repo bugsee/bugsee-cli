@@ -12,7 +12,7 @@ npx bugsee-cli --version
 
 ## How the binary gets here
 
-The binary is **not** in this package. It ships in five per-platform packages,
+The binary is **not** in this package. It ships in six per-platform packages,
 declared as `optionalDependencies`:
 
 | Package                    | `os` / `cpu`       |
@@ -22,6 +22,7 @@ declared as `optionalDependencies`:
 | `@bugsee/cli-linux-arm64`  | `linux` / `arm64`  |
 | `@bugsee/cli-linux-x64`    | `linux` / `x64`    |
 | `@bugsee/cli-win32-x64`    | `win32` / `x64`    |
+| `@bugsee/cli-win32-arm64`  | `win32` / `arm64`  |
 
 npm installs only the one matching your machine and skips the rest. Nothing is
 downloaded at install time, so this works with `--ignore-scripts`, with a

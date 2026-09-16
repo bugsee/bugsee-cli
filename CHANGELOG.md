@@ -7,6 +7,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **Windows ARM64 (`aarch64-pc-windows-msvc`) is now a published target** — the
+  sixth triple, bringing a seventh npm package (`@bugsee/cli-win32-arm64`).
+  Closes [#20]. That leg builds NATIVELY on a `windows-11-arm` runner rather
+  than cross-compiling: under cargo-xwin, `ring` assembles its ARM64 Windows
+  `.S` files with the plain `clang` driver, which reads MSVC-style `/imsvc`
+  include flags as filenames. `installer/install.ps1` now resolves ARM64 hosts
+  (preferring `PROCESSOR_ARCHITEW6432`, so a 32-bit PowerShell on 64-bit Windows
+  is not misread as x86), and `ci.yml` build-checks and e2e-tests the target on
+  every PR so a broken leg cannot reach a tag push.
 - **`bugsee-cli xcode upload-dsyms`** — dSYM upload from an Xcode Run Script
   build phase, with none of the `BUGSEE_BUILD_INFO_*` gating. It neither
   registers a build nor uploads build-info, so it is safe to run on every build,
@@ -25,7 +34,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `xcode post-action` is unchanged: `BUGSEE_BUILD_INFO_ENABLED=0` still disables
   dSYM upload there.
 
+### Fixed
+- **`bugsee-cli update` on Windows ARM64** refused to run: `host_triple()` had
+  no `("windows", "aarch64")` arm and returned `None`. The mapping is now a
+  table rather than `match` arms — a `match` can only ever be exercised for the
+  host it compiled on, which is how the platform went missing — and two tests
+  pin it against `[workspace.metadata.dist].targets` so the two cannot drift
+  again.
+
 [#19]: https://github.com/bugsee/bugsee-cli/issues/19
+[#20]: https://github.com/bugsee/bugsee-cli/issues/20
 
 
 ## [0.7.6] - 2026-09-16

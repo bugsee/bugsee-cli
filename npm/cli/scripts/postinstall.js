@@ -7,7 +7,7 @@
 //   - `npm install --no-optional` / `--omit=optional` (and the CI images that
 //     bake that in), where npm never even looks at the platform packages;
 //   - an internal registry mirror or proxy that carries @bugsee/cli but not
-//     the five @bugsee/cli-<platform> scopes, where npm silently skips the
+//     the six @bugsee/cli-<platform> scopes, where npm silently skips the
 //     optional dependency and leaves nothing behind;
 //   - a platform we publish no package for at all.
 //

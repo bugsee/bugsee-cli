@@ -50,7 +50,7 @@ builds the tokio runtime, and dispatches.
 - `src/cli/` — one module per command, each owning its clap arg struct + logic:
   `debug_files` (upload/convert), `sourcemaps` (inject), `upload`
   (build/build-info), `pack`, `vcs_metadata`, `ios_deps`, `build_env`, `dsym`,
-  `xcode` (post-action). `mod.rs` defines the top-level `Cli`/`Command` and
+  `xcode` (post-action, upload-dsyms). `mod.rs` defines the top-level `Cli`/`Command` and
   `dispatch`. The Xcode post-action's helpers live alongside: `xcactivitylog`
   (build-timings decode), `xcode_ipa` (`.app`→`.ipa` packaging + Mach-O UUID),
   `size_check` (in-build size gate).
@@ -164,15 +164,21 @@ for the same binary: `publish` takes the cargo-dist-generated
 `bugsee-cli-npm-package.tar.gz` release asset straight to `@bugsee/bugsee-cli`
 (a single package whose postinstall downloads the binary), while
 `publish-optional-deps` runs `npm/build.mjs` over the release's binary archives
-to assemble and publish `@bugsee/cli` plus its five `@bugsee/cli-<platform>`
+to assemble and publish `@bugsee/cli` plus its six `@bugsee/cli-<platform>`
 packages (per-`os`/`cpu` `optionalDependencies`, so nothing downloads at install
-time). Six packages, platform packages FIRST — npm skips an unresolvable
+time). Seven packages, platform packages FIRST — npm skips an unresolvable
 optional dependency silently, so the front package must never be live ahead of
-them. See `npm/README.md`. Each package needs its own Trusted Publisher entry on
-npmjs.com pointing at `npm-publish.yml` — and that entry lives on a PACKAGE's
-settings page, so it cannot be added for a name that has never been published.
-A new name therefore needs one manual token-auth publish first; the runbook is
-`npm/README.md` ("First-publish bootstrap"). Skipping it fails only at publish
+them. See `npm/README.md`. Each package needs its own Trusted Publisher entry
+pointing at `npm-publish.yml`, written with `npm trust github <pkg> --file
+npm-publish.yml --repo bugsee/bugsee-cli --allow-publish` (npm >= 11.15;
+`--allow-publish` does not exist before that, and an entry created without it
+grants nothing while looking configured). npm keys the entry on a PACKAGE, so it
+cannot be added for a name that has never been published: a new name needs one
+manual placeholder publish first, which requires an interactive 2FA browser
+challenge — NOT a token, and never `--otp` in a loop, which trips npm's
+per-account OTP rate limiter. Both steps are scripted in
+`npm/bootstrap-names.sh`; the runbook is `npm/README.md`
+("First-publish bootstrap"). Skipping it fails only at publish
 time, with a 404 on the `PUT` that reads as though the package does not exist
 rather than as a missing trust configuration. The publish loop is written to be
 resumable for exactly that reason — npm versions are immutable, so a partial

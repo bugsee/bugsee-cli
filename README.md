@@ -272,7 +272,8 @@ Stable. Integrators (Gradle plugin, MSBuild target, fastlane plugin, npm wrapper
 | 10–19 | Input / discovery problems (file not found, unparseable format).      | no                       |
 | 20–29 | Configuration problems (bad token, invalid flags).                   | no                       |
 | 30–39 | Upload problems (network, server 4xx/5xx).                            | no                       |
-| 40+   | Reserved.                                                            | no                       |
+| 40    | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
+| 41+   | Reserved.                                                            | no                       |
 
 The fallback rule: codes ≤ 2 mean the CLI never got a fair chance to run; codes ≥ 10 are substantive failures the in-language uploader would hit the same way. See `src/exit_code.rs` for the source-of-truth enum.
 
@@ -294,7 +295,7 @@ Every metadata `POST` sets `X-Bugsee-Uploader: cli`. The in-language fallback up
 | CDN download + SHA-256 checksum on first use | Flutter (Dart plugin), fastlane plugin (`resolveCli`) |
 | Homebrew tap + curl installer | iOS / generic CI |
 
-Target platforms: macOS arm64 + x86_64, Linux x86_64 + aarch64 (glibc; musl if Alpine CI demand exists), Windows x86_64. (Windows arm64 is not built — see [#20](https://github.com/bugsee/bugsee-cli/issues/20).)
+Target platforms: macOS arm64 + x86_64, Linux x86_64 + aarch64 (glibc; musl if Alpine CI demand exists), Windows x86_64 + arm64. (Windows arm64 builds natively on a `windows-11-arm` runner — see [#20](https://github.com/bugsee/bugsee-cli/issues/20).)
 
 ### The two npm packages
 
@@ -302,9 +303,9 @@ Both ship the same binary at the same version, and both are published from
 `.github/workflows/npm-publish.yml` off the same release. They differ in how
 the binary reaches `node_modules`:
 
-**`@bugsee/cli` — prefer this one.** The binary lives in five per-platform
+**`@bugsee/cli` — prefer this one.** The binary lives in six per-platform
 packages (`@bugsee/cli-darwin-arm64`, `-darwin-x64`, `-linux-arm64`,
-`-linux-x64`, `-win32-x64`), each declaring `os`/`cpu` and
+`-linux-x64`, `-win32-x64`, `-win32-arm64`), each declaring `os`/`cpu` and
 pinned to the exact version by the front package's `optionalDependencies`. npm
 resolves exactly one. Nothing is downloaded at install time, so it works under
 `--ignore-scripts`, under a lockfile-pinned CI install, and offline from a warm
