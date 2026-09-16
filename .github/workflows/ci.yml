@@ -98,6 +98,23 @@ jobs:
   # `dsym::identify` and skipped before any network call — on Linux those tests
   # skip themselves, so an ubuntu-only matrix would leave the command's actual
   # job unverified in CI.
+  # `npm/bootstrap-names.sh` decides whether a package is correctly configured
+  # for OIDC publishing. A wrong answer is invisible until a release 404s
+  # halfway through the publish loop, and its `other` branch tells an operator
+  # to REVOKE a trust entry — so the classifier needs its fixtures run on every
+  # change, not just on whoever last touched it.
+  #
+  # No network, npm or auth: the fixtures stand in for `npm trust list`.
+  npm-scripts:
+    name: npm scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: shellcheck
+        run: shellcheck npm/bootstrap-names.sh npm/test-bootstrap-names.sh
+      - name: trust_state fixtures
+        run: bash npm/test-bootstrap-names.sh
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
