@@ -112,6 +112,9 @@ Environment variables (read from the Xcode build environment):
   BUGSEE_DSYM_UPLOAD_NO_FAIL
                            Truthy: never fail the build, and run the upload in
                            the background. Same as --no-fail.
+  PROJECT_TEMP_DIR         Where the detached run writes its log, in no-fail
+                           mode only. Xcode sets this; falls back to the system
+                           temp dir.
   BUGSEE_APP_TOKEN         App token (or pass --app-token).
   BUGSEE_ENDPOINT          API endpoint (or pass --endpoint).
 
@@ -119,10 +122,16 @@ Exit codes:
 
   0        Uploaded, or there was nothing to upload (no dSYM folder, or no
            .dSYM bundles in it). Both are reported as warnings.
+  10 / 11  A bundle could not be read or packed (unreadable DWARF, disk full).
   20 / 21  Missing or rejected app token.
   30 / 31  Server error / network failure.
 
-With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every one of those becomes 0.
+With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every non-zero code becomes 0.
+
+  BUGSEE_DSYM_UPLOAD_NO_FAIL / --no-fail additionally DETACH the upload on unix,
+  so its output goes to $PROJECT_TEMP_DIR/bugsee-cli.log (falling back to the
+  system temp dir) instead of the build log. If you want those warnings visible
+  in Xcode, do not use no-fail mode.
 
 Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which stops a build
 phase reading the dSYM folder. Set it to NO on the target, or declare the folder
@@ -171,12 +180,19 @@ pub enum XcodeCommand {
     #[command(after_long_help = UPLOAD_DSYMS_ENV_HELP)]
     UploadDsyms {
         /// Never fail the build: downgrade every upload error to a warning and
-        /// exit 0 (overrides BUGSEE_DSYM_UPLOAD_NO_FAIL; default: off).
+        /// exit 0 (default: off).
         ///
-        /// Because this accepts in advance that failures go unseen, it also
-        /// runs the upload in the BACKGROUND (detached, like `post-action`) so
-        /// the build does not wait for it. Without it the upload is
-        /// synchronous, which is what lets a failure reach the build.
+        /// Equivalent to setting BUGSEE_DSYM_UPLOAD_NO_FAIL — either one
+        /// ENABLES no-fail, and there is no flag that turns it back off, so a
+        /// job that exports the variable globally cannot opt one invocation
+        /// back into strict mode.
+        ///
+        /// Because this accepts in advance that failures go unseen, on unix it
+        /// also runs the upload in the BACKGROUND (detached, like
+        /// `post-action`), which means its warnings go to the daemon log rather
+        /// than the build log — see the environment section below. On Windows
+        /// there is no fork, so it stays synchronous. Without it the upload is
+        /// always synchronous, which is what lets a failure reach the build.
         #[arg(long)]
         no_fail: bool,
     },
@@ -394,7 +410,12 @@ pub async fn dispatch(
             run_post_action(&env, &endpoint, app_token.as_deref()).await
         }
         XcodeCommand::UploadDsyms { no_fail } => {
-            let env: HashMap<String, String> = std::env::vars().collect();
+            // `env::vars()` panics on a non-UTF-8 key/value; `vars_os` skips
+            // them instead. Nothing this command reads can be non-Unicode, and
+            // an unrelated variable in the environment must not abort the run.
+            let env: HashMap<String, String> = std::env::vars_os()
+                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+                .collect();
             let no_fail = upload_dsyms_no_fail(no_fail, &env);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_upload_dsyms(&env, &endpoint, app_token.as_deref(), no_fail).await
@@ -423,15 +444,6 @@ pub(crate) enum Gate {
 /// "Add Environment Variable" emits `KEY=""` when the value field is left
 /// blank — treating that as "off" would silently disable a user who thought
 /// they were accepting the default).
-/// Whether `upload-dsyms` is in no-fail mode: the `--no-fail` flag OR a truthy
-/// `BUGSEE_DSYM_UPLOAD_NO_FAIL`. Shared with [`crate::cli::should_daemonize`],
-/// which needs the same answer BEFORE the runtime starts in order to decide
-/// whether to detach — no-fail mode backgrounds the upload, since nothing is
-/// waiting on its result.
-pub(crate) fn upload_dsyms_no_fail(flag: bool, env: &HashMap<String, String>) -> bool {
-    flag || env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
-}
-
 fn env_truthy_default_true(value: Option<&String>) -> bool {
     match value {
         None => true,
@@ -448,6 +460,15 @@ fn env_truthy(value: Option<&String>) -> bool {
         value.map(|v| v.trim().to_ascii_lowercase()).as_deref(),
         Some("1") | Some("true") | Some("yes") | Some("on")
     )
+}
+
+/// Whether `upload-dsyms` is in no-fail mode: the `--no-fail` flag OR a truthy
+/// `BUGSEE_DSYM_UPLOAD_NO_FAIL`. Shared with [`crate::cli::should_daemonize`],
+/// which needs the same answer BEFORE the runtime starts in order to decide
+/// whether to detach — no-fail mode backgrounds the upload, since nothing is
+/// waiting on its result.
+pub(crate) fn upload_dsyms_no_fail(flag: bool, env: &HashMap<String, String>) -> bool {
+    flag || env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
 }
 
 fn trimmed<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
@@ -1521,6 +1542,178 @@ mod tests {
         let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
         let r = run_upload_dsyms(&env, "https://example.invalid", None, true).await;
         assert!(r.is_ok(), "--no-fail must never fail the build, got {r:?}");
+    }
+
+    /// Build a REAL `.dSYM` (clang + dsymutil) in `dir`, or `None` when the
+    /// Apple toolchain is absent.
+    ///
+    /// A fabricated directory is not enough for anything past discovery:
+    /// `dsym::identify` rejects it, `run_dsym_upload` logs a warning and
+    /// `continue`s, and the upload never touches the network — so every test
+    /// below would pass without a server. `scripts/e2e_flows.py` builds its
+    /// fixture the same way.
+    fn real_dsym(dir: &std::path::Path) -> Option<PathBuf> {
+        if which("clang").is_none() || which("dsymutil").is_none() {
+            return None;
+        }
+        // Compile in a SEPARATE directory from the one we hand to the scanner:
+        // on macOS `clang -g` links and then runs dsymutil itself, leaving a
+        // `t.dSYM` next to the binary. Scanning that directory would discover
+        // two bundles and upload both.
+        let work = dir.join("work");
+        let folder = dir.join("dsyms");
+        std::fs::create_dir_all(&work).ok()?;
+        std::fs::create_dir_all(&folder).ok()?;
+
+        let c = work.join("t.c");
+        std::fs::write(&c, b"int main(){return 0;}\n").ok()?;
+        let exe = work.join("t");
+        std::process::Command::new("clang")
+            .arg("-g")
+            .arg(&c)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        let dsym = folder.join("App.dSYM");
+        std::process::Command::new("dsymutil")
+            .arg(&exe)
+            .arg("-o")
+            .arg(&dsym)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())?;
+        // The folder to scan, containing exactly one bundle.
+        dsym.is_dir().then_some(folder)
+    }
+
+    fn which(bin: &str) -> Option<PathBuf> {
+        std::env::var_os("PATH").and_then(|paths| {
+            std::env::split_paths(&paths)
+                .map(|d| d.join(bin))
+                .find(|p| p.is_file())
+        })
+    }
+
+    /// Wires a mock Bugsee endpoint whose metadata POST answers with `body`.
+    async fn mock_endpoint(body: serde_json::Value) -> wiremock::MockServer {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    /// The success path. Without this, deleting the `run_dsym_upload` call
+    /// entirely leaves every other test in this file passing — the command's
+    /// actual job would have no coverage at all.
+    #[tokio::test]
+    async fn uploads_the_dsym_and_hits_both_stages() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+
+        let server = MockServer::start().await;
+        let put_url = format!("{}/s3-put", server.uri());
+        // Stage 1: metadata POST hands back a presigned URL.
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": 0, "endpoint": put_url })),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        // Stage 2: the payload PUT. `.expect(1)` is the assertion that the
+        // upload actually happened.
+        Mock::given(method("PUT"))
+            .and(wm_path("/s3-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        upload_dsyms_strict(&env, &server.uri(), Some("TKN"))
+            .await
+            .expect("upload should succeed");
+        // MockServer verifies the `.expect(1)`s on drop.
+    }
+
+    #[tokio::test]
+    async fn rejected_app_token_fails_the_build_with_21() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = mock_endpoint(serde_json::json!({
+            "error": { "type": "ApplicationNotFoundError", "message": "no such app" }
+        }))
+        .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, &server.uri(), Some("TKN"))
+            .await
+            .expect_err("a rejected token must fail the build");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::AppTokenRejected
+        );
+    }
+
+    #[tokio::test]
+    async fn server_error_fails_the_build_with_30() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = mock_endpoint(serde_json::json!({
+            "error": { "type": "InternalError", "message": "upstream exploded" }
+        }))
+        .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, &server.uri(), Some("TKN"))
+            .await
+            .expect_err("a server error must fail the build");
+        assert_eq!(exit_code_of(&err), crate::exit_code::ExitCode::UploadServer);
+    }
+
+    /// The same real failures, under `--no-fail`: the build must survive every
+    /// one of them. This is the end-to-end counterpart of
+    /// `every_real_failure_fails_the_build_unless_no_fail_is_set`, which only
+    /// exercises the downgrade over hand-built errors.
+    #[tokio::test]
+    async fn no_fail_swallows_a_real_server_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = mock_endpoint(serde_json::json!({
+            "error": { "type": "ApplicationNotFoundError", "message": "no such app" }
+        }))
+        .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = run_upload_dsyms(&env, &server.uri(), Some("TKN"), true).await;
+        assert!(
+            r.is_ok(),
+            "--no-fail must swallow a rejected token, got {r:?}"
+        );
     }
 
     /// Every failure the issue calls out — bad token, connectivity, server —

@@ -34,7 +34,8 @@ fn main() {
     };
 
     // Detach into the background BEFORE any thread/runtime exists. Only
-    // `xcode post-action` (without --force-foreground) daemonizes; on success
+    // `xcode post-action` (without --force-foreground) and `xcode upload-dsyms`
+    // in no-fail mode daemonize; on success
     // the original process has already `exit(0)`'d and only the detached daemon
     // returns here. A fork failure falls back to foreground so the work still
     // runs (a slow archive beats a missing build record).

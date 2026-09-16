@@ -36,7 +36,7 @@ Binary lands at `target/release/bugsee-cli`. Pinned to stable Rust via `rust-too
 
 ## Subcommands
 
-All subcommands print JSON to stdout and exit 0 on parseable failure (empty list / null / empty object) so Python integrators can shell with `check=False` and rely on the output shape rather than the exit code. Hard failures (network, auth, malformed argv) follow the [exit-code contract](#exit-code-contract) below.
+The metadata-resolving subcommands print JSON to stdout and exit 0 on parseable failure (empty list / null / empty object) so Python integrators can shell with `check=False` and rely on the output shape rather than the exit code. (`xcode upload-dsyms` is deliberately not one of these: it prints nothing to stdout and is designed to exit non-zero so a build phase fails — see its section below.) Hard failures (network, auth, malformed argv) follow the [exit-code contract](#exit-code-contract) below.
 
 ### `debug-files upload <paths>...`
 
@@ -199,6 +199,7 @@ report is unreadable:
 | Situation | Exit | Build |
 | --- | --- | --- |
 | Uploaded, or nothing to upload | `0` | continues |
+| A bundle could not be read or packed | `10` / `11` | **fails** |
 | Missing / rejected app token | `20` / `21` | **fails** |
 | Server error / network failure | `30` / `31` | **fails** |
 
@@ -206,9 +207,16 @@ report is unreadable:
 success, not a failure: a target that produces no debug symbols is a normal
 state. Only real problems fail the build.
 
-`--no-fail` (or `BUGSEE_DSYM_UPLOAD_NO_FAIL=1`) opts out of all of it. Because
-that accepts in advance that failures go unseen, it also runs the upload in the
-**background** so the build never waits on it.
+`--no-fail` (or `BUGSEE_DSYM_UPLOAD_NO_FAIL=1`) opts out of all of it. Either
+one *enables* no-fail; there is no flag that turns it back off, so a job
+exporting the variable globally cannot opt a single invocation back into strict
+mode.
+
+Because no-fail accepts in advance that failures go unseen, on unix it also runs
+the upload in the **background**, which means its warnings go to
+`$PROJECT_TEMP_DIR/bugsee-cli.log` rather than the Xcode build log. If you want
+them visible, do not use no-fail mode. (On Windows there is no fork, so it stays
+synchronous.)
 
 > **Xcode 15+:** `ENABLE_USER_SCRIPT_SANDBOXING` defaults to `YES`, which stops a
 > build phase reading the dSYM folder. Set it to `NO` on the target, or declare
@@ -226,7 +234,7 @@ bugsee-cli debug-files convert <input> --to bmf|bsf --output <path>
 
 ### Global flags
 
-`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `upload build`, `upload build-info`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`, `sourcemaps inject`) do no network I/O and ignore them.
+`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `upload build`, `upload build-info`, `xcode post-action`, `xcode upload-dsyms`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`, `sourcemaps inject`) do no network I/O and ignore them.
 
 ### Subcommand vocabulary
 
