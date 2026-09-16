@@ -16,6 +16,7 @@
 //! legacy top-level `uuid` fallback); `debug-files upload --type sourcemaps` reads the
 //! id back via [`read_debug_id`].
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -68,6 +69,14 @@ pub struct InjectStats {
     pub maps_updated: u32,
 }
 
+/// Whether `inject` treats this file as a JS bundle (`.js`/`.cjs`/`.mjs`).
+fn is_js_bundle(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|e| e.to_str()),
+        Some("js") | Some("cjs") | Some("mjs")
+    )
+}
+
 /// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`.
 pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
     let mut stats = InjectStats::default();
@@ -77,19 +86,45 @@ pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if !p.is_file() {
-                continue;
-            }
-            let is_js = matches!(
-                p.extension().and_then(|e| e.to_str()),
-                Some("js") | Some("cjs") | Some("mjs")
-            );
-            if is_js {
+            if p.is_file() && is_js_bundle(p) {
                 inject_one(p, dry_run, &mut stats)?;
             }
         }
     }
     Ok(stats)
+}
+
+/// The `.map` files that `inject` would stamp under `paths`: each JS bundle's
+/// paired map, resolved exactly as [`inject_paths`] resolves it. Canonicalized,
+/// so a caller can compare them against paths it reached another way.
+///
+/// This is what lets an upload tell a bundle's map that is MISSING its debug-id
+/// (inject did not run — an error) from a map no bundle points at, such as an
+/// extracted-CSS map or a `.d.ts.map`, which inject never stamps by design.
+pub fn bundle_maps(paths: &[PathBuf]) -> HashSet<PathBuf> {
+    let mut out = HashSet::new();
+    for root in paths {
+        for entry in walkdir::WalkDir::new(root)
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
+            let p = entry.path();
+            if !(p.is_file() && is_js_bundle(p)) {
+                continue;
+            }
+            // A bundle that cannot be read as text cannot be injected either, so
+            // it contributes no map — the same outcome inject would reach.
+            let Ok(content) = std::fs::read_to_string(p) else {
+                continue;
+            };
+            if let Some(map) = paired_map(p, &content) {
+                if let Ok(canonical) = std::fs::canonicalize(&map) {
+                    out.insert(canonical);
+                }
+            }
+        }
+    }
+    out
 }
 
 fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {

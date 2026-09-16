@@ -23,7 +23,7 @@ import tempfile
 import threading
 
 TOKEN = "TKN"
-STATE = {"flow": "none", "port": 0, "cap": ""}
+STATE = {"flow": "none", "port": 0, "cap": "", "duplicate_uuids": set(), "puts": {}}
 
 
 def cappath(name):
@@ -62,6 +62,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if p.endswith("/symbols"):
             with open(cappath(f"{flow}__symbols_post.json"), "wb") as f:
                 f.write(body)
+            with open(cappath(f"{flow}__symbols_posts.jsonl"), "ab") as f:
+                f.write(body + b"\n")
+            if json.loads(body).get("uuid") in STATE["duplicate_uuids"]:
+                # The appserver's REAL duplicate answer (code/app.utils.js error()):
+                # HTTP 200, the code nested inside `error`.
+                self._json({"ok": False, "error": {
+                    "type": "DuplicateSymbolsFoundError",
+                    "message": "A symbol file with the same identifier already exists",
+                    "code": 16004,
+                }})
+                return
             self._json({"code": 0, "endpoint": f"{self._base()}/put/{flow}__upload"})
         elif p.endswith("/builds/chunks/check"):
             req = json.loads(body)
@@ -89,6 +100,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         body = self._read_body()
         name = self.path.rsplit("/put/", 1)[-1]
+        STATE["puts"][STATE["flow"]] = STATE["puts"].get(STATE["flow"], 0) + 1
         with open(cappath(name + ".bin"), "wb") as f:
             f.write(body)
         self.send_response(200)
@@ -181,6 +193,26 @@ def make_fixtures(fix):
         f.write("console.log('hello');\n//# sourceMappingURL=app.js.map\n")
     with open(os.path.join(dist, "app.js.map"), "w") as f:
         json.dump({"version": 3, "sources": ["app.js"], "names": [], "mappings": "AAAA"}, f)
+
+    # A production web build: two JS chunks, each with its hidden map, plus the
+    # extracted-CSS map webpack/Vite emit beside them (which inject never stamps).
+    web = os.path.join(fix, "web")
+    os.makedirs(web, exist_ok=True)
+    for chunk in ("main", "vendor"):
+        with open(os.path.join(web, f"{chunk}.js"), "w") as f:
+            f.write(f"console.log('{chunk}');\n")
+        with open(os.path.join(web, f"{chunk}.js.map"), "w") as f:
+            json.dump({"version": 3, "sources": [f"{chunk}.ts"], "names": [], "mappings": "AAAA"}, f)
+    with open(os.path.join(web, "main.css.map"), "w") as f:
+        json.dump({"version": 3, "sources": ["main.css"], "names": [], "mappings": "AAAA"}, f)
+
+    # The same shape where inject never ran: the bundle's own map has no id.
+    uninjected = os.path.join(fix, "web-uninjected")
+    os.makedirs(uninjected, exist_ok=True)
+    with open(os.path.join(uninjected, "main.js"), "w") as f:
+        f.write("console.log('main');\n")
+    with open(os.path.join(uninjected, "main.js.map"), "w") as f:
+        json.dump({"version": 3, "sources": ["main.ts"], "names": [], "mappings": "AAAA"}, f)
     import zipfile as zf
     with zf.ZipFile(os.path.join(fix, "native-debug-symbols.zip"), "w") as z:
         z.writestr("arm64-v8a/libfoo.so", b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 256)
@@ -287,6 +319,33 @@ def main():
                        capture_output=True, text=True)
     results["sourcemaps_inject"] = (r.returncode == 0)
     print(f"  [{'PASS' if r.returncode == 0 else 'FAIL'}] sourcemaps_inject (local)")
+
+    # A SECOND production build: `vendor` is unchanged, so the server already has
+    # its map. The CSS map belongs to no bundle. Both used to abort the batch.
+    subprocess.run([binpath, "sourcemaps", "inject", os.path.join(fix, "web")],
+                   capture_output=True, text=True, check=True)
+    vendor_id = json.load(open(os.path.join(fix, "web", "vendor.js.map"))).get("debug_id")
+    main_id = json.load(open(os.path.join(fix, "web", "main.js.map"))).get("debug_id")
+    STATE["duplicate_uuids"] = {vendor_id}
+    results["sourcemaps_rebuild_with_css_and_unchanged_chunk"] = run(
+        binpath, "sourcemaps_rebuild",
+        ["debug-files", "upload", "--type", "sourcemaps", os.path.join(fix, "web")] + v)
+    STATE["duplicate_uuids"] = set()
+    try:
+        posted = [json.loads(line).get("uuid")
+                  for line in open(cappath("sourcemaps_rebuild__symbols_posts.jsonl"), "rb")]
+        results["sourcemaps_rebuild_registers_both_chunks_and_puts_only_the_changed_one"] = (
+            sorted(posted) == sorted([main_id, vendor_id])
+            and STATE["puts"].get("sourcemaps_rebuild") == 1)
+        if not results["sourcemaps_rebuild_registers_both_chunks_and_puts_only_the_changed_one"]:
+            print(f"  [warn] posted={posted!r} puts={STATE['puts'].get('sourcemaps_rebuild')!r}")
+    except Exception as e:
+        print("  [warn] could not verify the rebuild flow:", e)
+        results["sourcemaps_rebuild_registers_both_chunks_and_puts_only_the_changed_one"] = False
+    results["sourcemaps_uninjected_bundle_map_exits_11"] = run(
+        binpath, "sourcemaps_uninjected",
+        ["debug-files", "upload", "--type", "sourcemaps", os.path.join(fix, "web-uninjected")] + v,
+        expect_code=11)
 
     results["proguard"] = run(binpath, "proguard", ["debug-files", "upload", "--type", "proguard",
                                                     os.path.join(fix, "mapping.txt")] + v)
