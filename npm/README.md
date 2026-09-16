@@ -35,6 +35,7 @@ downloads the binary), which still publishes unchanged as an alias.
 | `cli/scripts/postinstall.js` | The download fallback. Must never fail an install.                                                                                          |
 | `build.mjs`                  | Assembles all seven packages from a directory of release assets.                                                                              |
 | `bootstrap-names.sh`         | One-time registry + trusted-publisher bootstrap for a NEW package name (see below).                                                          |
+| `test-bootstrap-names.sh`    | Fixture tests for that script's trust-entry check. No network or npm needed: `bash npm/test-bootstrap-names.sh`.                             |
 
 The six platform packages have no sources here: `build.mjs` mints each
 `package.json` and `README.md` from the platform table, so adding a platform is
@@ -108,7 +109,12 @@ What it does per name, and why:
 
 2. **Attaches the trusted publisher** with `npm trust github <pkg> --file
    npm-publish.yml --repo bugsee/bugsee-cli --allow-publish`, then reads it back
-   to confirm.
+   and confirms the entry actually grants **publish** for that workflow and
+   repository — not merely that an entry exists. A substring check is not
+   enough: `permissions: stage publish` contains the word "publish" while
+   granting no direct publish, and an entry for a different workflow would match
+   a bare filename match. Either would look configured and still 404 on release
+   day.
 
    `--allow-publish` requires npm >= 11.15. An OLDER npm accepts the command
    without it and creates an entry carrying no publish permission — which looks

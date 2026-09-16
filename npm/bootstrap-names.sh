@@ -56,6 +56,40 @@ else
   TRUST_NPM="npx -y npm@latest"
 fi
 
+# Does $1 already have a trusted publisher granting DIRECT PUBLISH for
+# (REPO, WORKFLOW)?
+#
+# A substring grep is not enough, and getting this wrong is invisible until
+# release day:
+#   - "permissions: stage publish" CONTAINS "publish" but grants no direct
+#     publish, so the OIDC publish would still 404.
+#   - an entry for a different workflow would match a bare filename grep.
+# So parse `npm trust list`'s blank-line-separated entries and require file,
+# repository AND an exact `publish` member of the permissions list to agree
+# within the SAME entry.
+has_publish_trust() {
+  $TRUST_NPM trust list "$1" 2>/dev/null | awk -v WORKFLOW="$WORKFLOW" -v REPO="$REPO" '
+    BEGIN { RS = ""; FS = "\n"; found = 0 }
+    {
+      file = ""; repo = ""; perms = ""
+      for (i = 1; i <= NF; i++) {
+        line = $i
+        sub(/^[ \t]+/, "", line)
+        if (line ~ /^file:[ \t]*/)        { sub(/^file:[ \t]*/, "", line);        file = line }
+        if (line ~ /^repository:[ \t]*/)  { sub(/^repository:[ \t]*/, "", line);  repo = line }
+        if (line ~ /^permissions:[ \t]*/) { sub(/^permissions:[ \t]*/, "", line); perms = line }
+      }
+      if (file != WORKFLOW || repo != REPO) next
+      n = split(perms, p, /[ \t]*,[ \t]*/)
+      for (i = 1; i <= n; i++) {
+        gsub(/^[ \t]+|[ \t]+$/, "", p[i])
+        if (p[i] == "publish") { found = 1 }
+      }
+    }
+    END { exit(found ? 0 : 1) }
+  '
+}
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -90,8 +124,8 @@ JSON
   fi
 
   # 2. Attach the trusted publisher, so npm-publish.yml's OIDC can publish it.
-  if $TRUST_NPM trust list "$pkg" 2>/dev/null | grep -q "$WORKFLOW"; then
-    echo "  trust:    already configured for $WORKFLOW"
+  if has_publish_trust "$pkg"; then
+    echo "  trust:    already grants publish for $WORKFLOW"
   else
     echo "  trust:    adding $REPO / $WORKFLOW"
     if ! $TRUST_NPM trust github "$pkg" \
@@ -101,8 +135,11 @@ JSON
     fi
     # Verify rather than trust the exit code — an entry without publish
     # permission is indistinguishable from a correct one until release day.
-    if ! $TRUST_NPM trust list "$pkg" 2>/dev/null | grep -q "$WORKFLOW"; then
-      echo "  STOPPED: trust command succeeded but no entry is listed for $pkg." >&2
+    if ! has_publish_trust "$pkg"; then
+      echo "  STOPPED: $pkg has no entry granting publish for $WORKFLOW." >&2
+      echo "  An entry created by npm < 11.15 (no --allow-publish) looks configured" >&2
+      echo "  but grants nothing; revoke it and re-run with a newer npm." >&2
+      $TRUST_NPM trust list "$pkg" 2>&1 | sed 's/^/    /' >&2
       exit 1
     fi
     echo "  trust:    configured"
