@@ -93,25 +93,21 @@ trust_state() {
   out="$($TRUST_NPM trust list "$pkg" --json 2>/dev/null)"
   status=$?
   if [ "$status" -ne 0 ] || [ -z "$out" ]; then
-    # Retry without --json: an older npm may not support it. Keep the exit
-    # status, since that is what distinguishes "no entries" from "call failed".
     out="$($TRUST_NPM trust list "$pkg" 2>/dev/null)"
     status=$?
     [ "$status" -ne 0 ] && { echo unknown; return 0; }
     printf '%s' "$out" | awk -v WORKFLOW="$WORKFLOW" -v REPO="$REPO" '
-      BEGIN { RS = ""; FS = "\n"; state = "absent" }
-      {
-        file = ""; repo = ""; perms = ""
-        for (i = 1; i <= NF; i++) {
-          line = $i
-          sub(/^[ \t]+/, "", line)
-          # Trim trailing whitespace AND a CR, so CRLF output still matches.
-          gsub(/[ \t\r]+$/, "", line)
-          if (line ~ /^file:[ \t]*/)        { sub(/^file:[ \t]*/, "", line);        file = line }
-          if (line ~ /^repository:[ \t]*/)  { sub(/^repository:[ \t]*/, "", line);  repo = line }
-          if (line ~ /^permissions:[ \t]*/) { sub(/^permissions:[ \t]*/, "", line); perms = line }
-        }
-        if (file != WORKFLOW || repo != REPO) next
+      # LINE-oriented, with an entry boundary at a REPEATED key. Do not assume
+      # npm separates entries with a blank line: if it does not, a paragraph
+      # parser merges entries and the last file:/repository:/permissions: win —
+      # which can report a granted entry for a package that grants nothing,
+      # the one wrong answer this whole function exists to prevent.
+      function norm_file(v) { sub(/^.*\//, "", v); return v }               # .github/workflows/x.yml -> x.yml
+      function norm_repo(v) {
+        sub(/^[a-z]+:\/\/[^\/]+\//, "", v); sub(/\.git$/, "", v); return v  # URL form -> owner/name
+      }
+      function evaluate(   i, n, p) {
+        if (norm_file(file) != WORKFLOW || norm_repo(repo) != REPO) return
         if (state == "absent") state = "other"
         n = split(perms, p, /[ \t]*,[ \t]*/)
         for (i = 1; i <= n; i++) {
@@ -119,44 +115,80 @@ trust_state() {
           if (p[i] == "publish") state = "granted"
         }
       }
-      END { print state }
+      function reset() { file = ""; repo = ""; perms = ""; delete seen }
+      BEGIN { state = "absent"; recognised = 0; any_content = 0; reset() }
+      {
+        line = $0
+        sub(/^[ \t]+/, "", line)
+        gsub(/[ \t\r]+$/, "", line)
+        key = ""
+        if (line ~ /^file:/)             key = "file"
+        else if (line ~ /^repository:/)  key = "repository"
+        else if (line ~ /^permissions:/) key = "permissions"
+        else if (line ~ /^type:/)        key = "type"
+        else if (line ~ /^id:/)          key = "id"
+        if (line != "") any_content = 1
+        if (key == "") next
+        recognised = 1
+        if (key in seen) { evaluate(); reset() }   # a repeat starts a new entry
+        seen[key] = 1
+        val = line
+        sub(/^[a-z]+:[ \t]*/, "", val)
+        if (key == "file") file = val
+        else if (key == "repository") repo = val
+        else if (key == "permissions") perms = val
+      }
+      END {
+        evaluate()
+        # No output at all means npm succeeded and had nothing to list: a
+        # genuinely unconfigured package, which is the NORMAL bootstrap case.
+        # Output we could not parse is different — we did not understand the
+        # format, which must not read as "no entries". The JSON path has the
+        # same guard; the text path, used by exactly the npm versions whose
+        # format is least known, must not be the one without it.
+        if (!any_content) print "absent"
+        else print (recognised ? state : "unknown")
+      }
     '
     return 0
   fi
 
-  # JSON path. Deliberately tolerant about shape: find any object anywhere in
-  # the document that names this workflow and repository, then look for an
-  # exact `publish` permission. An unrecognised shape prints `unknown` rather
-  # than a confident wrong answer.
+  # shellcheck disable=SC2016  # the node program is deliberately unexpanded;
+  # WORKFLOW and REPO reach it through argv, not interpolation.
   printf '%s' "$out" | node -e '
     let raw = "";
     process.stdin.on("data", d => raw += d).on("end", () => {
       let doc;
       try { doc = JSON.parse(raw); } catch { console.log("unknown"); return; }
+      // A scalar (npm emits bare `null` from some --json commands) tells us
+      // nothing; it must not read as a confident "not configured".
+      if (!doc || typeof doc !== "object") { console.log("unknown"); return; }
       const wf = process.argv[1], repo = process.argv[2];
-      let state = "absent", sawAny = false;
+      const normFile = v => String(v).trim().replace(/^.*\//, "");
+      const normRepo = v => String(v).trim().replace(/^[a-z]+:\/\/[^/]+\//, "").replace(/\.git$/, "");
+      let state = "absent", sawEntry = false;
       const visit = (n) => {
         if (Array.isArray(n)) return n.forEach(visit);
         if (!n || typeof n !== "object") return;
         const file = n.file ?? n.workflow ?? n.workflowFilename;
         const r = n.repository ?? n.repo;
-        if (typeof file === "string" && typeof r === "string") {
-          sawAny = true;
-          if (file.trim() === wf && r.trim() === repo) {
+        const perms = n.permissions ?? n.permission;
+        // Require a THIRD entry-ish key: one unrelated metadata object carrying
+        // file+repository must not disarm the "did we understand this?" guard.
+        const entryish = perms !== undefined || n.type !== undefined || n.id !== undefined;
+        if (typeof file === "string" && typeof r === "string" && entryish) {
+          sawEntry = true;
+          if (normFile(file) === wf && normRepo(r) === repo) {
             if (state === "absent") state = "other";
-            const perms = n.permissions ?? n.permission ?? [];
-            const list = Array.isArray(perms) ? perms : String(perms).split(",");
+            const list = Array.isArray(perms) ? perms : String(perms ?? "").split(",");
             if (list.map(x => String(x).trim()).includes("publish")) state = "granted";
           }
         }
         Object.values(n).forEach(visit);
       };
       visit(doc);
-      // An empty document is a legitimately unconfigured package; a non-empty
-      // one in which nothing looked like an entry means we did not understand
-      // it, which is not the same thing.
-      const empty = Array.isArray(doc) ? doc.length === 0 : Object.keys(doc || {}).length === 0;
-      console.log(state === "absent" && !sawAny && !empty ? "unknown" : state);
+      const empty = Array.isArray(doc) ? doc.length === 0 : Object.keys(doc).length === 0;
+      console.log(state === "absent" && !sawEntry && !empty ? "unknown" : state);
     });
   ' "$WORKFLOW" "$REPO"
 }
@@ -249,6 +281,13 @@ JSON
         exit 1
       fi
       echo "  trust:    configured"
+      ;;
+    *)
+      # trust_state's contract is "prints exactly one word". If node is missing
+      # or a pipeline died it prints nothing, and an unmatched `case` would fall
+      # through silently — reporting success with the package unconfigured.
+      echo "  STOPPED: could not classify $pkg's trust state (unexpected output)." >&2
+      exit 1
       ;;
   esac
 

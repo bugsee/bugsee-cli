@@ -107,6 +107,12 @@ What it does per name, and why:
    defaults to restricted, and a restricted package is not installable. No
    `--provenance`: that needs CI OIDC and fails locally.
 
+   It publishes to **`--tag bootstrap`**, never `latest`, so the placeholder can
+   never be what `npm install @bugsee/cli` resolves. Until the first real
+   release the package therefore has no `latest` at all, which is correct — there
+   is nothing installable yet. The step-4 cleanup below should also
+   `npm dist-tag rm <pkg> bootstrap`.
+
 2. **Attaches the trusted publisher** with `npm trust github <pkg> --file
    npm-publish.yml --repo bugsee/bugsee-cli --allow-publish`, then reads it back
    and confirms the entry actually grants **publish** for that workflow and
