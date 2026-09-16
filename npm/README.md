@@ -11,11 +11,11 @@ Sources for the **seven** npm packages published by
  ├─ @bugsee/cli-linux-x64       x86_64-unknown-linux-gnu
  ├─ @bugsee/cli-win32-x64       x86_64-pc-windows-msvc
  └─ @bugsee/cli-win32-arm64     aarch64-pc-windows-msvc
+```
 
 Windows arm64 joined the set in 0.7.7 (bugsee/bugsee-cli#20): that leg builds
 natively on a `windows-11-arm` runner rather than cross-compiling, because
 `ring` cannot assemble its ARM64 Windows asm under cargo-xwin.
-```
 
 All seven are published at the crate version, and the front package pins its
 six `optionalDependencies` to that exact version — never a range. npm resolves

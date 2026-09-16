@@ -50,7 +50,7 @@ builds the tokio runtime, and dispatches.
 - `src/cli/` — one module per command, each owning its clap arg struct + logic:
   `debug_files` (upload/convert), `sourcemaps` (inject), `upload`
   (build/build-info), `pack`, `vcs_metadata`, `ios_deps`, `build_env`, `dsym`,
-  `xcode` (post-action). `mod.rs` defines the top-level `Cli`/`Command` and
+  `xcode` (post-action, upload-dsyms). `mod.rs` defines the top-level `Cli`/`Command` and
   `dispatch`. The Xcode post-action's helpers live alongside: `xcactivitylog`
   (build-timings decode), `xcode_ipa` (`.app`→`.ipa` packaging + Mach-O UUID),
   `size_check` (in-build size gate).
@@ -67,7 +67,8 @@ builds the tokio runtime, and dispatches.
   produce unusable symbols.
 - `src/compress/` — the ZIP + zstd packer (the wire format).
 - `src/inject/` — source-map debug-id injection.
-- `src/daemon.rs` — the Unix double-fork for `xcode post-action`'s background mode.
+- `src/daemon.rs` — the Unix double-fork for `xcode post-action`'s background
+  mode, and for `xcode upload-dsyms` in no-fail mode.
 - `src/error.rs` / `src/exit_code.rs` — the typed error → stable exit-code mapping.
 
 ## Conventions & contracts
@@ -164,19 +165,56 @@ for the same binary: `publish` takes the cargo-dist-generated
 `bugsee-cli-npm-package.tar.gz` release asset straight to `@bugsee/bugsee-cli`
 (a single package whose postinstall downloads the binary), while
 `publish-optional-deps` runs `npm/build.mjs` over the release's binary archives
-to assemble and publish `@bugsee/cli` plus its five `@bugsee/cli-<platform>`
+to assemble and publish `@bugsee/cli` plus its six `@bugsee/cli-<platform>`
 packages (per-`os`/`cpu` `optionalDependencies`, so nothing downloads at install
-time). Six packages, platform packages FIRST — npm skips an unresolvable
+time). Seven packages, platform packages FIRST — npm skips an unresolvable
 optional dependency silently, so the front package must never be live ahead of
-them. See `npm/README.md`. Each package needs its own Trusted Publisher entry on
-npmjs.com pointing at `npm-publish.yml` — and that entry lives on a PACKAGE's
-settings page, so it cannot be added for a name that has never been published.
-A new name therefore needs one manual token-auth publish first; the runbook is
-`npm/README.md` ("First-publish bootstrap"). Skipping it fails only at publish
+them. See `npm/README.md`. Each package needs its own Trusted Publisher entry
+pointing at `npm-publish.yml`, written with `npm trust github <pkg> --file
+npm-publish.yml --repo bugsee/bugsee-cli --allow-publish` (npm >= 11.15;
+`--allow-publish` does not exist before that, and an entry created without it
+grants nothing while looking configured). npm keys the entry on a PACKAGE, so it
+cannot be added for a name that has never been published: a new name needs one
+manual placeholder publish first, which requires an interactive 2FA browser
+challenge — NOT a token, and never `--otp` in a loop, which trips npm's
+per-account OTP rate limiter. Both steps are scripted in
+`npm/bootstrap-names.sh`; the runbook is `npm/README.md`
+("First-publish bootstrap"). Skipping it fails only at publish
 time, with a 404 on the `PUT` that reads as though the package does not exist
 rather than as a missing trust configuration. The publish loop is written to be
 resumable for exactly that reason — npm versions are immutable, so a partial
 first run would otherwise wedge the version permanently.
+
+
+## The `xcode upload-dsyms` command
+
+`bugsee-cli xcode upload-dsyms` uploads dSYMs from a Run Script BUILD PHASE with
+none of the `BUGSEE_BUILD_INFO_*` gating — it neither registers a build nor
+uploads build-info, so it is safe on every build. That is the shape a React
+Native / Flutter config plugin can generate (`withXcodeProject` edits
+`project.pbxproj`), as opposed to the scheme post-action, which means editing
+`.xcscheme` XML.
+
+Its failure policy is deliberately ASYMMETRIC and is the reason the command
+exists: "nothing to upload" (no dSYM folder, or a folder with no `.dSYM`
+bundles) exits 0, while anything genuinely broken FAILS THE BUILD — a missing or
+empty token (20), a rejected one (21), a server or network error (30/31), an
+unreadable folder or bundle (10/11). A build phase that swallows errors means
+symbolication silently stops working and nobody notices until a crash report is
+unreadable.
+
+`--no-fail` / `BUGSEE_DSYM_UPLOAD_NO_FAIL` opts out of all of it, and on unix
+ALSO detaches the upload — having accepted that failures go unseen, nothing is
+left for the build to wait on. That makes it the second daemonizing path, so the
+fork-before-runtime invariant above applies to it too: `should_daemonize`
+resolves the flag AND the env var to one answer before the runtime is built.
+Strict mode must stay foreground, because a detached daemon's exit code reaches
+nobody.
+
+`find_app`'s build-dir fallback is opt-in for this command only: from a build
+phase during `xcodebuild archive` the archive directory exists but
+`Products/Applications` is not populated yet, whereas post-action in that state
+must keep skipping rather than adopt the unsigned ArchiveIntermediates `.app`.
 
 `workflow_run` is the trigger because GitHub suppresses `release:`/`push:`
 chains for activity initiated by the default `GITHUB_TOKEN`, which is what dist

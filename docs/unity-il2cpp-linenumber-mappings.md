@@ -112,12 +112,14 @@ Requires:
 
 - **Bugsnag:** CLI `unity-android` / `unity-ios`; uploads `LineNumberMappings.json`
   with native symbols; fail unless `--no-upload-il2cpp-mapping`.
-- **Sentry:** Capture-time addresses + server apply via `symbolic-il2cpp`; upload
-  with debug files.
-- **Firebase:** NDK / symbols.zip focus; less public LineNumberMappings emphasis.
+- **Sentry:** Capture-time `il2cpp_native_stack_trace` IPs + server apply via
+  `symbolic-il2cpp`; upload with debug files. `CaptureException(e)` required for
+  Release Method-only file/line; Unity 6 MethodFileLineNumber is an alternate path.
+- **Firebase:** NDK / symbols.zip focus; managed lines lean on Unity stack settings.
+- **Backtrace:** Prefer real `Exception` object; symbols.zip; WebGL no C# lines.
 
 Bugsee matches Bugsnag for thin CLI orchestration and Sentry for the primary
-address→map apply model.
+address→map apply model (managed Mode B via `Il2CppNativeStack` + worker LNM).
 
 ---
 
