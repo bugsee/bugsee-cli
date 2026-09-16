@@ -6,6 +6,66 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.6] - 2026-09-16
+
+Packaging and CI release. **No functional changes to the binary** — the CLI
+surface, exit codes, stdout JSON shapes, and upload wire format are identical to
+0.7.5, so no integrator needs to move its version floor.
+
+### Added
+- **A second npm channel, `@bugsee/cli`**, whose binary ships in five
+  `os`/`cpu`-tagged packages (`@bugsee/cli-darwin-arm64`, `-darwin-x64`,
+  `-linux-arm64`, `-linux-x64`, `-win32-x64`) declared as
+  `optionalDependencies` and pinned to the exact crate version. npm resolves one
+  of them, so an install downloads a single binary and **nothing runs at install
+  time** — it works under `--ignore-scripts`, unlike the download-on-postinstall
+  approach. A `postinstall` fallback still downloads from the GitHub release if
+  no platform package resolved, and never fails the install. There is no Windows
+  arm64 package: see [#20].
+- `@bugsee/bugsee-cli` is **unchanged** and keeps publishing as a working alias.
+
+### Changed
+- `npm-publish.yml` gained a second, independent `publish-optional-deps` job for
+  the family. It publishes platform packages **before** the front package (npm
+  skips an unresolvable optional dependency silently, so the reverse order would
+  ship a front package with no binary), is resumable across a partial failure
+  (npm versions are immutable), and routes prereleases to the `next` dist-tag
+  rather than moving `latest`.
+- The S3 mirror now chains off the Release workflow automatically instead of
+  requiring a manual dispatch — v0.7.4 was released and never mirrored, so the
+  CDN served 0.7.3 for six weeks and `bugsee-cli update` never offered it.
+- Release artifacts and the cargo-dist cache now expire after 1 day.
+
+### Fixed
+- Corrected the README, which described `@bugsee/cli` with per-OS optional
+  dependencies as the existing npm channel. It was not — both the name and the
+  mechanism were wrong.
+- Corrected the `Cargo.toml` and `CLAUDE.md` guidance that said to run `dist
+  generate` after a dist-config change. `allow-dirty = ["ci"]` disables dist's
+  writer as well as its check, so `dist generate` and `dist generate --check`
+  are silent no-ops for `release.yml`; verify with `dist plan
+  --output-format=json` instead.
+
+### Security
+- **`rustls` 0.23.40 -> 0.23.45** (with `rustls-webpki` 0.103.13 -> 0.103.15) —
+  [RUSTSEC-2026-0285], TLS 1.3 handshake messages incorrectly accepted across
+  encryption level boundaries (medium, 5.3). Reachable: every upload goes through
+  `reqwest`/`hyper-rustls`, which is the crate's only TLS stack.
+- For the record, `h2` [RUSTSEC-2026-0258] does **not** apply to the shipped
+  binary. `h2` is a dev-only dependency pulled in by `wiremock`; `reqwest` is
+  configured without `http2`, and `cargo tree -i h2 -e normal` resolves to
+  nothing.
+
+### Dependencies
+- **`plist` 1.10.0 -> 1.10.1** — no advisory, but it fixes a panic on
+  out-of-range dates in binary plists, which is reachable through
+  `build-env read-plist`. Pulls `quick-xml` 0.41.0 -> 0.42.0 and `base64`
+  0.23.1.
+- **`flate2` 1.1.9 -> 1.1.10** (`miniz_oxide` 0.8.9 -> 0.9.1) and **`uuid`
+  1.24.1 -> 1.26.0** — routine maintenance, no advisories.
+- MSRV 1.88 re-verified against the updated lockfile with
+  `cargo +1.88 check --all-targets`.
+
 ## [0.7.5] - 2026-08-24
 
 Dependency and security maintenance. **No functional changes** — the CLI
@@ -295,6 +355,7 @@ retry/chunking stacks.
   (`debug-files upload --type dsym`), dSYM UUID/slice inspection (`dsym`), and
   the canonical CI resolvers (`vcs-metadata`, `ios-deps`, `build-env`).
 
+[0.7.6]: https://github.com/bugsee/bugsee-cli/compare/v0.7.5...v0.7.6
 [0.7.5]: https://github.com/bugsee/bugsee-cli/compare/v0.7.4...v0.7.5
 [0.7.4]: https://github.com/bugsee/bugsee-cli/compare/v0.7.3...v0.7.4
 [0.7.3]: https://github.com/bugsee/bugsee-cli/compare/v0.7.2...v0.7.3
@@ -308,3 +369,6 @@ retry/chunking stacks.
 [0.2.0]: https://github.com/bugsee/bugsee-cli/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/bugsee/bugsee-cli/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/bugsee/bugsee-cli/releases/tag/v0.1.0
+[RUSTSEC-2026-0285]: https://rustsec.org/advisories/RUSTSEC-2026-0285
+[RUSTSEC-2026-0258]: https://rustsec.org/advisories/RUSTSEC-2026-0258
+[#20]: https://github.com/bugsee/bugsee-cli/issues/20
