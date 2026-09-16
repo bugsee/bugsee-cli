@@ -27,7 +27,9 @@ FIXTURE_STATUS=0
 # "json"  -> --json answers, text is never reached
 # "both"  -> --json answers with $FIXTURE, exactly like a modern npm
 FIXTURE_MODE="text"
-# shellcheck disable=SC2329
+# fake_npm is reached only through $TRUST_NPM, which shellcheck cannot see.
+# SC2329 and SC2317 are the same finding in different shellcheck generations.
+# shellcheck disable=SC2329,SC2317
 fake_npm() {
   local json=0
   for a in "$@"; do [ "$a" = "--json" ] && json=1; done

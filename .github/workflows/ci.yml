@@ -111,7 +111,12 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - name: shellcheck
-        run: shellcheck npm/bootstrap-names.sh npm/test-bootstrap-names.sh
+        # Print the version: the codes for "this function is never invoked"
+        # differ between shellcheck generations (SC2317 before 0.10, SC2329
+        # after), so a failure here is much easier to read with it in the log.
+        run: |
+          shellcheck --version
+          shellcheck npm/bootstrap-names.sh npm/test-bootstrap-names.sh
       - name: trust_state fixtures
         run: bash npm/test-bootstrap-names.sh
 
