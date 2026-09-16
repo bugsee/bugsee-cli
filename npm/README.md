@@ -34,6 +34,7 @@ downloads the binary), which still publishes unchanged as an alias.
 | `cli/bin/bugsee-cli.js`      | The `bin` launcher. Forwards argv/stdio/exit code.                                                                                          |
 | `cli/scripts/postinstall.js` | The download fallback. Must never fail an install.                                                                                          |
 | `build.mjs`                  | Assembles all seven packages from a directory of release assets.                                                                              |
+| `bootstrap-names.sh`         | One-time registry + trusted-publisher bootstrap for a NEW package name (see below).                                                          |
 
 The six platform packages have no sources here: `build.mjs` mints each
 `package.json` and `README.md` from the platform table, so adding a platform is
@@ -85,54 +86,36 @@ for n in cli cli-darwin-arm64 cli-darwin-x64 cli-linux-arm64 \
 done
 ```
 
-Per NEW name, once, by a human with publish rights on the `@bugsee` scope:
+Both steps are scripted. Run it in a real terminal — npm requires an
+interactive 2FA challenge to publish and to write trust configuration, and it
+completes that in the browser:
 
-1. **Publish a `0.0.0` placeholder**, from a scratch directory — not from
-   `npm/dist`, which carries real content.
+```sh
+bash npm/bootstrap-names.sh cli-win32-arm64   # just the new name(s)
+bash npm/bootstrap-names.sh                   # or the whole family
+```
 
-   ```sh
-   npm login
-   tmp="$(mktemp -d)"
-   for n in cli-win32-arm64; do           # <- only the names that 404 above
-     mkdir -p "$tmp/$n"
-     cat > "$tmp/$n/package.json" <<JSON
-   { "name": "@bugsee/$n", "version": "0.0.0",
-     "description": "Placeholder — see https://github.com/bugsee/bugsee-cli",
-     "repository": { "type": "git",
-       "url": "git+https://github.com/bugsee/bugsee-cli.git" },
-     "license": "MIT" }
-   JSON
-     npm publish "$tmp/$n" --access public
-   done
-   ```
+It is idempotent and fail-fast: an already-published name is left alone, an
+existing trust entry is left alone, and the first error stops the run rather
+than hammering a rate-limited npm with the remaining names. It ends by printing
+each package's trust configuration so you can see what landed.
 
-   `--access public` is required: a scoped package defaults to restricted, and a
-   restricted package is not installable. Do **not** pass `--provenance` — it
-   needs CI OIDC and fails locally.
+What it does per name, and why:
 
-   **Run this in a real terminal.** npm requires an interactive 2FA challenge to
-   publish; it prints a URL and completes via the browser, and that session then
-   covers the rest of the run. Do NOT pass `--otp` in a loop: a wrong or
-   repeated TOTP trips npm's per-account OTP rate limiter (`429 ... rate limited
-   otp`), which then blocks publishing for everyone on the account for a while.
-   A granular token is not a way around this — npm is removing direct publish
-   for tokens entirely in January 2027.
+1. **Publishes a `0.0.0` placeholder** with `--access public` — a scoped package
+   defaults to restricted, and a restricted package is not installable. No
+   `--provenance`: that needs CI OIDC and fails locally.
 
-2. **Add the Trusted Publisher.** This is a CLI operation:
+2. **Attaches the trusted publisher** with `npm trust github <pkg> --file
+   npm-publish.yml --repo bugsee/bugsee-cli --allow-publish`, then reads it back
+   to confirm.
 
-   ```sh
-   npm trust github "@bugsee/cli-win32-arm64" \
-     --file npm-publish.yml --repo bugsee/bugsee-cli --allow-publish --yes
-   npm trust list "@bugsee/cli-win32-arm64"    # verify before relying on it
-   ```
+   `--allow-publish` requires npm >= 11.15. An OLDER npm accepts the command
+   without it and creates an entry carrying no publish permission — which looks
+   configured and still 404s on release day. The script detects that and routes
+   the trust calls through `npx -y npm@latest`.
 
-   `--allow-publish` is **required** and only exists in npm >= 11.15; an older
-   npm creates an entry with no publish permission, which looks configured and
-   still fails at release time. If the local npm is older, run it through
-   `npx -y npm@latest`. No environment is configured, because the job uses none.
-
-   (The npmjs.com web UI at `npmjs.com/package/<name>/access` does the same
-   thing, if you prefer it.)
+   (`npmjs.com/package/<name>/access` does the same thing through the web UI.)
 
 3. **Release normally.** `npm-publish.yml` publishes the real versions over the
    placeholders.
@@ -141,6 +124,11 @@ Per NEW name, once, by a human with publish rights on the `@bugsee` scope:
    @bugsee/<name>@0.0.0`, within 72 hours. Never unpublish the _last_ remaining
    version — that deletes the package and with it the trusted-publisher
    configuration, putting you back at step 1.
+
+Do **not** drive `npm publish` with `--otp` in a loop. A wrong or reused TOTP
+trips npm's per-account OTP rate limiter (`429 ... rate limited otp`), which then
+blocks publishing across the whole account for a while. A granular token is not
+a way around it either: npm removes direct publish for tokens in January 2027.
 
 `@bugsee/bugsee-cli` and the six names published in 0.7.6 are already
 bootstrapped and need none of this.
