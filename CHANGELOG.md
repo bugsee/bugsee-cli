@@ -14,10 +14,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (`withXcodeProject`) rather than a scheme post-action. Closes [#19].
 
   A genuine failure **fails the build** by design — a missing or rejected token
-  (`20`/`21`), an unreadable bundle (`10`/`11`), a server or network error
-  (`30`/`31`) — because a build phase that swallows errors means symbolication
-  silently stops working. "Nothing to upload" (no dSYM folder, or no `.dSYM`
-  bundles in it) is a success, not a failure. `--no-fail` /
+  (`20`/`21`), a server or network error (`30`/`31`), or bundles that were found
+  but could not be read (`11`) — because a build phase that swallows errors
+  means symbolication silently stops working. "Nothing to upload" (no dSYM
+  folder, or no `.dSYM` bundles in it) is a success, not a failure; "found
+  bundles, uploaded none" is not. `--no-fail` /
   `BUGSEE_DSYM_UPLOAD_NO_FAIL` opts out of all of it and, on unix, detaches the
   upload so the build never waits on it.
 

@@ -291,7 +291,8 @@ pub async fn dispatch(
                 return run_dsym_upload(
                     &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
                 )
-                .await;
+                .await
+                .map(|_| ());
             }
 
             if kind == DebugFileType::Pdb {
@@ -1476,7 +1477,7 @@ pub(crate) async fn run_dsym_upload(
     strategy: Strategy,
     force: bool,
     dry_run: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DsymUploadSummary> {
     let candidates = discover_dsyms(paths);
     if candidates.is_empty() {
         return Err(input_not_found(format!(
@@ -1587,7 +1588,25 @@ pub(crate) async fn run_dsym_upload(
     } else {
         tracing::info!(uploaded, already_existed, skipped, "upload complete");
     }
-    Ok(())
+    Ok(DsymUploadSummary {
+        uploaded,
+        already_existed,
+        skipped,
+    })
+}
+
+/// What [`run_dsym_upload`] actually did.
+///
+/// Returned rather than only logged because "found bundles, uploaded none"
+/// is indistinguishable from success at the call site otherwise — a bundle
+/// `dsym::identify` cannot parse is skipped and the call still returns `Ok`.
+/// `xcode upload-dsyms` turns that into a build failure; see its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DsymUploadSummary {
+    pub uploaded: u32,
+    pub already_existed: u32,
+    /// Bundles found but not uploaded because they could not be read.
+    pub skipped: u32,
 }
 
 #[cfg(test)]

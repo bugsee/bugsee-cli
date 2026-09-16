@@ -86,9 +86,19 @@ jobs:
           if ($errors) { $errors | ForEach-Object { $_.Message }; exit 1 }
           Write-Host "install.ps1 parses clean"
 
+  # Runs on macOS as well as Linux. Some tests need the Apple toolchain to say
+  # anything: `xcode upload-dsyms`'s upload coverage builds a real `.dSYM` with
+  # clang + dsymutil, because a fabricated bundle is rejected by
+  # `dsym::identify` and skipped before any network call — on Linux those tests
+  # skip themselves, so an ubuntu-only matrix would leave the command's actual
+  # job unverified in CI.
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

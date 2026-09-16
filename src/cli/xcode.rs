@@ -49,7 +49,7 @@ use crate::cli::{
     build_env, debug_files, ios_deps, size_check, vcs_metadata, xcactivitylog, xcode_ipa,
 };
 use crate::compress::Strategy;
-use crate::error::{config_invalid, Error};
+use crate::error::{config_invalid, input_invalid, Error};
 use crate::upload::build;
 use crate::upload::http::RetryPolicy;
 
@@ -561,7 +561,16 @@ pub(crate) fn should_run(env: &HashMap<String, String>) -> Gate {
 pub(crate) fn find_app(env: &HashMap<String, String>) -> Option<PathBuf> {
     let archive_path = trimmed(env, "ARCHIVE_PATH");
     if !archive_path.is_empty() && Path::new(archive_path).is_dir() {
-        return find_app_in_archive(Path::new(archive_path));
+        // Fall THROUGH on a miss rather than returning None. From a post-action
+        // the archive is complete and this always hits; from a Run Script build
+        // phase during `xcodebuild archive` the directory exists but
+        // `Products/Applications` is not populated yet, because the archive is
+        // assembled after the phases run. Giving up there would register dSYMs
+        // with empty version/build in exactly the case `upload-dsyms` exists
+        // for.
+        if let Some(app) = find_app_in_archive(Path::new(archive_path)) {
+            return Some(app);
+        }
     }
     find_app_in_build_dir(env)
 }
@@ -1255,8 +1264,16 @@ async fn upload_dsyms(
     )
     .await
     {
-        Ok(()) => {
-            tracing::info!("Bugsee: dSYM upload complete");
+        // post-action is deliberately soft: it must never fail an
+        // already-signed build, so even "found bundles, read none" only warns
+        // here. `upload-dsyms` makes the opposite call for the same summary.
+        Ok(summary) => {
+            tracing::info!(
+                uploaded = summary.uploaded,
+                already_existed = summary.already_existed,
+                skipped = summary.skipped,
+                "Bugsee: dSYM upload complete"
+            );
             true
         }
         Err(e) => {
@@ -1372,7 +1389,7 @@ async fn upload_dsyms_strict(
         .and_then(|b| b.build.as_deref())
         .unwrap_or("");
 
-    debug_files::run_dsym_upload(
+    let summary = debug_files::run_dsym_upload(
         std::slice::from_ref(&folder),
         endpoint,
         app_token,
@@ -1383,7 +1400,30 @@ async fn upload_dsyms_strict(
         /* dry_run */ false,
     )
     .await?;
-    tracing::info!("Bugsee: dSYM upload complete");
+
+    // `run_dsym_upload` skips a bundle `dsym::identify` cannot parse and still
+    // returns Ok. Bundles were discovered, so "uploaded nothing" here means the
+    // symbols did NOT reach Bugsee — the precise silent failure this command
+    // exists to prevent. Triggers: a truncated or partially-written dSYM, an
+    // empty Contents/Resources/DWARF, or DWARF unreadable under
+    // ENABLE_USER_SCRIPT_SANDBOXING.
+    if summary.uploaded == 0 && summary.already_existed == 0 && summary.skipped > 0 {
+        return Err(input_invalid(format!(
+            "found {} dSYM bundle(s) under {} but could not read any of them — \
+             no symbols were uploaded (a truncated dSYM, an empty \
+             Contents/Resources/DWARF, or DWARF unreadable under \
+             ENABLE_USER_SCRIPT_SANDBOXING)",
+            summary.skipped,
+            folder.display(),
+        )));
+    }
+
+    tracing::info!(
+        uploaded = summary.uploaded,
+        already_existed = summary.already_existed,
+        skipped = summary.skipped,
+        "Bugsee: dSYM upload complete"
+    );
     Ok(())
 }
 
@@ -1542,6 +1582,55 @@ mod tests {
         let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
         let r = run_upload_dsyms(&env, "https://example.invalid", None, true).await;
         assert!(r.is_ok(), "--no-fail must never fail the build, got {r:?}");
+    }
+
+    /// Bundles were found and NONE of them could be read, so nothing reached
+    /// Bugsee. That is the exact silent-symbolication-loss this command exists
+    /// to prevent, and it must not exit 0.
+    ///
+    /// Real triggers: a truncated or partially-written dSYM, an empty
+    /// `Contents/Resources/DWARF`, or the DWARF file being unreadable under
+    /// ENABLE_USER_SCRIPT_SANDBOXING.
+    #[tokio::test]
+    async fn unreadable_bundles_fail_the_build_rather_than_reporting_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App"); // discoverable, but not a Mach-O
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+
+        // A token is present, so this is past every "nothing to do" branch:
+        // the only reason nothing uploaded is that the bundle is unreadable.
+        let err = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN"))
+            .await
+            .expect_err("unreadable bundles must not report success");
+        assert_eq!(exit_code_of(&err), crate::exit_code::ExitCode::InputInvalid);
+    }
+
+    /// A Run Script build phase during `xcodebuild archive` sees ARCHIVE_PATH
+    /// set while `Products/Applications` is not populated yet — the archive is
+    /// assembled after the phases run. `find_app` must not give up there, or
+    /// dSYMs register with empty version/build in the command's primary use
+    /// case.
+    #[test]
+    fn find_app_falls_back_to_the_build_dir_when_the_archive_is_not_populated() {
+        let tmp = tempfile::tempdir().unwrap();
+        // An ARCHIVE_PATH that exists but has no Products/Applications yet.
+        let archive = tmp.path().join("App.xcarchive");
+        std::fs::create_dir_all(&archive).unwrap();
+        // ...while the build dir already holds the .app.
+        let build_dir = tmp.path().join("Build/Products/Release-iphoneos");
+        let app = build_dir.join("App.app");
+        std::fs::create_dir_all(&app).unwrap();
+
+        let env = env_of(&[
+            ("ARCHIVE_PATH", archive.to_str().unwrap()),
+            ("TARGET_BUILD_DIR", build_dir.to_str().unwrap()),
+            ("WRAPPER_NAME", "App.app"),
+        ]);
+        assert_eq!(
+            find_app(&env).as_deref(),
+            Some(app.as_path()),
+            "an unpopulated archive must fall through to TARGET_BUILD_DIR"
+        );
     }
 
     /// Build a REAL `.dSYM` (clang + dsymutil) in `dir`, or `None` when the
