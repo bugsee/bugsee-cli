@@ -23,17 +23,21 @@ FIXTURE_STATUS=0
 # Stands in for `$TRUST_NPM trust list <pkg> [--json]`. Returns the fixture for
 # the shape being tested and ignores the other, so a test can exercise the JSON
 # path or the text fallback independently.
+# "text"  -> an npm with no --json support (the --json call fails)
+# "json"  -> --json answers, text is never reached
+# "both"  -> --json answers with $FIXTURE, exactly like a modern npm
 FIXTURE_MODE="text"
-# shellcheck disable=SC2329
+# fake_npm is reached only through $TRUST_NPM, which shellcheck cannot see.
+# SC2329 and SC2317 are the same finding in different shellcheck generations.
+# shellcheck disable=SC2329,SC2317
 fake_npm() {
   local json=0
   for a in "$@"; do [ "$a" = "--json" ] && json=1; done
-  if { [ "$json" = 1 ] && [ "$FIXTURE_MODE" = "json" ]; } ||
-     { [ "$json" = 0 ] && [ "$FIXTURE_MODE" = "text" ]; }; then
-    printf '%s' "$FIXTURE"
-    return "$FIXTURE_STATUS"
-  fi
-  # Wrong shape for this fixture: behave like an npm that does not support it.
+  case "$FIXTURE_MODE" in
+    both) printf '%s' "$FIXTURE"; return "$FIXTURE_STATUS" ;;
+    json) [ "$json" = 1 ] && { printf '%s' "$FIXTURE"; return "$FIXTURE_STATUS"; }; return 1 ;;
+    text) [ "$json" = 0 ] && { printf '%s' "$FIXTURE"; return "$FIXTURE_STATUS"; }; return 1 ;;
+  esac
   return 1
 }
 # shellcheck disable=SC2034
@@ -135,6 +139,51 @@ t "JSON: another workflow is 'absent'" absent json 0 '[{"file":"release.yml","re
 t "JSON: nested under a key still found" granted json 0 '{"trustedPublishers":[{"file":"npm-publish.yml","repository":"bugsee/bugsee-cli","permissions":["publish"]}]}'
 # A shape we do not recognise must not be reported as a confident 'absent'.
 t "JSON: unrecognised shape is 'unknown'" unknown json 0 '{"somethingElse":{"a":1}}'
+
+# ---- entries that are NOT blank-line separated ---------------------------
+# A paragraph parser merges these and the LAST file:/repository:/permissions:
+# win, reporting `granted` for a package whose own entry grants nothing — the
+# one wrong answer this function exists to prevent.
+t "merged entries do not leak permissions across" other text 0 'file: release.yml
+repository: bugsee/bugsee-cli
+permissions: publish
+type: github
+file: npm-publish.yml
+repository: bugsee/bugsee-cli'
+
+t "ours second and granted, no blank line" granted text 0 'type: github
+file: release.yml
+repository: bugsee/bugsee-cli
+permissions: stage publish
+type: github
+file: npm-publish.yml
+repository: bugsee/bugsee-cli
+permissions: publish'
+
+# ---- output we do not understand ----------------------------------------
+# Distinct from "no entries": the text path is used by exactly the npm versions
+# whose format is least known, so it must not guess.
+t "prose instead of fields is 'unknown'" unknown text 0 'No trusted publishers configured.'
+t "different field labels are 'unknown'" unknown text 0 'workflow: npm-publish.yml
+repo: bugsee/bugsee-cli
+grants: publish'
+
+# ...but genuinely empty output IS "no entries", which is the normal state of a
+# freshly published placeholder. Getting this wrong would make bootstrapping a
+# new name impossible.
+t "empty text output is 'absent'" absent text 0 ''
+
+# ---- rendering differences ----------------------------------------------
+t "a path-qualified workflow still matches" granted text 0 'type: github
+file: .github/workflows/npm-publish.yml
+repository: https://github.com/bugsee/bugsee-cli.git
+permissions: publish'
+
+# ---- the JSON path, harder cases ----------------------------------------
+t "JSON: a bare null is 'unknown', not 'absent'" unknown both 0 'null'
+t "JSON: unrelated metadata does not disarm the guard" unknown both 0 '{"meta":{"file":"x","repository":"y"},"weird":{"a":1}}'
+t "JSON: npm supporting --json with no entries is 'absent'" absent both 0 '[]'
+t "JSON: a non-zero --json call falls back, not 'absent'" unknown json 1 '[]'
 
 if [ "$fails" -eq 0 ]; then
   echo "all trust_state cases pass"
