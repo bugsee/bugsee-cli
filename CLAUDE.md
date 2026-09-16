@@ -68,7 +68,7 @@ builds the tokio runtime, and dispatches.
 - `src/compress/` — the ZIP + zstd packer (the wire format).
 - `src/inject/` — source-map debug-id injection.
 - `src/daemon.rs` — the Unix double-fork for `xcode post-action`'s background
-  mode, and for `xcode upload-dsyms` in no-fail mode.
+  mode, and for `xcode upload-dsyms` in background mode.
 - `src/error.rs` / `src/exit_code.rs` — the typed error → stable exit-code mapping.
 
 ## Conventions & contracts
@@ -203,13 +203,27 @@ unreadable folder or bundle (10/11). A build phase that swallows errors means
 symbolication silently stops working and nobody notices until a crash report is
 unreadable.
 
-`--no-fail` / `BUGSEE_DSYM_UPLOAD_NO_FAIL` opts out of all of it, and on unix
-ALSO detaches the upload — having accepted that failures go unseen, nothing is
-left for the build to wait on. That makes it the second daemonizing path, so the
-fork-before-runtime invariant above applies to it too: `should_daemonize`
-resolves the flag AND the env var to one answer before the runtime is built.
-Strict mode must stay foreground, because a detached daemon's exit code reaches
-nobody.
+Failing the build and detaching are INDEPENDENT, each with an `--x` / `--no-x`
+pair and an env var (`BUGSEE_DSYM_UPLOAD_NO_FAIL`,
+`BUGSEE_DSYM_UPLOAD_BACKGROUND`); a flag beats its env var. `--no-fail` still
+selects detaching by DEFAULT, because an unset background choice derives from
+the failure policy — but `--no-background` turns it off, which is the
+combination CI wants: never break the build, yet still wait, so a runner tearing
+down its process tree cannot kill the upload mid-flight.
+
+Strict-and-detached is REFUSED, not honoured: a detached daemon's exit code
+reaches nobody, so failing the build would silently do nothing (exit 2 from
+clap when both flags are given, exit 20 when it arrives through the
+environment, where clap cannot see it).
+
+This is the second daemonizing path, so the fork-before-runtime invariant above
+applies here too. Both decisions come from ONE function,
+`resolve_upload_dsyms_mode`, because `should_daemonize` resolves them in `main`
+before the runtime exists while `dispatch` resolves them after — and when those
+two diverged, the CI case worked through flags and silently detached through env
+vars. `should_daemonize` must therefore copy EVERY variable the resolver reads;
+copying a subset is worse than copying none, since the resolver cannot tell its
+input was truncated.
 
 `find_app`'s build-dir fallback is opt-in for this command only: from a build
 phase during `xcodebuild archive` the archive directory exists but

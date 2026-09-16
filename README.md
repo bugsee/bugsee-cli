@@ -200,23 +200,36 @@ report is unreadable:
 | --- | --- | --- |
 | Uploaded, or nothing to upload | `0` | continues |
 | A bundle could not be read or packed | `10` / `11` | **fails** |
-| Missing / rejected app token | `20` / `21` | **fails** |
+| Missing / rejected app token, or a refused flag combination from the environment | `20` / `21` | **fails** |
 | Server error / network failure | `30` / `31` | **fails** |
 
 "Nothing to upload" — no dSYM folder, or a folder with no `.dSYM` bundles — is a
 success, not a failure: a target that produces no debug symbols is a normal
 state. Only real problems fail the build.
 
-`--no-fail` (or `BUGSEE_DSYM_UPLOAD_NO_FAIL=1`) opts out of all of it. Either
-one *enables* no-fail; there is no flag that turns it back off, so a job
-exporting the variable globally cannot opt a single invocation back into strict
-mode.
+Whether a failure breaks the build and whether the upload detaches are
+**independent**, each with an on/off pair (`--fail` / `--no-fail`,
+`--background` / `--no-background`) and a matching env var
+(`BUGSEE_DSYM_UPLOAD_NO_FAIL`, `BUGSEE_DSYM_UPLOAD_BACKGROUND`). A flag
+overrides its env var, so a job exporting one globally can still opt a single
+invocation back.
 
-Because no-fail accepts in advance that failures go unseen, on unix it also runs
-the upload in the **background**, which means its warnings go to
-`$PROJECT_TEMP_DIR/bugsee-cli.log` rather than the Xcode build log. If you want
-them visible, do not use no-fail mode. (On Windows there is no fork, so it stays
-synchronous.)
+| | fails the build | waits for the upload |
+| --- | --- | --- |
+| *(default)* | yes | yes |
+| `--no-fail` | no | no — detaches |
+| `--no-fail --no-background` | no | **yes** |
+| `--fail --background` | *refused* — exit `2` (flags) or `20` (env) | — |
+
+`--no-fail --no-background` is usually what CI wants: never break the build, but
+still wait, so a runner tearing down its process tree the moment `xcodebuild`
+returns cannot kill the upload mid-flight.
+
+`--fail --background` is refused rather than honoured, because a detached
+process's exit code reaches nobody — "fail the build" would silently do nothing.
+A detached run's warnings also go to `$PROJECT_TEMP_DIR/bugsee-cli.log` rather
+than the Xcode build log, so `--no-background` is how you keep them visible. On
+Windows there is no fork and every run is synchronous.
 
 > **Xcode 15+:** `ENABLE_USER_SCRIPT_SANDBOXING` defaults to `YES`, which stops a
 > build phase reading the dSYM folder. Set it to `NO` on the target, or declare

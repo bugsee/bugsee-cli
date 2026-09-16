@@ -35,6 +35,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   dSYM upload there.
 
 ### Fixed
+- **`xcode upload-dsyms`: failing the build and detaching are now independent.**
+  `--no-fail` did both and could only be switched on, so "don't fail my build,
+  but do wait for the upload" — what CI usually wants — was unreachable, and a
+  runner tearing down its process tree could kill a detached upload with every
+  exit code still 0. Each concern now has an on/off pair (`--fail`/`--no-fail`,
+  `--background`/`--no-background`) and an env var, a flag overrides its env var,
+  and the defaults are unchanged. The one incoherent combination — fail the
+  build AND detach, where the exit code reaches nobody — is refused rather than
+  silently ignored. Closes [#28].
 - **`bugsee-cli update` on Windows ARM64** refused to run: `host_triple()` had
   no `("windows", "aarch64")` arm and returned `None`. The mapping is now a
   table rather than `match` arms — a `match` can only ever be exercised for the
@@ -44,6 +53,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 [#19]: https://github.com/bugsee/bugsee-cli/issues/19
 [#20]: https://github.com/bugsee/bugsee-cli/issues/20
+[#28]: https://github.com/bugsee/bugsee-cli/issues/28
 
 
 ## [0.7.6] - 2026-09-16

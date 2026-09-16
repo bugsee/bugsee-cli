@@ -1608,11 +1608,16 @@ pub(crate) struct DsymUploadSummary {
     pub already_existed: u32,
     /// Bundles found but not uploaded because they could not be read.
     pub skipped: u32,
-    /// True when nothing was actually sent. In a dry run the loop validates and
-    /// `continue`s WITHOUT incrementing `uploaded`, so `{0, 0, skipped}` would
-    /// otherwise read as "could not read any of them" to a caller that only
-    /// inspects the counts. No current caller passes `dry_run`, but the struct
-    /// claims to report what the upload did, so it has to say when it did none.
+    /// True when nothing was actually sent: a dry run validates and `continue`s
+    /// without incrementing `uploaded`, so the counters describe what WOULD
+    /// have happened, not what did. `debug-files upload --type dsym --dry-run`
+    /// reaches this today (it discards the summary); the flag is here so a
+    /// future caller cannot mistake a dry run's zeros for a failed upload.
+    ///
+    /// It deliberately does NOT weaken `upload-dsyms`'s unreadable-bundle gate:
+    /// `skipped > 0` means "could not be read" in a dry run exactly as in a
+    /// real one, and excusing it here would make that gate weaker than the one
+    /// it replaced.
     pub dry_run: bool,
 }
 

@@ -156,6 +156,45 @@ fn no_fail_env_var_behaves_exactly_like_the_flag() {
     );
 }
 
+/// The env vars must reach the SAME decision as the flags.
+///
+/// `should_daemonize` runs in `main` and collects the environment itself, so
+/// every unit test — which hands the map in directly — is blind to it. This
+/// combination detached despite BUGSEE_DSYM_UPLOAD_BACKGROUND=0 because that
+/// key was simply not among the ones copied.
+#[cfg(unix)]
+#[test]
+fn background_env_var_is_honoured_exactly_like_the_flag() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dsyms = tmp.path().join("dsyms");
+    std::fs::create_dir_all(&dsyms).unwrap();
+    fake_dsym(&dsyms, "App");
+    let logdir = tmp.path().join("log");
+    std::fs::create_dir_all(&logdir).unwrap();
+
+    let out = cli()
+        .args(["xcode", "upload-dsyms"])
+        .env("DWARF_DSYM_FOLDER_PATH", &dsyms)
+        .env("PROJECT_TEMP_DIR", &logdir)
+        .env("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")
+        .env("BUGSEE_DSYM_UPLOAD_BACKGROUND", "0")
+        .output()
+        .unwrap();
+
+    assert_eq!(out.status.code(), Some(0), "no-fail must still exit 0");
+    // Foreground: the diagnostics come back on OUR stderr, and no daemon log
+    // is written. A detached run is the exact opposite of both.
+    assert!(
+        !out.stderr.is_empty(),
+        "expected a foreground run to report on stderr; it detached instead"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    assert!(
+        !logdir.join("bugsee-cli.log").exists(),
+        "BUGSEE_DSYM_UPLOAD_BACKGROUND=0 must not detach"
+    );
+}
+
 /// On non-unix there is no fork, so `--no-fail` runs synchronously and the
 /// exit code is the command's own.
 #[cfg(not(unix))]
@@ -209,6 +248,9 @@ fn help_documents_the_env_vars_and_exit_codes() {
         .stdout(contains("DWARF_DSYM_FOLDER_PATH"))
         .stdout(contains("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
         .stdout(contains("--no-fail"))
+        .stdout(contains("--background"))
+        .stdout(contains("--no-background"))
+        .stdout(contains("BUGSEE_DSYM_UPLOAD_BACKGROUND"))
         .stdout(contains("ENABLE_USER_SCRIPT_SANDBOXING"));
 }
 

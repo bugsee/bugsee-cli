@@ -110,11 +110,18 @@ Environment variables (read from the Xcode build environment):
   ARCHIVE_PATH             Fallback: <ARCHIVE_PATH>/dSYMs is scanned when
                            DWARF_DSYM_FOLDER_PATH is unset or not a directory.
   BUGSEE_DSYM_UPLOAD_NO_FAIL
-                           Truthy: never fail the build, and run the upload in
-                           the background. Same as --no-fail.
-  PROJECT_TEMP_DIR         Where the detached run writes its log, in no-fail
-                           mode only. Xcode sets this; falls back to the system
-                           temp dir.
+                           Truthy: never fail the build. Same as --no-fail, and
+                           like it, implies detaching unless
+                           BUGSEE_DSYM_UPLOAD_BACKGROUND / --no-background says
+                           otherwise. A flag overrides this.
+  BUGSEE_DSYM_UPLOAD_BACKGROUND
+                           Truthy: detach. Falsey: run synchronously. Unset:
+                           follow the failure policy. Cannot be truthy while
+                           failures are fatal -- a detached exit code reaches
+                           nobody -- and that combination is refused with exit
+                           20 rather than silently ignored.
+  PROJECT_TEMP_DIR         Where a DETACHED run writes its log. Xcode sets
+                           this; falls back to the system temp dir.
   BUGSEE_APP_TOKEN         App token (or pass --app-token).
   BUGSEE_ENDPOINT          API endpoint (or pass --endpoint).
 
@@ -123,15 +130,26 @@ Exit codes:
   0        Uploaded, or there was nothing to upload (no dSYM folder, or no
            .dSYM bundles in it). Both are reported as warnings.
   10 / 11  A bundle could not be read or packed (unreadable DWARF, disk full).
-  20 / 21  Missing or rejected app token.
+  20 / 21  Missing or rejected app token; also a refused failure/detach
+           combination arriving through the environment.
   30 / 31  Server error / network failure.
+  2        A refused failure/detach combination given as FLAGS (argv error).
 
 With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every non-zero code becomes 0.
 
-  BUGSEE_DSYM_UPLOAD_NO_FAIL / --no-fail additionally DETACH the upload on unix,
-  so its output goes to $PROJECT_TEMP_DIR/bugsee-cli.log (falling back to the
-  system temp dir) instead of the build log. If you want those warnings visible
-  in Xcode, do not use no-fail mode.
+Failing and detaching are independent:
+
+  (default)                  fail the build, wait for the upload
+  --no-fail                  never fail, detach (on unix)
+  --no-fail --no-background  never fail, but WAIT -- what CI usually wants, so a
+                             runner tearing down its process tree cannot kill
+                             the upload mid-flight
+  --fail --background        refused: a detached exit code reaches nobody
+
+A detached run's output goes to $PROJECT_TEMP_DIR/bugsee-cli.log (falling back
+to the system temp dir) instead of the build log, so --no-background is also how
+you keep the warnings visible in Xcode. On Windows there is no fork and every
+run is synchronous.
 
 Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which stops a build
 phase reading the dSYM folder. Set it to NO on the target, or declare the folder
@@ -179,22 +197,37 @@ pub enum XcodeCommand {
     /// Pass `--no-fail` to opt out of that entirely.
     #[command(after_long_help = UPLOAD_DSYMS_ENV_HELP)]
     UploadDsyms {
+        /// Fail the build when the upload fails (overrides
+        /// BUGSEE_DSYM_UPLOAD_NO_FAIL; this is the default).
+        #[arg(
+            long = "fail",
+            overrides_with = "no_fail",
+            conflicts_with = "background"
+        )]
+        fail: bool,
         /// Never fail the build: downgrade every upload error to a warning and
-        /// exit 0 (default: off).
+        /// exit 0 (overrides BUGSEE_DSYM_UPLOAD_NO_FAIL; default: off).
         ///
-        /// Equivalent to setting BUGSEE_DSYM_UPLOAD_NO_FAIL — either one
-        /// ENABLES no-fail, and there is no flag that turns it back off, so a
-        /// job that exports the variable globally cannot opt one invocation
-        /// back into strict mode.
-        ///
-        /// Because this accepts in advance that failures go unseen, on unix it
-        /// also runs the upload in the BACKGROUND (detached, like
-        /// `post-action`), which means its warnings go to the daemon log rather
-        /// than the build log — see the environment section below. On Windows
-        /// there is no fork, so it stays synchronous. Without it the upload is
-        /// always synchronous, which is what lets a failure reach the build.
-        #[arg(long)]
+        /// On unix this also DETACHES the upload unless --no-background is
+        /// given, since nothing is left for the build to wait on.
+        #[arg(long = "no-fail", overrides_with = "fail")]
         no_fail: bool,
+
+        /// Detach the upload so the build does not wait for it (overrides
+        /// BUGSEE_DSYM_UPLOAD_BACKGROUND; unix only).
+        ///
+        /// Cannot be combined with failing on error: a detached process's exit
+        /// code reaches nobody, so the failure would never reach the build.
+        #[arg(long = "background", overrides_with = "no_background")]
+        background: bool,
+        /// Run the upload synchronously (overrides
+        /// BUGSEE_DSYM_UPLOAD_BACKGROUND).
+        ///
+        /// With --no-fail this is the combination CI usually wants: never break
+        /// the build, but still wait for the upload, so a runner tearing down
+        /// its process tree cannot kill it mid-flight.
+        #[arg(long = "no-background", overrides_with = "background")]
+        no_background: bool,
     },
 }
 
@@ -299,6 +332,10 @@ pub struct PostActionOverrides {
 /// `overrides_with` guarantees the two bools are never both `true` (the last
 /// one on the command line wins), so this is unambiguous; `None` means neither
 /// was passed (fall back to the env var / default).
+pub(crate) fn resolve_toggle_pub(enable: bool, disable: bool) -> Option<bool> {
+    resolve_toggle(enable, disable)
+}
+
 fn resolve_toggle(enable: bool, disable: bool) -> Option<bool> {
     if enable {
         Some(true)
@@ -404,23 +441,28 @@ pub async fn dispatch(
         // are overlaid onto the env map so every downstream gate sees them as if
         // they were environment variables (CLI flag wins over a real env var).
         XcodeCommand::PostAction { overrides, .. } => {
-            // `vars_os`, not `vars`: the latter panics on a non-UTF-8 key or
-            // value anywhere in the environment (exit 101, outside the
-            // documented contract). See bugsee/bugsee-cli#29 for the same bug
-            // still open in vcs-metadata and build-env.
+            // `env_map`, never `env::vars().collect()` — see its doc comment.
             let mut env: HashMap<String, String> = crate::cli::env_map();
             apply_overrides(&mut env, &overrides);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
         }
-        XcodeCommand::UploadDsyms { no_fail } => {
-            // `env::vars()` panics on a non-UTF-8 key/value; `vars_os` skips
-            // them instead. Nothing this command reads can be non-Unicode, and
-            // an unrelated variable in the environment must not abort the run.
+        XcodeCommand::UploadDsyms {
+            fail,
+            no_fail,
+            background,
+            no_background,
+        } => {
+            // `env_map`, never `env::vars().collect()` — see its doc comment.
             let env: HashMap<String, String> = crate::cli::env_map();
-            let no_fail = upload_dsyms_no_fail(no_fail, &env);
+            let mode = resolve_upload_dsyms_mode(
+                resolve_toggle(fail, no_fail),
+                resolve_toggle(background, no_background),
+                &env,
+            )
+            .map_err(config_invalid)?;
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-            run_upload_dsyms(&env, &endpoint, app_token.as_deref(), no_fail).await
+            run_upload_dsyms(&env, &endpoint, app_token.as_deref(), !mode.fail_on_error).await
         }
     }
 }
@@ -464,13 +506,59 @@ fn env_truthy(value: Option<&String>) -> bool {
     )
 }
 
-/// Whether `upload-dsyms` is in no-fail mode: the `--no-fail` flag OR a truthy
-/// `BUGSEE_DSYM_UPLOAD_NO_FAIL`. Shared with [`crate::cli::should_daemonize`],
-/// which needs the same answer BEFORE the runtime starts in order to decide
-/// whether to detach — no-fail mode backgrounds the upload, since nothing is
-/// waiting on its result.
-pub(crate) fn upload_dsyms_no_fail(flag: bool, env: &HashMap<String, String>) -> bool {
-    flag || env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
+/// The two independent decisions `upload-dsyms` makes before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadDsymsMode {
+    /// Propagate a real failure as a non-zero exit, failing the build.
+    pub fail_on_error: bool,
+    /// Detach (unix only), so the build does not wait for the upload.
+    pub background: bool,
+}
+
+/// Resolve both decisions from the flag pairs and the environment.
+///
+/// ONE resolver, because [`crate::cli::should_daemonize`] needs `background`
+/// BEFORE the tokio runtime exists while `dispatch` needs both after it. If the
+/// two derived it separately they could disagree — producing a foreground run
+/// that never fails, or a detached run that believes it is strict.
+///
+/// `Err` is the one incoherent combination: strict AND detached. A detached
+/// process's exit code reaches nobody, so "fail the build" would silently do
+/// nothing. Refusing beats honouring it meaninglessly.
+pub(crate) fn resolve_upload_dsyms_mode(
+    fail_flag: Option<bool>,
+    background_flag: Option<bool>,
+    env: &HashMap<String, String>,
+) -> Result<UploadDsymsMode, String> {
+    // Flag beats env, matching post-action's documented rule. The env var is
+    // NEGATIVE (`NO_FAIL`) because that is the knob users actually set; invert
+    // it here so everything downstream reasons in the positive.
+    let fail_on_error =
+        fail_flag.unwrap_or_else(|| !env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL")));
+
+    // An UNSET background choice derives from the failure policy, which
+    // preserves the shipped default: --no-fail alone still detaches.
+    let background = background_flag
+        .or_else(|| {
+            env.get("BUGSEE_DSYM_UPLOAD_BACKGROUND")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| env_truthy(Some(v)))
+        })
+        .unwrap_or(!fail_on_error);
+
+    if fail_on_error && background {
+        return Err(
+            "cannot fail the build AND detach the upload: a detached process's exit code \
+             reaches nobody, so the failure could never reach the build. Use --no-fail with \
+             --background, or drop --background to keep failures observable."
+                .to_string(),
+        );
+    }
+
+    Ok(UploadDsymsMode {
+        fail_on_error,
+        background,
+    })
 }
 
 fn trimmed<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
@@ -1349,6 +1437,25 @@ async fn upload_dsyms_strict(
     endpoint: &str,
     app_token: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Before concluding "no folder": a CONFIGURED path we cannot reach is a
+    // failure, not an absence. `resolve_dsym_folder` tests `is_dir()`, which is
+    // false both for "does not exist" and for "an ancestor denied us the
+    // lookup" — the second is a sandbox symptom and must not read as the first.
+    let configured = trimmed(env, "DWARF_DSYM_FOLDER_PATH");
+    if !configured.is_empty() {
+        if let Err(e) = std::fs::metadata(configured) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(Error::InputNotFound(format!(
+                    "cannot reach the configured dSYM folder {configured}: {e} — if this is a \
+                     Run Script build phase, Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING \
+                     to YES, which blocks it; set it to NO on the target, or declare the \
+                     folder in the phase's input file lists"
+                ))
+                .into());
+            }
+        }
+    }
+
     // "Nothing to upload" #1: no folder to look in. A build phase on a target
     // that produces no debug symbols is a normal, correct state.
     let folder = match resolve_dsym_folder(env) {
@@ -1374,7 +1481,7 @@ async fn upload_dsyms_strict(
     // sandbox denies the directory LISTING, not the DWARF parse, so it would
     // otherwise never reach the "could not read a bundle" path below and would
     // exit 0 on this command's single most likely real failure.
-    if let Err(e) = std::fs::read_dir(&folder) {
+    if let Err(e) = probe_dsym_folder(&folder) {
         return Err(Error::InputNotFound(format!(
             "cannot read the dSYM folder {}: {e} — if this is a Run Script build \
              phase, Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which \
@@ -1386,6 +1493,35 @@ async fn upload_dsyms_strict(
     }
 
     let candidates = debug_files::discover_dsyms(std::slice::from_ref(&folder));
+
+    // A `*.dSYM` we can see but discovery rejected was almost certainly
+    // unreadable rather than malformed: `is_dsym_bundle` tests
+    // `Contents/Resources/DWARF.is_dir()`, which is false without search
+    // permission on the bundle. Such a bundle is dropped BEFORE `skipped` can
+    // count it, so without this it vanishes — the app-plus-extension case where
+    // the app uploads and the build goes green.
+    let dropped: Vec<PathBuf> = std::fs::read_dir(&folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("dSYM"))
+        .filter(|p| !candidates.contains(p))
+        .collect();
+    if !dropped.is_empty() {
+        return Err(input_invalid(format!(
+            "{} .dSYM bundle(s) under {} could not be read and were NOT uploaded: {} \
+             (unreadable under ENABLE_USER_SCRIPT_SANDBOXING, or a truncated bundle \
+             with no Contents/Resources/DWARF)",
+            dropped.len(),
+            folder.display(),
+            dropped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    }
     if candidates.is_empty() {
         tracing::warn!(
             folder = %folder.display(),
@@ -1405,12 +1541,15 @@ async fn upload_dsyms_strict(
     // through as Some(""). Without this it POSTs to `/apps//symbols`, burns the
     // retry budget, and exits 31 — a network error for what is a misconfigured
     // token.
-    let app_token = app_token.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
-        config_invalid(
-            "--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms` \
+    let app_token = app_token
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            config_invalid(
+                "--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms` \
              and must not be empty",
-        )
-    })?;
+            )
+        })?;
 
     // Version/build are best-effort metadata: the `.app` is not always locatable
     // from a build phase, and the server tolerates empty strings. Never fatal —
@@ -1444,7 +1583,7 @@ async fn upload_dsyms_strict(
     // exists to prevent. Triggers: a truncated or partially-written dSYM, an
     // empty Contents/Resources/DWARF, or DWARF unreadable under
     // ENABLE_USER_SCRIPT_SANDBOXING.
-    if summary.skipped > 0 && !summary.dry_run {
+    if summary.skipped > 0 {
         return Err(input_invalid(format!(
             "{} of {} dSYM bundle(s) under {} could not be read, so those symbols \
              were NOT uploaded (a truncated dSYM, an empty \
@@ -1462,6 +1601,19 @@ async fn upload_dsyms_strict(
         skipped = summary.skipped,
         "Bugsee: dSYM upload complete"
     );
+    Ok(())
+}
+
+/// Can we actually enumerate this folder?
+///
+/// `read_dir` succeeding is NOT enough: a folder that is readable but not
+/// searchable (mode 0444) opens fine and then fails on every entry, which
+/// `WalkDir`'s `filter_map(Result::ok)` turns into "empty". Draining the
+/// iterator here surfaces that as the error it is.
+fn probe_dsym_folder(folder: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(folder)? {
+        entry?;
+    }
     Ok(())
 }
 
@@ -1671,6 +1823,102 @@ mod tests {
         );
     }
 
+    /// The folder LISTS but its entries cannot be stat'd (mode 0444: readable,
+    /// not searchable). `read_dir` succeeds, so the guard above passes, and
+    /// `WalkDir`'s `filter_map(Result::ok)` then silently drops every child —
+    /// "nothing to upload", exit 0, symbols lost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_whose_entries_cannot_be_read_fails_the_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("dsyms");
+        std::fs::create_dir_all(folder.join("App.dSYM/Contents/Resources/DWARF")).unwrap();
+        std::fs::write(folder.join("App.dSYM/Contents/Resources/DWARF/App"), b"x").unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "a folder we cannot look into must not read as empty"
+        );
+    }
+
+    /// One bundle in the folder is unreadable, so `is_dsym_bundle` rejects it
+    /// before `skipped` can count it. That is the app-plus-extension shape
+    /// again: the readable bundle uploads and the build goes green.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_bundle_is_not_silently_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("dsyms");
+        std::fs::create_dir_all(&folder).unwrap();
+        let widget = folder.join("Widget.dSYM");
+        std::fs::create_dir_all(widget.join("Contents/Resources/DWARF")).unwrap();
+        std::fs::set_permissions(&widget, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&widget, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "an unreadable .dSYM must not vanish from the count"
+        );
+    }
+
+    /// An ANCESTOR of the dSYM folder is unreadable, so `resolve_dsym_folder`'s
+    /// `is_dir()` is false and it reports "no dSYM folder" — the read_dir guard
+    /// is never even reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreachable_folder_is_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let folder = outer.join("dsyms");
+        std::fs::create_dir_all(folder.join("App.dSYM/Contents/Resources/DWARF")).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "a configured folder we cannot reach is a failure, not an absence"
+        );
+    }
+
+    /// Whitespace is filtered as insignificant, so it must not survive into the
+    /// URL: `" TKN "` would POST to `/apps/%20TKN%20/symbols`.
+    #[tokio::test]
+    async fn a_padded_app_token_is_trimmed_not_just_accepted() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = MockServer::start().await;
+        // Only the TRIMMED path is mounted: a padded token that reaches the URL
+        // verbatim hits no mock and fails the expectation.
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "type": "ApplicationNotFoundError", "message": "x" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let _ = upload_dsyms_strict(&env, &server.uri(), Some("  TKN  ")).await;
+    }
+
     /// An unreadable dSYM FOLDER is the Xcode 15+ sandboxing case this command
     /// documents — and the sandbox denies the directory listing, not the DWARF
     /// parse, so it never reaches the "could not read any bundle" path. It must
@@ -1699,6 +1947,23 @@ mod tests {
     /// Xcode writes `KEY=""` when the value field is left blank, so an empty
     /// token is a REALISTIC misconfiguration — and it must be reported as one
     /// (exit 20) rather than as whatever the server says about `/apps//symbols`.
+    /// Whitespace-only counts as empty. `BUGSEE_APP_TOKEN=" "` otherwise POSTs
+    /// to `/apps/%20/symbols`, burns the retry budget and exits 31 — reporting
+    /// a network failure for a misconfigured token.
+    #[tokio::test]
+    async fn a_whitespace_only_app_token_is_a_config_error_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App");
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, "https://example.invalid", Some("   "))
+            .await
+            .expect_err("a whitespace-only token must fail");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_app_token_is_a_config_error_not_a_network_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2006,20 +2271,115 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn no_fail_is_set_by_flag_or_env_var() {
-        assert!(upload_dsyms_no_fail(true, &env_of(&[])));
-        assert!(upload_dsyms_no_fail(
-            false,
-            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")])
-        ));
-        assert!(!upload_dsyms_no_fail(false, &env_of(&[])));
-        // Xcode writes KEY="" for a blank value field — that is "unset", not
-        // "enabled", consistent with every other toggle here.
-        assert!(!upload_dsyms_no_fail(
-            false,
-            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")])
-        ));
+    // ─── upload-dsyms: failure policy and detaching are independent (#28) ───
+
+    fn mode(
+        fail: Option<bool>,
+        bg: Option<bool>,
+        env: &[(&str, &str)],
+    ) -> Result<UploadDsymsMode, String> {
+        resolve_upload_dsyms_mode(fail, bg, &env_of(env))
+    }
+
+    #[test]
+    fn default_is_strict_and_synchronous() {
+        let m = mode(None, None, &[]).unwrap();
+        assert!(m.fail_on_error, "a failure must reach the build by default");
+        assert!(
+            !m.background,
+            "strict mode must stay foreground to be observable"
+        );
+    }
+
+    #[test]
+    fn no_fail_still_implies_background() {
+        // Preserves the shipped default: having accepted that failures go
+        // unseen, nothing is left for the build to wait on.
+        let m = mode(Some(false), None, &[]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(m.background);
+    }
+
+    #[test]
+    fn no_fail_plus_no_background_is_the_ci_case() {
+        // "Don't fail my build, but DO wait" — unreachable before #28, and the
+        // combination that stops a CI teardown killing a detached upload.
+        let m = mode(Some(false), Some(false), &[]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(!m.background);
+    }
+
+    #[test]
+    fn strict_and_detached_is_refused_rather_than_honoured_meaninglessly() {
+        // A detached process's exit code reaches nobody, so this would be a
+        // strict mode that silently cannot fail anything.
+        assert!(mode(Some(true), Some(true), &[]).is_err());
+        // Reachable from the environment too, where clap cannot refuse it.
+        assert!(mode(None, Some(true), &[]).is_err());
+        assert!(mode(None, None, &[("BUGSEE_DSYM_UPLOAD_BACKGROUND", "1")]).is_err());
+    }
+
+    #[test]
+    fn env_vars_drive_both_decisions() {
+        let m = mode(None, None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            m.background,
+            "env no-fail must detach exactly like the flag"
+        );
+
+        let m = mode(
+            None,
+            None,
+            &[
+                ("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1"),
+                ("BUGSEE_DSYM_UPLOAD_BACKGROUND", "0"),
+            ],
+        )
+        .unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            !m.background,
+            "the CI case must be reachable from env alone"
+        );
+    }
+
+    #[test]
+    fn a_flag_overrides_its_env_var() {
+        // The off-switch the previous design lacked entirely: a job exporting
+        // BUGSEE_DSYM_UPLOAD_NO_FAIL globally can now opt one invocation back
+        // into strict mode. Matches post-action's documented flag-wins rule.
+        let m = mode(Some(true), None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")]).unwrap();
+        assert!(
+            m.fail_on_error,
+            "--fail must beat BUGSEE_DSYM_UPLOAD_NO_FAIL"
+        );
+        assert!(!m.background);
+    }
+
+    #[test]
+    fn a_blank_env_value_is_unset_not_enabled() {
+        // Xcode writes KEY="" for a blank value field. BOTH variables need
+        // this: BACKGROUND="" reaching env_truthy as "falsey" would pin the
+        // upload to the foreground and silently cancel --no-fail's detaching.
+        let m = mode(None, None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")]).unwrap();
+        assert!(m.fail_on_error);
+        assert!(!m.background);
+
+        let m = mode(
+            None,
+            None,
+            &[
+                ("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1"),
+                ("BUGSEE_DSYM_UPLOAD_BACKGROUND", ""),
+            ],
+        )
+        .unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            m.background,
+            "a blank BACKGROUND is UNSET, so it must fall back to the failure policy"
+        );
     }
 
     #[test]
