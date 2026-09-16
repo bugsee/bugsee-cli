@@ -1,4 +1,5 @@
-//! Background (daemon) execution for `xcode post-action`.
+//! Background (daemon) execution for `xcode post-action` and for
+//! `xcode upload-dsyms` in no-fail mode.
 //!
 //! The iOS post-action must return control to Xcode immediately so the archive
 //! doesn't stall on Bugsee's network I/O. We reproduce the BugseeAgent's classic

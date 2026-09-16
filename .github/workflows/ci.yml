@@ -65,10 +65,16 @@ jobs:
       # Build only: the `test` job above covers behaviour, and this job exists
       # to prove the target still compiles — ring/zstd-sys/zip/flate2 included.
       - run: cargo build --release --target aarch64-pc-windows-msvc
-      - name: Smoke-test the binary on its native host
-        run: |
-          .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe --version
-          .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe vcs-metadata
+      # One command per step ON PURPOSE. The default shell here is pwsh, where a
+      # NATIVE command's non-zero exit does not abort the script — GitHub only
+      # inspects $LASTEXITCODE after the whole thing runs. Both commands in one
+      # step would let `--version` crash and still report green as long as the
+      # last line succeeded, which is precisely the failure this job exists to
+      # keep out of a tag release.
+      - name: Smoke-test --version on its native host
+        run: .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe --version
+      - name: Smoke-test stdout purity on its native host
+        run: .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe vcs-metadata
 
   # install.ps1 gained an ARM64 arch arm; a parse error there is invisible on
   # Linux and only shows up when a user runs the installer.
@@ -86,9 +92,19 @@ jobs:
           if ($errors) { $errors | ForEach-Object { $_.Message }; exit 1 }
           Write-Host "install.ps1 parses clean"
 
+  # Runs on macOS as well as Linux. Some tests need the Apple toolchain to say
+  # anything: `xcode upload-dsyms`'s upload coverage builds a real `.dSYM` with
+  # clang + dsymutil, because a fabricated bundle is rejected by
+  # `dsym::identify` and skipped before any network call — on Linux those tests
+  # skip themselves, so an ubuntu-only matrix would leave the command's actual
+  # job unverified in CI.
   test:
-    name: test
-    runs-on: ubuntu-latest
+    name: test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable

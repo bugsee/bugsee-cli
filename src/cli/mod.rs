@@ -26,14 +26,16 @@ pub mod xcode_ipa;
 pub struct Cli {
     /// Bugsee API endpoint (defaults to https://api.bugsee.com).
     /// Used only by upload-flavoured subcommands (`debug-files
-    /// upload`, `upload build`, `upload build-info`). Metadata-resolving
+    /// upload`, `upload build`, `upload build-info`, `xcode post-action`,
+    /// `xcode upload-dsyms`). Metadata-resolving
     /// subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`,
     /// `sourcemaps inject`) do no network I/O and ignore this flag.
     #[arg(long, env = "BUGSEE_ENDPOINT", global = true)]
     pub endpoint: Option<String>,
 
     /// Bugsee app token. Required by `debug-files upload`, `upload build`,
-    /// and `upload build-info`; ignored by every other subcommand. Kept
+    /// `upload build-info`, `xcode post-action` and `xcode upload-dsyms`;
+    /// ignored by every other subcommand. Kept
     /// `global` so the same env-var-driven invocation shape works
     /// across all subcommands without per-call conditional plumbing
     /// in Python integrators.
@@ -104,11 +106,17 @@ pub enum Command {
     #[command(subcommand)]
     Dsym(dsym::DsymCommand),
 
-    /// Xcode build-phase orchestration. `post-action` reads the Xcode build
-    /// environment (exported as env vars by a "Run Script" build phase) and
-    /// sequences the build-publish ops the CLI already owns — build-info
-    /// registration + bundle upload and dSYM upload — so the iOS SDK's
-    /// `tools.bundle/BugseeAgent` can delegate the whole flow to one command.
+    /// Xcode build-phase orchestration.
+    ///
+    /// `post-action` reads the Xcode build environment (exported as env vars by
+    /// a "Run Script" build phase) and sequences the build-publish ops the CLI
+    /// already owns — build-info registration + bundle upload and dSYM upload —
+    /// so the iOS SDK's `tools.bundle/BugseeAgent` can delegate the whole flow
+    /// to one command.
+    ///
+    /// `upload-dsyms` does dSYM upload ALONE, with none of the build-info
+    /// gating, for teams that want symbols from a build phase without
+    /// registering a build record on every build.
     #[command(subcommand)]
     Xcode(xcode::XcodeCommand),
 
@@ -125,23 +133,57 @@ pub enum Command {
 /// work (and before the async runtime starts — forking a live multi-threaded
 /// runtime is unsafe).
 ///
-/// Only `xcode post-action` daemonizes — the iOS post-action context, where the
-/// archive must return fast. Every other command, including the user-facing
-/// `debug-files upload` (which a developer may run directly from a terminal),
-/// stays in the foreground. `--force-foreground` opts the post-action back into
-/// synchronous execution so a size-check FAIL can gate CI. Always `false` on
-/// non-unix (no `fork`).
+/// Two commands daemonize:
+/// - `xcode post-action` — the iOS post-action context, where the archive must
+///   return fast. `--force-foreground` opts back into synchronous execution so
+///   a size-check FAIL can gate CI.
+/// - `xcode upload-dsyms` in no-fail mode — having accepted that failures go
+///   unseen, nothing is left for the build to wait on. In STRICT mode it stays
+///   foreground: a detached daemon's exit code reaches nobody.
+///
+/// Every other command, including the user-facing `debug-files upload` (which a
+/// developer may run directly from a terminal), stays in the foreground.
+/// Always `false` on non-unix (no `fork`).
 pub fn should_daemonize(cli: &Cli) -> bool {
+    // Read ONLY the one variable this decision depends on, and with `var_os`.
+    //
+    // `std::env::vars()` PANICS on a non-UTF-8 key or value anywhere in the
+    // environment, and this function runs for EVERY subcommand before anything
+    // else — so collecting the whole environment here turns an unrelated
+    // `dsym uuid` into exit 101, a code outside the documented contract
+    // entirely. Plenty of real environments carry a non-Unicode variable that
+    // is none of this CLI's business.
+    const NO_FAIL: &str = "BUGSEE_DSYM_UPLOAD_NO_FAIL";
+    let mut env = std::collections::HashMap::new();
+    if let Some(v) = std::env::var_os(NO_FAIL).and_then(|v| v.into_string().ok()) {
+        env.insert(NO_FAIL.to_string(), v);
+    }
+    should_daemonize_with_env(cli, &env)
+}
+
+/// [`should_daemonize`] over an explicit environment, so the decision is
+/// unit-testable without mutating the process environment.
+///
+/// It needs the environment because `upload-dsyms`'s no-fail mode is settable
+/// EITHER by `--no-fail` or by `BUGSEE_DSYM_UPLOAD_NO_FAIL`, and the two must
+/// reach the same decision — a foreground run that also never fails is the one
+/// combination with no use case.
+fn should_daemonize_with_env(cli: &Cli, env: &std::collections::HashMap<String, String>) -> bool {
     if !cfg!(unix) {
         return false;
     }
-    matches!(
-        &cli.command,
+    match &cli.command {
         Command::Xcode(xcode::XcodeCommand::PostAction {
-            force_foreground: false,
-            ..
-        })
-    )
+            force_foreground, ..
+        }) => !force_foreground,
+        // No-fail mode has accepted that failures go unseen, so there is
+        // nothing for the build to wait on. Strict mode MUST stay foreground:
+        // a detached daemon's exit code reaches nobody.
+        Command::Xcode(xcode::XcodeCommand::UploadDsyms { no_fail }) => {
+            xcode::upload_dsyms_no_fail(*no_fail, env)
+        }
+        _ => false,
+    }
 }
 
 pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
@@ -163,6 +205,7 @@ pub async fn dispatch(cli: Cli) -> anyhow::Result<()> {
 mod tests {
     use super::*;
     use clap::Parser;
+    use std::collections::HashMap;
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(args).expect("valid args")
@@ -180,6 +223,41 @@ mod tests {
     fn post_action_force_foreground_stays_synchronous() {
         let cli = parse(&["bugsee-cli", "xcode", "post-action", "--force-foreground"]);
         assert!(!should_daemonize(&cli));
+    }
+
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn upload_dsyms_stays_foreground_by_default() {
+        // Strict is the default, and a failure can only reach the build from a
+        // synchronous run — a detached daemon's exit code goes nowhere.
+        //
+        // Explicit EMPTY env, not `should_daemonize`: that reads the real
+        // process environment, so a developer (or CI job) who happens to export
+        // BUGSEE_DSYM_UPLOAD_NO_FAIL would fail this test for reasons having
+        // nothing to do with the code under test.
+        let cli = parse(&["bugsee-cli", "xcode", "upload-dsyms"]);
+        assert!(!should_daemonize_with_env(&cli, &HashMap::new()));
+    }
+
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn upload_dsyms_no_fail_daemonizes() {
+        // --no-fail accepts in advance that failures go unseen, so there is
+        // nothing left for the build to wait on.
+        let cli = parse(&["bugsee-cli", "xcode", "upload-dsyms", "--no-fail"]);
+        // Empty env, so this proves the FLAG did it and not an ambient var.
+        assert!(should_daemonize_with_env(&cli, &HashMap::new()));
+    }
+
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn upload_dsyms_no_fail_env_var_daemonizes_like_the_flag() {
+        // The env var and the flag MUST agree: otherwise setting the env var
+        // would quietly get you a foreground run that also never fails, which
+        // is the one combination nobody asked for.
+        let cli = parse(&["bugsee-cli", "xcode", "upload-dsyms"]);
+        let env = HashMap::from([("BUGSEE_DSYM_UPLOAD_NO_FAIL".to_string(), "1".to_string())]);
+        assert!(should_daemonize_with_env(&cli, &env));
     }
 
     #[test]

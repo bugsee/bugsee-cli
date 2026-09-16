@@ -6,6 +6,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`bugsee-cli xcode upload-dsyms`** — dSYM upload from an Xcode Run Script
+  build phase, with none of the `BUGSEE_BUILD_INFO_*` gating. It neither
+  registers a build nor uploads build-info, so it is safe to run on every build,
+  and it is the shape a React Native / Flutter config plugin can generate
+  (`withXcodeProject`) rather than a scheme post-action. Closes [#19].
+
+  A genuine failure **fails the build** by design — a missing or rejected token
+  (`20`/`21`), a server or network error (`30`/`31`), or bundles that were found
+  but could not be read (`11`) — because a build phase that swallows errors
+  means symbolication silently stops working. "Nothing to upload" (no dSYM
+  folder, or no `.dSYM` bundles in it) is a success, not a failure; "found
+  bundles, uploaded none" is not. `--no-fail` /
+  `BUGSEE_DSYM_UPLOAD_NO_FAIL` opts out of all of it and, on unix, detaches the
+  upload so the build never waits on it.
+
+  `xcode post-action` is unchanged: `BUGSEE_BUILD_INFO_ENABLED=0` still disables
+  dSYM upload there.
+
+[#19]: https://github.com/bugsee/bugsee-cli/issues/19
+
+
 ## [0.7.6] - 2026-09-16
 
 Packaging and CI release. **No functional changes to the binary** — the CLI

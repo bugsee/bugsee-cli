@@ -291,7 +291,8 @@ pub async fn dispatch(
                 return run_dsym_upload(
                     &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
                 )
-                .await;
+                .await
+                .map(|_| ());
             }
 
             if kind == DebugFileType::Pdb {
@@ -901,7 +902,7 @@ async fn run_rust_elf_upload(
 /// subdirectory). The recursive scan lets a caller point at an Xcode archive's
 /// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
 /// itself. De-duplicated.
-fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
+pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
     fn is_dsym_bundle(p: &std::path::Path) -> bool {
         p.is_dir()
             && p.extension().and_then(|e| e.to_str()) == Some("dSYM")
@@ -1476,7 +1477,7 @@ pub(crate) async fn run_dsym_upload(
     strategy: Strategy,
     force: bool,
     dry_run: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<DsymUploadSummary> {
     let candidates = discover_dsyms(paths);
     if candidates.is_empty() {
         return Err(input_not_found(format!(
@@ -1587,7 +1588,32 @@ pub(crate) async fn run_dsym_upload(
     } else {
         tracing::info!(uploaded, already_existed, skipped, "upload complete");
     }
-    Ok(())
+    Ok(DsymUploadSummary {
+        uploaded,
+        already_existed,
+        skipped,
+        dry_run,
+    })
+}
+
+/// What [`run_dsym_upload`] actually did.
+///
+/// Returned rather than only logged because "found bundles, uploaded none"
+/// is indistinguishable from success at the call site otherwise — a bundle
+/// `dsym::identify` cannot parse is skipped and the call still returns `Ok`.
+/// `xcode upload-dsyms` turns that into a build failure; see its caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DsymUploadSummary {
+    pub uploaded: u32,
+    pub already_existed: u32,
+    /// Bundles found but not uploaded because they could not be read.
+    pub skipped: u32,
+    /// True when nothing was actually sent. In a dry run the loop validates and
+    /// `continue`s WITHOUT incrementing `uploaded`, so `{0, 0, skipped}` would
+    /// otherwise read as "could not read any of them" to a caller that only
+    /// inspects the counts. No current caller passes `dry_run`, but the struct
+    /// claims to report what the upload did, so it has to say when it did none.
+    pub dry_run: bool,
 }
 
 #[cfg(test)]
