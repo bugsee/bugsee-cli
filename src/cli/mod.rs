@@ -129,6 +129,25 @@ pub enum Command {
     Update(update::UpdateArgs),
 }
 
+/// The process environment as a `String` map, skipping any entry that is not
+/// valid Unicode.
+///
+/// ALWAYS use this instead of `std::env::vars().collect()`. `env::vars()`
+/// PANICS on a non-UTF-8 key or value anywhere in the environment — not just in
+/// a variable this CLI cares about — and the resulting exit 101 is outside the
+/// documented exit-code contract entirely, so an integrator re-deriving
+/// `should_fallback` gets an undefined code. Xcode and CI environments are
+/// large and not curated; a non-Unicode variable set by some other tool in the
+/// build is none of our business and must not abort the run.
+///
+/// Nothing this CLI reads can legitimately be non-Unicode, so dropping such
+/// entries is correct rather than merely tolerant. See bugsee/bugsee-cli#29.
+pub(crate) fn env_map() -> std::collections::HashMap<String, String> {
+    std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
+        .collect()
+}
+
 /// Whether this invocation should detach into a background daemon BEFORE any
 /// work (and before the async runtime starts — forking a live multi-threaded
 /// runtime is unsafe).

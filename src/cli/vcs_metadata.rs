@@ -82,7 +82,7 @@ pub fn dispatch(args: VcsMetadataArgs) -> anyhow::Result<()> {
     let working_dir = args
         .working_dir
         .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
-    let env: HashMap<String, String> = std::env::vars().collect();
+    let env: HashMap<String, String> = crate::cli::env_map();
     let metadata = resolve(&env, &working_dir);
     let json = serde_json::to_string(&metadata)?;
     println!("{}", json);

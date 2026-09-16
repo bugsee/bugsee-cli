@@ -56,7 +56,7 @@ pub fn dispatch(cmd: BuildEnvCommand) -> anyhow::Result<()> {
             Ok(())
         }
         BuildEnvCommand::MachineLabel => {
-            let env_map: HashMap<String, String> = env::vars().collect();
+            let env_map: HashMap<String, String> = crate::cli::env_map();
             println!("{}", resolve_machine_label(&env_map).unwrap_or_default());
             Ok(())
         }

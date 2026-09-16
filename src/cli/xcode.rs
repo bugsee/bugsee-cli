@@ -408,9 +408,7 @@ pub async fn dispatch(
             // value anywhere in the environment (exit 101, outside the
             // documented contract). See bugsee/bugsee-cli#29 for the same bug
             // still open in vcs-metadata and build-env.
-            let mut env: HashMap<String, String> = std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect();
+            let mut env: HashMap<String, String> = crate::cli::env_map();
             apply_overrides(&mut env, &overrides);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
@@ -419,9 +417,7 @@ pub async fn dispatch(
             // `env::vars()` panics on a non-UTF-8 key/value; `vars_os` skips
             // them instead. Nothing this command reads can be non-Unicode, and
             // an unrelated variable in the environment must not abort the run.
-            let env: HashMap<String, String> = std::env::vars_os()
-                .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)))
-                .collect();
+            let env: HashMap<String, String> = crate::cli::env_map();
             let no_fail = upload_dsyms_no_fail(no_fail, &env);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_upload_dsyms(&env, &endpoint, app_token.as_deref(), no_fail).await
