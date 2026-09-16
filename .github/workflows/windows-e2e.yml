@@ -1,27 +1,68 @@
 # Windows end-to-end smoke test for a PUBLISHED bugsee-cli release.
-# Runs the real x86_64-pc-windows-msvc binary (downloaded from
-# download.bugsee.com, the same URL production consumers use) through every
-# upload flow against an in-process mock server — proving the Windows binary's
-# subcommand dispatch, packing/zstd, and HTTP client path all work on a genuine
-# Windows host. Manual (workflow_dispatch) so it runs AFTER a release has been
-# mirrored to download.bugsee.com (the mirror step is itself manual), avoiding a
-# race with release.yml at tag time.
+# Runs the real published Windows binary (downloaded from download.bugsee.com,
+# the same URL production consumers use) through every upload flow against an
+# in-process mock server — proving the Windows binary's subcommand dispatch,
+# packing/zstd, and HTTP client path all work on a genuine Windows host. Manual
+# (workflow_dispatch) so it runs AFTER a release has been mirrored to
+# download.bugsee.com, avoiding a race with release.yml at tag time.
+#
+# BOTH published Windows architectures are covered, each on its own native
+# runner: x86_64-pc-windows-msvc on windows-latest and aarch64-pc-windows-msvc
+# on windows-11-arm. The arm64 build exists only from 0.7.7 onward
+# (bugsee/bugsee-cli#20), so testing an older release needs `arch: x64` —
+# otherwise the arm64 leg fails on a 404 for an asset that was never published.
 name: Windows e2e
 
 on:
   workflow_dispatch:
     inputs:
       version:
-        description: "Published CLI version to e2e-test (no leading v), e.g. 0.6.0"
+        description: "Published CLI version to e2e-test (no leading v), e.g. 0.7.7"
         required: true
-        default: "0.6.0"
+      arch:
+        description: "Which published Windows build to test (arm64 exists from 0.7.7)"
+        required: true
+        type: choice
+        default: both
+        options:
+          - both
+          - x64
+          - arm64
 
 permissions:
   contents: read
 
 jobs:
+  # The matrix is computed rather than static because a job-level `if` cannot
+  # read the `matrix` context — selecting one architecture has to happen before
+  # the matrix exists, not be filtered out of it afterwards.
+  setup:
+    name: resolve arch matrix
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.resolve.outputs.matrix }}
+    steps:
+      - id: resolve
+        run: |
+          x64='{"arch":"x64","runner":"windows-latest","triple":"x86_64-pc-windows-msvc"}'
+          arm64='{"arch":"arm64","runner":"windows-11-arm","triple":"aarch64-pc-windows-msvc"}'
+          case "${{ inputs.arch }}" in
+            x64)   matrix="[$x64]" ;;
+            arm64) matrix="[$arm64]" ;;
+            both)  matrix="[$x64,$arm64]" ;;
+            *)     echo "::error::unknown arch '${{ inputs.arch }}'"; exit 1 ;;
+          esac
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "testing: $matrix"
+
   windows-e2e:
-    runs-on: windows-latest
+    name: windows-e2e (${{ matrix.arch }})
+    needs: setup
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.setup.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
 
@@ -31,9 +72,10 @@ jobs:
           $ErrorActionPreference = "Stop"
           $v = "${{ inputs.version }}"
           $base = "https://download.bugsee.com/cli/v$v"
-          Write-Host "Fetching $base/bugsee-cli-x86_64-pc-windows-msvc.zip"
-          Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip" -OutFile cli.zip
-          Invoke-WebRequest "$base/bugsee-cli-x86_64-pc-windows-msvc.zip.sha256" -OutFile cli.zip.sha256
+          $triple = "${{ matrix.triple }}"
+          Write-Host "Fetching $base/bugsee-cli-$triple.zip"
+          Invoke-WebRequest "$base/bugsee-cli-$triple.zip" -OutFile cli.zip
+          Invoke-WebRequest "$base/bugsee-cli-$triple.zip.sha256" -OutFile cli.zip.sha256
           $expected = ((Get-Content cli.zip.sha256 -Raw).Trim() -split '\s+')[0].ToLower()
           $actual = (Get-FileHash cli.zip -Algorithm SHA256).Hash.ToLower()
           if ($actual -ne $expected) { throw "sha256 mismatch: expected $expected, got $actual" }
