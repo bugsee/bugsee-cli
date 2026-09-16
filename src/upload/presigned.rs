@@ -2,8 +2,9 @@
 //!
 //! Stage 1: `POST {endpoint}/apps/{app_token}/symbols` with metadata JSON
 //!          (`{uuid, version, build, hash, transform?}`). Server responds with
-//!          either `{code: 0, endpoint: <presigned PUT URL>}` (proceed) or
-//!          `{code: 16004}` (already exists, skip), or an error.
+//!          either `{code: 0, endpoint: <presigned PUT URL>}` (proceed), the
+//!          already-exists sentinel (skip — see [`is_already_exists`]), or an
+//!          error envelope `{ok: false, error: {type, message, code}}`.
 //! Stage 2: `PUT <presigned URL>` with the binary body.
 //!
 //! Wire format already implemented identically across the existing Kotlin
@@ -25,8 +26,10 @@ use serde::{Deserialize, Serialize};
 use crate::error::{Error, Result};
 use crate::upload::http::{self, RetryPolicy};
 
-/// Server-side already-exists sentinel returned in the metadata POST body.
+/// Server-side already-exists sentinel: `DuplicateSymbolsFoundError`, whose
+/// code is the symbol-error offset 16000 + 4 (appserver `errors/symbol`).
 const CODE_ALREADY_EXISTS: i64 = 16004;
+const TYPE_ALREADY_EXISTS: &str = "DuplicateSymbolsFoundError";
 
 /// Metadata POST body. Field names MUST match the wire format the worker has
 /// been receiving — every existing uploader emits these exact keys.
@@ -95,6 +98,25 @@ struct ErrorPayload {
     error_type: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    #[serde(default)]
+    code: Option<i64>,
+}
+
+/// Whether the metadata response says the server already has this symbol.
+///
+/// The appserver's error serializer (`code/app.utils.js` `error()`) answers a
+/// duplicate with HTTP 200 and the code NESTED in the envelope —
+/// `{ok: false, error: {type: "DuplicateSymbolsFoundError", code: 16004}}` —
+/// so the nested code and the error type are both checked. A top-level
+/// `code: 16004` is accepted too: it is what this client originally matched on,
+/// and the check costs nothing. Matching ONLY the top level is what made every
+/// re-upload of an unchanged artifact a hard failure that aborted the batch.
+fn is_already_exists(parsed: &MetadataResponse) -> bool {
+    parsed.code == Some(CODE_ALREADY_EXISTS)
+        || parsed.error.as_ref().is_some_and(|e| {
+            e.code == Some(CODE_ALREADY_EXISTS)
+                || e.error_type.as_deref() == Some(TYPE_ALREADY_EXISTS)
+        })
 }
 
 /// Outcome of the metadata POST (stage 1). Either the server already has the
@@ -160,7 +182,7 @@ pub async fn register(
             ),
         })?;
 
-    if parsed.code == Some(CODE_ALREADY_EXISTS) {
+    if is_already_exists(&parsed) {
         tracing::debug!("server reports SymbolAlreadyExists ({CODE_ALREADY_EXISTS})");
         return Ok(Registration::AlreadyExists);
     }
@@ -371,6 +393,147 @@ mod tests {
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
         assert_eq!(body["uuids"], serde_json::json!(["aaaa"]));
+    }
+
+    /// Minimal metadata for the register/upload response-shape tests.
+    fn plain_metadata() -> Metadata<'static> {
+        Metadata {
+            uuid: Some("did-1"),
+            version: "1",
+            build: "1",
+            hash: Some("h"),
+            transform: None,
+            format: Some("sourcemap"),
+            uuids: None,
+            overwrite: None,
+        }
+    }
+
+    async fn register_against(body: serde_json::Value) -> Result<Registration> {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = http::build_client().unwrap();
+        register(
+            &client,
+            RetryPolicy::none(),
+            &server.uri(),
+            "TKN",
+            &plain_metadata(),
+        )
+        .await
+    }
+
+    /// The appserver's real duplicate answer. Its error serializer
+    /// (`code/app.utils.js` `error()`) sends HTTP 200 with the code NESTED inside
+    /// `error` — `code: err.offset + err.code` = 16000 + 4 — never at the top
+    /// level. Matching only a top-level `code` made every re-upload of an
+    /// unchanged artifact a hard failure (exit 30) that aborted the whole batch.
+    #[tokio::test]
+    async fn register_recognises_the_appservers_nested_duplicate_envelope() {
+        let reg = register_against(serde_json::json!({
+            "ok": false,
+            "error": {
+                "type": "DuplicateSymbolsFoundError",
+                "message": "A symbol file with the same identifier already exists",
+                "code": 16004
+            }
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+    }
+
+    #[tokio::test]
+    async fn register_recognises_a_duplicate_by_nested_code_alone() {
+        let reg = register_against(serde_json::json!({
+            "ok": false,
+            "error": { "code": 16004 }
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+    }
+
+    #[tokio::test]
+    async fn register_recognises_a_duplicate_by_error_type_alone() {
+        let reg = register_against(serde_json::json!({
+            "ok": false,
+            "error": { "type": "DuplicateSymbolsFoundError" }
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+    }
+
+    #[tokio::test]
+    async fn register_still_fails_on_any_other_symbol_error() {
+        // A sibling code from the same error family (SymbolNotFoundError = 16001)
+        // must not be mistaken for "already there".
+        let err = register_against(serde_json::json!({
+            "ok": false,
+            "error": {
+                "type": "SymbolNotFoundError",
+                "message": "Symbol file not found",
+                "code": 16001
+            }
+        }))
+        .await
+        .unwrap_err();
+        match err {
+            Error::UploadServer { status, message } => {
+                assert_eq!(status, 200);
+                assert!(message.contains("SymbolNotFoundError"), "{message}");
+            }
+            other => panic!("expected UploadServer, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn register_maps_the_nested_application_not_found_to_token_rejected() {
+        let err = register_against(serde_json::json!({
+            "ok": false,
+            "error": { "type": "ApplicationNotFoundError", "code": 2001 }
+        }))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::AppTokenRejected), "got {err:?}");
+    }
+
+    #[tokio::test]
+    async fn upload_skips_the_put_when_the_server_reports_the_nested_duplicate() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": { "type": "DuplicateSymbolsFoundError", "code": 16004 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let payload = tempfile::NamedTempFile::new().unwrap();
+        let client = http::build_client().unwrap();
+        let outcome = upload(
+            &client,
+            RetryPolicy::none(),
+            &server.uri(),
+            "TKN",
+            &plain_metadata(),
+            payload.path(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, Outcome::AlreadyExists);
     }
 
     #[tokio::test]

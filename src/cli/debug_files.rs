@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
+use crate::inject;
 use crate::symbols::{dsym, elf, il2cpp_linemap, pdb, proguard, rust, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
@@ -142,7 +143,10 @@ pub enum DebugFileType {
     /// WebAssembly debug info (scaffold — not yet processed).
     Wasm,
     /// JS source maps (React Native / web). Keyed by the debug-id embedded by
-    /// `bugsee-cli sourcemaps inject` (or a caller-supplied `--uuid`).
+    /// `bugsee-cli sourcemaps inject` (or a caller-supplied `--uuid`). In a
+    /// scanned directory, a map with no debug-id that no JS bundle points at
+    /// (e.g. an extracted-CSS map) is skipped with a warning; one a bundle does
+    /// point at is an error. A map already on the server is skipped.
     Sourcemaps,
     /// Unity IL2CPP `LineNumberMappings.json` (+ MethodMap / il2cppFileRoot)
     /// bundle. Keyed by the IL2CPP module UUID(s) (`libil2cpp` / UnityFramework);
@@ -525,26 +529,46 @@ fn discover_mappings(paths: &[PathBuf]) -> Vec<PathBuf> {
     out
 }
 
+/// A source-map upload candidate, and whether the caller named it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SourcemapCandidate {
+    path: PathBuf,
+    /// Passed as a file argument rather than reached by walking a directory.
+    explicit: bool,
+}
+
 /// Discover `.map` source-map files under the given paths. Explicit file
 /// arguments are trusted as-is (regardless of extension) so a caller can point
 /// at a single non-`.map`-named map; directories are walked for `*.map`.
-fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<SourcemapCandidate> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_file() {
-            out.push(p.clone());
+            out.push(SourcemapCandidate {
+                path: p.clone(),
+                explicit: true,
+            });
             continue;
         }
         if !p.is_dir() {
             tracing::warn!(path = %p.display(), "path does not exist or is not a file/dir; skipping");
             continue;
         }
-        for entry in WalkDir::new(p).into_iter().filter_map(|e| e.ok()) {
+        // Sorted, so a batch is processed in the same order on every run and
+        // platform: a log from one CI run then describes the next one too.
+        for entry in WalkDir::new(p)
+            .sort_by_file_name()
+            .into_iter()
+            .filter_map(|e| e.ok())
+        {
             if !entry.file_type().is_file() {
                 continue;
             }
             if entry.path().extension().and_then(|e| e.to_str()) == Some("map") {
-                out.push(entry.into_path());
+                out.push(SourcemapCandidate {
+                    path: entry.into_path(),
+                    explicit: false,
+                });
             }
         }
     }
@@ -1292,9 +1316,17 @@ async fn run_il2cpp_linemap_upload(
 ///
 /// Each `.map` is keyed on the server by the debug-id `sourcemaps inject`
 /// embedded (`debug_id` / `debugId`, legacy `uuid` fallback) — read back here
-/// via [`sourcemap::identify`]. A map carrying no id is a hard error: the
-/// caller must run `sourcemaps inject` first (or pass `--uuid` to key by a
-/// caller-owned id). The map is packed as a single Zstd entry and uploaded
+/// via [`sourcemap::identify`]. A map carrying no id is a hard error — the
+/// caller must run `sourcemaps inject` first, or pass `--uuid` to key by a
+/// caller-owned id — with ONE exception: a map reached by walking a directory
+/// that no JS bundle points at (an extracted-CSS map, a `.d.ts.map`). `inject`
+/// never stamps those by design, so they are skipped with a warning instead of
+/// aborting every other map in the build. A walk that leaves nothing uploadable
+/// is still an error, so a forgotten `inject` cannot pass silently.
+///
+/// A map the server already has is a per-file no-op (`already_existed`); the
+/// batch continues, which is what lets a second build of an app with unchanged
+/// chunks upload its changed ones. The map is packed as a single Zstd entry and uploaded
 /// through the shared presigned protocol; the worker auto-detects the
 /// `sourcemap` format from the unzipped JSON and re-derives the same debug-id
 /// (`symbolfiles/sourcemap.py:parse`).
@@ -1329,9 +1361,35 @@ async fn run_sourcemap_upload(
 
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
-    for map_path in candidates {
+    let mut skipped_unkeyed = 0u32;
+    let mut keyed = 0u32;
+    // Built only if a walked map turns out to have no id, since it reads every
+    // JS bundle in the tree.
+    let mut bundle_maps: Option<std::collections::HashSet<PathBuf>> = None;
+    for SourcemapCandidate {
+        path: map_path,
+        explicit,
+    } in candidates
+    {
         tracing::info!(path = %map_path.display(), "processing source map");
         let identity = sourcemap::identify(&map_path)?;
+
+        if uuid_override.is_none() && identity.debug_id.is_none() && !explicit {
+            let bundle_maps = bundle_maps.get_or_insert_with(|| inject::bundle_maps(paths));
+            let belongs_to_a_bundle = std::fs::canonicalize(&map_path)
+                .map(|canonical| bundle_maps.contains(&canonical))
+                .unwrap_or(false);
+            if !belongs_to_a_bundle {
+                skipped_unkeyed += 1;
+                tracing::warn!(
+                    path = %map_path.display(),
+                    "skipping source map with no debug id that no JS bundle points at \
+                     (e.g. an extracted-CSS or .d.ts map, which `sourcemaps inject` never stamps)"
+                );
+                continue;
+            }
+        }
+        keyed += 1;
 
         // Resolve the keying id: an explicit --uuid override wins; otherwise the
         // embedded debug-id. A map with neither cannot be keyed — fail loudly
@@ -1422,10 +1480,28 @@ async fn run_sourcemap_upload(
         }
     }
 
+    if keyed == 0 {
+        return Err(input_invalid(format!(
+            "no source map under {} carries a debug id ({skipped_unkeyed} skipped as belonging \
+             to no JS bundle) — run `bugsee-cli sourcemaps inject <bundle-dir>` first to embed \
+             one, or pass --uuid to key by a caller-owned id",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
     if dry_run {
-        tracing::info!("dry-run complete");
+        tracing::info!(skipped_unkeyed, "dry-run complete");
     } else {
-        tracing::info!(uploaded, already_existed, "upload complete");
+        tracing::info!(
+            uploaded,
+            already_existed,
+            skipped_unkeyed,
+            "upload complete"
+        );
     }
     Ok(())
 }
@@ -1644,10 +1720,11 @@ mod sourcemap_upload_tests {
         write(&tmp.path().join("sub"), "c.map", b"{}");
 
         let mut found = discover_sourcemaps(&[tmp.path().to_path_buf()]);
-        found.sort();
+        found.sort_by(|a, b| a.path.cmp(&b.path));
+        assert!(found.iter().all(|c| !c.explicit), "walked, not named");
         let names: Vec<_> = found
             .iter()
-            .map(|p| p.file_name().unwrap().to_str().unwrap().to_string())
+            .map(|c| c.path.file_name().unwrap().to_str().unwrap().to_string())
             .collect();
         assert_eq!(
             names,
@@ -1658,7 +1735,13 @@ mod sourcemap_upload_tests {
         // An explicit non-.map file is trusted as-is.
         let explicit = write(tmp.path(), "weird-name", b"{}");
         let found2 = discover_sourcemaps(std::slice::from_ref(&explicit));
-        assert_eq!(found2, vec![explicit]);
+        assert_eq!(
+            found2,
+            vec![SourcemapCandidate {
+                path: explicit,
+                explicit: true
+            }]
+        );
     }
 
     /// Drives the two-stage presigned upload and returns the captured metadata
@@ -1811,6 +1894,266 @@ mod sourcemap_upload_tests {
         )
         .await
         .unwrap();
+    }
+
+    /// A mock collector that signs every metadata POST and accepts every PUT,
+    /// except POSTs whose `uuid` is in `already_there`, which get the appserver's
+    /// real duplicate envelope. Returns the server and the ids POSTed, in order.
+    async fn collector(already_there: &[&str]) -> MockServer {
+        use wiremock::matchers::body_partial_json;
+        let server = MockServer::start().await;
+        for id in already_there {
+            Mock::given(method("POST"))
+                .and(wm_path("/apps/TKN/symbols"))
+                .and(body_partial_json(serde_json::json!({ "uuid": id })))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "ok": false,
+                    "error": {
+                        "type": "DuplicateSymbolsFoundError",
+                        "message": "A symbol file with the same identifier already exists",
+                        "code": 16004
+                    }
+                })))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+        }
+        let put_url = format!("{}/sourcemap-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/sourcemap-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        server
+    }
+
+    async fn posted_ids(server: &MockServer) -> Vec<String> {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "POST")
+            .map(|r| {
+                let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                body["uuid"].as_str().unwrap().to_string()
+            })
+            .collect()
+    }
+
+    async fn puts(server: &MockServer) -> usize {
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .filter(|r| r.method.as_str() == "PUT")
+            .count()
+    }
+
+    async fn upload_dir(dir: &std::path::Path, endpoint: &str) -> anyhow::Result<()> {
+        run_sourcemap_upload(
+            &[dir.to_path_buf()],
+            endpoint,
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+        )
+        .await
+    }
+
+    /// A webpack/Vite build with extracted CSS: `inject` stamps the JS bundle's
+    /// map and (correctly) leaves the CSS map alone, since no JS bundle points at
+    /// it. The upload walk reaches both — and used to abort the WHOLE batch on the
+    /// CSS map (exit 11) before or after the JS one, depending on walk order.
+    #[tokio::test]
+    async fn a_css_map_no_bundle_points_at_is_skipped_and_the_js_map_still_uploads() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "main.js",
+            b"console.log(1)\n//# debugId=did-js\n",
+        );
+        write(
+            tmp.path(),
+            "main.js.map",
+            br#"{"version":3,"debug_id":"did-js","mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "main.css.map",
+            br#"{"version":3,"sources":["a.css"],"mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "types.d.ts.map",
+            br#"{"version":3,"sources":["types.ts"],"mappings":""}"#,
+        );
+
+        let server = collector(&[]).await;
+        upload_dir(tmp.path(), &server.uri()).await.unwrap();
+
+        assert_eq!(posted_ids(&server).await, vec!["did-js"]);
+        assert_eq!(puts(&server).await, 1);
+    }
+
+    /// The skip is for maps that belong to no bundle. A bundle's own map without
+    /// a debug-id means `inject` did not run (or failed) — uploading nothing for
+    /// it would leave that bundle's crashes unsymbolicated, so it stays fatal.
+    #[tokio::test]
+    async fn a_js_bundles_own_map_without_a_debug_id_still_fails_the_run() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "app.js", b"console.log(1)\n");
+        write(tmp.path(), "app.js.map", br#"{"version":3,"mappings":""}"#);
+
+        let server = collector(&[]).await;
+        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no debug_id") && msg.contains("app.js.map"),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputInvalid
+        );
+    }
+
+    #[tokio::test]
+    async fn a_map_a_bundle_names_in_its_sourcemappingurl_counts_as_that_bundles_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("maps")).unwrap();
+        write(
+            tmp.path(),
+            "app.mjs",
+            b"export const x = 1\n//# sourceMappingURL=maps/app.map\n",
+        );
+        write(
+            &tmp.path().join("maps"),
+            "app.map",
+            br#"{"version":3,"mappings":""}"#,
+        );
+
+        let server = collector(&[]).await;
+        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+        assert!(err.to_string().contains("app.map"), "{err}");
+    }
+
+    /// Skipping must never turn "nothing was uploadable" into a silent success:
+    /// a tree where NO map carries an id is the forgot-to-inject case.
+    #[tokio::test]
+    async fn a_walk_where_no_map_carries_a_debug_id_fails_loudly() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "main.css.map",
+            br#"{"version":3,"mappings":""}"#,
+        );
+
+        let server = collector(&[]).await;
+        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no source map") && msg.contains("sourcemaps inject"),
+            "{msg}"
+        );
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputInvalid
+        );
+        assert!(posted_ids(&server).await.is_empty());
+    }
+
+    /// A second production build: an unchanged chunk's map is already on the
+    /// server. That is a successful no-op for that file, and must not stop its
+    /// siblings — `a` sorts first, so the changed `b` is reached only if the
+    /// duplicate is treated as a skip.
+    #[tokio::test]
+    async fn an_unchanged_map_the_server_already_has_does_not_stop_its_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "a.js.map",
+            br#"{"version":3,"debug_id":"did-unchanged","mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "b.js.map",
+            br#"{"version":3,"debug_id":"did-changed","mappings":""}"#,
+        );
+
+        let server = collector(&["did-unchanged"]).await;
+        upload_dir(tmp.path(), &server.uri()).await.unwrap();
+
+        assert_eq!(
+            posted_ids(&server).await,
+            vec!["did-unchanged", "did-changed"]
+        );
+        assert_eq!(puts(&server).await, 1, "only the changed map is PUT");
+    }
+
+    /// `--uuid` keys every map by the caller's id, so there is nothing to skip:
+    /// an unkeyed map in a scanned directory still uploads, as it always did.
+    #[tokio::test]
+    async fn uuid_override_still_uploads_maps_that_carry_no_id_of_their_own() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "main.css.map",
+            br#"{"version":3,"mappings":""}"#,
+        );
+        let server = collector(&[]).await;
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            Some("22222222-2222-2222-2222-222222222222".parse().unwrap()),
+            Strategy::Zstd(11),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            posted_ids(&server).await,
+            vec!["22222222-2222-2222-2222-222222222222"]
+        );
+        assert_eq!(puts(&server).await, 1);
+    }
+
+    #[test]
+    fn discover_sourcemaps_returns_a_deterministic_order() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("m")).unwrap();
+        for name in ["z.js.map", "a.js.map", "k.js.map"] {
+            write(tmp.path(), name, b"{}");
+        }
+        write(&tmp.path().join("m"), "b.js.map", b"{}");
+
+        let found = discover_sourcemaps(&[tmp.path().to_path_buf()]);
+        let rel: Vec<_> = found
+            .iter()
+            .map(|c| {
+                c.path
+                    .strip_prefix(tmp.path())
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+        assert_eq!(rel, vec!["a.js.map", "k.js.map", "m/b.js.map", "z.js.map"]);
     }
 
     #[tokio::test]

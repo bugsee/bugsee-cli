@@ -6,6 +6,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **Re-uploading a symbol the server already has no longer fails the upload.**
+  The appserver answers a duplicate with HTTP 200 and the code nested in its
+  error envelope — `{ok: false, error: {type: "DuplicateSymbolsFoundError",
+  code: 16004}}` — but the client only recognised a top-level `code: 16004`, so
+  every already-uploaded artifact was a hard failure (exit `30`) instead of an
+  `already_existed` skip. For `debug-files upload` over a directory this aborted
+  the rest of the batch: the second production build of any web app with an
+  unchanged chunk could not upload its changed ones. The fix is in the shared
+  presigned client, so dSYM, ELF, ProGuard, PDB, Rust, IL2CPP line-map and
+  source-map uploads all get it.
+- **`debug-files upload --type sourcemaps` no longer aborts on a CSS source
+  map.** In a scanned directory, a map with no debug-id that no JS bundle points
+  at (an extracted-CSS map, a `.d.ts.map` — `sourcemaps inject` never stamps
+  those) is skipped with a warning instead of failing every other map with exit
+  `11`. A bundle's own map without a debug-id, a map named explicitly on the
+  command line, and a scan that leaves nothing uploadable all still fail.
+  Directory scans are also processed in sorted order, so a batch runs the same
+  way on every run and platform.
+
 ## [0.7.7] - 2026-09-16
 
 ### Added
