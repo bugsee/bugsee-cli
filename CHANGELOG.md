@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.7] - 2026-09-16
+
 ### Added
 - **Windows ARM64 (`aarch64-pc-windows-msvc`) is now a published target** — the
   sixth triple, bringing a seventh npm package (`@bugsee/cli-win32-arm64`).
@@ -22,28 +24,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and it is the shape a React Native / Flutter config plugin can generate
   (`withXcodeProject`) rather than a scheme post-action. Closes [#19].
 
-  A genuine failure **fails the build** by design — a missing or rejected token
-  (`20`/`21`), a server or network error (`30`/`31`), or bundles that were found
-  but could not be read (`11`) — because a build phase that swallows errors
-  means symbolication silently stops working. "Nothing to upload" (no dSYM
-  folder, or no `.dSYM` bundles in it) is a success, not a failure; "found
-  bundles, uploaded none" is not. `--no-fail` /
-  `BUGSEE_DSYM_UPLOAD_NO_FAIL` opts out of all of it and, on unix, detaches the
-  upload so the build never waits on it.
+  A genuine failure **fails the build** by design — a missing, empty or rejected
+  token (`20`/`21`), a server or network error (`30`/`31`), or a dSYM folder or
+  bundle that could not be read (`10`/`11`) — because a build phase that
+  swallows errors means symbolication silently stops working and nobody notices
+  until a crash report is unreadable. "Nothing to upload" (no dSYM folder, or no
+  `.dSYM` bundles in it) is a success, not a failure; "found bundles, uploaded
+  none" is not.
+
+  Failing the build and detaching the upload are **independent**, each with an
+  on/off pair (`--fail`/`--no-fail`, `--background`/`--no-background`) and an env
+  var (`BUGSEE_DSYM_UPLOAD_NO_FAIL`, `BUGSEE_DSYM_UPLOAD_BACKGROUND`); a flag
+  overrides its env var. The default is strict and synchronous; `--no-fail`
+  selects detaching unless `--no-background` says otherwise, which is usually
+  what CI wants — never break the build, but still wait, so a runner tearing
+  down its process tree cannot kill the upload mid-flight. Asking to fail the
+  build *and* detach is refused (`2` as flags, `20` from the environment) rather
+  than honoured, because a detached process's exit code reaches nobody. See
+  [#28].
 
   `xcode post-action` is unchanged: `BUGSEE_BUILD_INFO_ENABLED=0` still disables
   dSYM upload there.
 
 ### Fixed
-- **`xcode upload-dsyms`: failing the build and detaching are now independent.**
-  `--no-fail` did both and could only be switched on, so "don't fail my build,
-  but do wait for the upload" — what CI usually wants — was unreachable, and a
-  runner tearing down its process tree could kill a detached upload with every
-  exit code still 0. Each concern now has an on/off pair (`--fail`/`--no-fail`,
-  `--background`/`--no-background`) and an env var, a flag overrides its env var,
-  and the defaults are unchanged. The one incoherent combination — fail the
-  build AND detach, where the exit code reaches nobody — is refused rather than
-  silently ignored. Closes [#28].
+- **A non-UTF-8 environment variable no longer crashes the CLI.** `vcs-metadata`,
+  `build-env machine-label` and `xcode post-action` collected the environment
+  with `std::env::vars()`, which PANICS on a non-Unicode key or value anywhere
+  in it — not just in a variable this CLI reads. They exited **101**, a code
+  outside the documented contract entirely, so an integrator re-deriving
+  `should_fallback` got neither a structural failure to fall back on nor a
+  substantive one to propagate. Xcode and CI environments are large and not
+  curated; a variable set by any other tool in the build was enough. Closes [#29].
 - **`bugsee-cli update` on Windows ARM64** refused to run: `host_triple()` had
   no `("windows", "aarch64")` arm and returned `None`. The mapping is now a
   table rather than `match` arms — a `match` can only ever be exercised for the
@@ -51,9 +62,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   pin it against `[workspace.metadata.dist].targets` so the two cannot drift
   again.
 
+[0.7.7]: https://github.com/bugsee/bugsee-cli/compare/v0.7.6...v0.7.7
+
 [#19]: https://github.com/bugsee/bugsee-cli/issues/19
 [#20]: https://github.com/bugsee/bugsee-cli/issues/20
 [#28]: https://github.com/bugsee/bugsee-cli/issues/28
+[#29]: https://github.com/bugsee/bugsee-cli/issues/29
 
 
 ## [0.7.6] - 2026-09-16
