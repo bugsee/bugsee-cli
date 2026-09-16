@@ -45,6 +45,8 @@ TRUST_NPM="fake_npm"
 
 # shellcheck disable=SC1090
 eval "$(awk '/^trust_state\(\) \{/,/^\}/' "$SCRIPT_UNDER_TEST")"
+# shellcheck disable=SC1090
+eval "$(awk '/^trust_state_interactive\(\) \{/,/^\}/' "$SCRIPT_UNDER_TEST")"
 
 fails=0
 t() {
@@ -58,6 +60,20 @@ t() {
     fails=1
   fi
 }
+
+# ---- CAPTURED FROM A REAL REGISTRY -----------------------------------------
+# Verbatim `npx npm@latest trust list @bugsee/cli-win32-arm64` output, npm
+# 12.x, 2026-09-16. Every other fixture here was written to match the parser,
+# which proves the parser self-consistent and nothing about npm; this one is
+# the other way round. Do not "tidy" it — the leading blank line and the exact
+# labels are the point.
+t "real npm output is classified granted" granted text 0 '
+type: github
+id: 6827c0f2-26cd-49fc-9cd3-374f7bb1d3b2
+file: npm-publish.yml
+repository: bugsee/bugsee-cli
+permissions: publish, stage publish
+'
 
 # ---- the state that must never be guessed --------------------------------
 # npm errored. Previously this returned "not configured", and the script then
@@ -184,6 +200,64 @@ t "JSON: a bare null is 'unknown', not 'absent'" unknown both 0 'null'
 t "JSON: unrelated metadata does not disarm the guard" unknown both 0 '{"meta":{"file":"x","repository":"y"},"weird":{"a":1}}'
 t "JSON: npm supporting --json with no entries is 'absent'" absent both 0 '[]'
 t "JSON: a non-zero --json call falls back, not 'absent'" unknown json 1 '[]'
+
+# ---- the uncaptured retry ---------------------------------------------------
+# This is the half the 28 fixtures above CANNOT see: they stub npm out, so the
+# interaction between command substitution and npm's 2FA prompt is invisible to
+# them. The retry lived inline in the caller, and a mutation deleting it passed
+# every one of them.
+#
+# A fake npm that fails its first two (CAPTURED) reads and answers afterwards
+# stands in for the real failure mode: captured stdout -> EOTP -> `unknown`, then
+# an uncaptured call that authenticates, then a re-read that succeeds. It also has
+# no `--json` support, like the npm that produced the text fixture above.
+REAL_ENTRY='
+type: github
+id: 6827c0f2-26cd-49fc-9cd3-374f7bb1d3b2
+file: npm-publish.yml
+repository: bugsee/bugsee-cli
+permissions: publish, stage publish
+'
+# The call count lives in a FILE, not a variable: `trust_state` is invoked through
+# `$(...)`, and a subshell's increments die with it — which is why a first attempt
+# at this test saw the retry happen and still read `unknown`.
+# shellcheck disable=SC2329,SC2317
+flaky_npm() {
+  local json=0 n
+  for a in "$@"; do [ "$a" = "--json" ] && json=1; done
+  n=$(( $(cat "$CALL_FILE") + 1 ))
+  echo "$n" > "$CALL_FILE"
+  [ "$json" = 1 ] && return 1
+  [ "$n" -le "$FAIL_FIRST" ] && return 1
+  printf '%s' "$REAL_ENTRY"
+}
+
+# Asserts the classification AND whether the interactive retry was used, because
+# "granted either way" cannot tell a working retry from one that always runs.
+ti() {
+  local name="$1" expected="$2" want_retry="$3" out got retried
+  CALL_FILE="$(mktemp)"; echo 0 > "$CALL_FILE"
+  out="$(TRUST_NPM=flaky_npm trust_state_interactive "@bugsee/x" 2>/dev/null)"
+  got="$(printf '%s' "$out" | tail -1)"
+  case "$out" in *"needs an interactive 2FA challenge"*) retried=yes ;; *) retried=no ;; esac
+  rm -f "$CALL_FILE"
+  if [ "$got" = "$expected" ] && [ "$retried" = "$want_retry" ]; then
+    printf '  ok    %s\n' "$name"
+  else
+    printf '  FAIL  %s (expected %s/retry=%s, got %s/retry=%s)\n' \
+      "$name" "$expected" "$want_retry" "$got" "$retried"
+    fails=1
+  fi
+}
+
+# A cold session: the captured reads fail, so the retry is what rescues it.
+FAIL_FIRST=2
+ti "an EOTP-failing captured read is retried uncaptured, then classified" granted yes
+
+# A warm session answers immediately, and nothing is retried — so a session
+# already authenticated is never prompted.
+FAIL_FIRST=0
+ti "a session that already answers is classified without a retry" granted no
 
 if [ "$fails" -eq 0 ]; then
   echo "all trust_state cases pass"
