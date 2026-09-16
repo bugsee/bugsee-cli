@@ -23,7 +23,8 @@ name: Publish to npm
 # with a 404 on the PUT that reads as though the package does not exist rather
 # than as a missing trust configuration.
 #
-# >>> RUNBOOK: npm/README.md, "First-publish bootstrap". Read it before the
+# >>> RUNBOOK: `bash npm/bootstrap-names.sh <name>` does both steps and is
+# >>> idempotent; npm/README.md, "First-publish bootstrap" explains it. Read it before the
 # >>> first release that includes the @bugsee/cli family. @bugsee/bugsee-cli is
 # >>> already bootstrapped and needs nothing.
 #
