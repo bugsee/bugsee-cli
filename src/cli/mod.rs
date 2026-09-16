@@ -198,9 +198,20 @@ fn should_daemonize_with_env(cli: &Cli, env: &std::collections::HashMap<String, 
         // No-fail mode has accepted that failures go unseen, so there is
         // nothing for the build to wait on. Strict mode MUST stay foreground:
         // a detached daemon's exit code reaches nobody.
-        Command::Xcode(xcode::XcodeCommand::UploadDsyms { no_fail }) => {
-            xcode::upload_dsyms_no_fail(*no_fail, env)
-        }
+        Command::Xcode(xcode::XcodeCommand::UploadDsyms {
+            fail,
+            no_fail,
+            background,
+            no_background,
+        }) => xcode::resolve_upload_dsyms_mode(
+            xcode::resolve_toggle_pub(*fail, *no_fail),
+            xcode::resolve_toggle_pub(*background, *no_background),
+            env,
+        )
+        // An incoherent combination must NOT daemonize: dispatch reports it as
+        // a config error, which only happens if we are still in the foreground.
+        .map(|m| m.background)
+        .unwrap_or(false),
         _ => false,
     }
 }
@@ -242,6 +253,77 @@ mod tests {
     fn post_action_force_foreground_stays_synchronous() {
         let cli = parse(&["bugsee-cli", "xcode", "post-action", "--force-foreground"]);
         assert!(!should_daemonize(&cli));
+    }
+
+    /// `should_daemonize` decides in `main` BEFORE the runtime exists; dispatch
+    /// decides again afterwards. If the two ever disagree you get a foreground
+    /// run that never fails, or a detached run that believes it is strict.
+    /// They must resolve through one function — this pins that across the whole
+    /// flag/env matrix, including the combination that is refused.
+    #[cfg_attr(not(unix), ignore)]
+    #[test]
+    fn daemonize_decision_matches_the_resolver_everywhere() {
+        /// (extra argv, env pairs) for one row of the matrix.
+        type Case = (
+            &'static [&'static str],
+            &'static [(&'static str, &'static str)],
+        );
+
+        let cases: &[Case] = &[
+            (&[], &[]),
+            (&["--no-fail"], &[]),
+            (&["--fail"], &[]),
+            (&["--no-fail", "--no-background"], &[]),
+            (&["--no-fail", "--background"], &[]),
+            (&[], &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")]),
+            (&[], &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")]),
+            (
+                &[],
+                &[
+                    ("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1"),
+                    ("BUGSEE_DSYM_UPLOAD_BACKGROUND", "0"),
+                ],
+            ),
+            // Refused: must not daemonize, so dispatch is still in the
+            // foreground to report it.
+            (&[], &[("BUGSEE_DSYM_UPLOAD_BACKGROUND", "1")]),
+        ];
+
+        for (flags, env_pairs) in cases {
+            let mut argv = vec!["bugsee-cli", "xcode", "upload-dsyms"];
+            argv.extend_from_slice(flags);
+            let cli = parse(&argv);
+            let env: HashMap<String, String> = env_pairs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+
+            let expected = xcode::resolve_upload_dsyms_mode(
+                match &cli.command {
+                    Command::Xcode(xcode::XcodeCommand::UploadDsyms { fail, no_fail, .. }) => {
+                        xcode::resolve_toggle_pub(*fail, *no_fail)
+                    }
+                    _ => unreachable!(),
+                },
+                match &cli.command {
+                    Command::Xcode(xcode::XcodeCommand::UploadDsyms {
+                        background,
+                        no_background,
+                        ..
+                    }) => xcode::resolve_toggle_pub(*background, *no_background),
+                    _ => unreachable!(),
+                },
+                &env,
+            )
+            .map(|m| m.background)
+            .unwrap_or(false);
+
+            assert_eq!(
+                should_daemonize_with_env(&cli, &env),
+                expected,
+                "daemonize decision drifted from the resolver for {flags:?} / {env_pairs:?}"
+            );
+        }
     }
 
     #[cfg_attr(not(unix), ignore)]

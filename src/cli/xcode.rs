@@ -110,8 +110,16 @@ Environment variables (read from the Xcode build environment):
   ARCHIVE_PATH             Fallback: <ARCHIVE_PATH>/dSYMs is scanned when
                            DWARF_DSYM_FOLDER_PATH is unset or not a directory.
   BUGSEE_DSYM_UPLOAD_NO_FAIL
-                           Truthy: never fail the build, and run the upload in
-                           the background. Same as --no-fail.
+                           Truthy: never fail the build. Same as --no-fail, and
+                           like it, implies detaching unless
+                           BUGSEE_DSYM_UPLOAD_BACKGROUND / --no-background says
+                           otherwise. A flag overrides this.
+  BUGSEE_DSYM_UPLOAD_BACKGROUND
+                           Truthy: detach. Falsey: run synchronously. Unset:
+                           follow the failure policy. Cannot be truthy while
+                           failures are fatal -- a detached exit code reaches
+                           nobody -- and that combination is refused with exit
+                           20 rather than silently ignored.
   PROJECT_TEMP_DIR         Where the detached run writes its log, in no-fail
                            mode only. Xcode sets this; falls back to the system
                            temp dir.
@@ -128,10 +136,19 @@ Exit codes:
 
 With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every non-zero code becomes 0.
 
-  BUGSEE_DSYM_UPLOAD_NO_FAIL / --no-fail additionally DETACH the upload on unix,
-  so its output goes to $PROJECT_TEMP_DIR/bugsee-cli.log (falling back to the
-  system temp dir) instead of the build log. If you want those warnings visible
-  in Xcode, do not use no-fail mode.
+Failing and detaching are independent:
+
+  (default)                  fail the build, wait for the upload
+  --no-fail                  never fail, detach (on unix)
+  --no-fail --no-background  never fail, but WAIT -- what CI usually wants, so a
+                             runner tearing down its process tree cannot kill
+                             the upload mid-flight
+  --fail --background        refused: a detached exit code reaches nobody
+
+A detached run's output goes to $PROJECT_TEMP_DIR/bugsee-cli.log (falling back
+to the system temp dir) instead of the build log, so --no-background is also how
+you keep the warnings visible in Xcode. On Windows there is no fork and every
+run is synchronous.
 
 Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which stops a build
 phase reading the dSYM folder. Set it to NO on the target, or declare the folder
@@ -179,22 +196,37 @@ pub enum XcodeCommand {
     /// Pass `--no-fail` to opt out of that entirely.
     #[command(after_long_help = UPLOAD_DSYMS_ENV_HELP)]
     UploadDsyms {
+        /// Fail the build when the upload fails (overrides
+        /// BUGSEE_DSYM_UPLOAD_NO_FAIL; this is the default).
+        #[arg(
+            long = "fail",
+            overrides_with = "no_fail",
+            conflicts_with = "background"
+        )]
+        fail: bool,
         /// Never fail the build: downgrade every upload error to a warning and
-        /// exit 0 (default: off).
+        /// exit 0 (overrides BUGSEE_DSYM_UPLOAD_NO_FAIL; default: off).
         ///
-        /// Equivalent to setting BUGSEE_DSYM_UPLOAD_NO_FAIL — either one
-        /// ENABLES no-fail, and there is no flag that turns it back off, so a
-        /// job that exports the variable globally cannot opt one invocation
-        /// back into strict mode.
-        ///
-        /// Because this accepts in advance that failures go unseen, on unix it
-        /// also runs the upload in the BACKGROUND (detached, like
-        /// `post-action`), which means its warnings go to the daemon log rather
-        /// than the build log — see the environment section below. On Windows
-        /// there is no fork, so it stays synchronous. Without it the upload is
-        /// always synchronous, which is what lets a failure reach the build.
-        #[arg(long)]
+        /// On unix this also DETACHES the upload unless --no-background is
+        /// given, since nothing is left for the build to wait on.
+        #[arg(long = "no-fail", overrides_with = "fail")]
         no_fail: bool,
+
+        /// Detach the upload so the build does not wait for it (overrides
+        /// BUGSEE_DSYM_UPLOAD_BACKGROUND; unix only).
+        ///
+        /// Cannot be combined with failing on error: a detached process's exit
+        /// code reaches nobody, so the failure would never reach the build.
+        #[arg(long = "background", overrides_with = "no_background")]
+        background: bool,
+        /// Run the upload synchronously (overrides
+        /// BUGSEE_DSYM_UPLOAD_BACKGROUND).
+        ///
+        /// With --no-fail this is the combination CI usually wants: never break
+        /// the build, but still wait for the upload, so a runner tearing down
+        /// its process tree cannot kill it mid-flight.
+        #[arg(long = "no-background", overrides_with = "background")]
+        no_background: bool,
     },
 }
 
@@ -299,6 +331,10 @@ pub struct PostActionOverrides {
 /// `overrides_with` guarantees the two bools are never both `true` (the last
 /// one on the command line wins), so this is unambiguous; `None` means neither
 /// was passed (fall back to the env var / default).
+pub(crate) fn resolve_toggle_pub(enable: bool, disable: bool) -> Option<bool> {
+    resolve_toggle(enable, disable)
+}
+
 fn resolve_toggle(enable: bool, disable: bool) -> Option<bool> {
     if enable {
         Some(true)
@@ -404,23 +440,28 @@ pub async fn dispatch(
         // are overlaid onto the env map so every downstream gate sees them as if
         // they were environment variables (CLI flag wins over a real env var).
         XcodeCommand::PostAction { overrides, .. } => {
-            // `vars_os`, not `vars`: the latter panics on a non-UTF-8 key or
-            // value anywhere in the environment (exit 101, outside the
-            // documented contract). See bugsee/bugsee-cli#29 for the same bug
-            // still open in vcs-metadata and build-env.
+            // `env_map`, never `env::vars().collect()` — see its doc comment.
             let mut env: HashMap<String, String> = crate::cli::env_map();
             apply_overrides(&mut env, &overrides);
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             run_post_action(&env, &endpoint, app_token.as_deref()).await
         }
-        XcodeCommand::UploadDsyms { no_fail } => {
-            // `env::vars()` panics on a non-UTF-8 key/value; `vars_os` skips
-            // them instead. Nothing this command reads can be non-Unicode, and
-            // an unrelated variable in the environment must not abort the run.
+        XcodeCommand::UploadDsyms {
+            fail,
+            no_fail,
+            background,
+            no_background,
+        } => {
+            // `env_map`, never `env::vars().collect()` — see its doc comment.
             let env: HashMap<String, String> = crate::cli::env_map();
-            let no_fail = upload_dsyms_no_fail(no_fail, &env);
+            let mode = resolve_upload_dsyms_mode(
+                resolve_toggle(fail, no_fail),
+                resolve_toggle(background, no_background),
+                &env,
+            )
+            .map_err(config_invalid)?;
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
-            run_upload_dsyms(&env, &endpoint, app_token.as_deref(), no_fail).await
+            run_upload_dsyms(&env, &endpoint, app_token.as_deref(), !mode.fail_on_error).await
         }
     }
 }
@@ -464,13 +505,59 @@ fn env_truthy(value: Option<&String>) -> bool {
     )
 }
 
-/// Whether `upload-dsyms` is in no-fail mode: the `--no-fail` flag OR a truthy
-/// `BUGSEE_DSYM_UPLOAD_NO_FAIL`. Shared with [`crate::cli::should_daemonize`],
-/// which needs the same answer BEFORE the runtime starts in order to decide
-/// whether to detach — no-fail mode backgrounds the upload, since nothing is
-/// waiting on its result.
-pub(crate) fn upload_dsyms_no_fail(flag: bool, env: &HashMap<String, String>) -> bool {
-    flag || env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL"))
+/// The two independent decisions `upload-dsyms` makes before it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UploadDsymsMode {
+    /// Propagate a real failure as a non-zero exit, failing the build.
+    pub fail_on_error: bool,
+    /// Detach (unix only), so the build does not wait for the upload.
+    pub background: bool,
+}
+
+/// Resolve both decisions from the flag pairs and the environment.
+///
+/// ONE resolver, because [`crate::cli::should_daemonize`] needs `background`
+/// BEFORE the tokio runtime exists while `dispatch` needs both after it. If the
+/// two derived it separately they could disagree — producing a foreground run
+/// that never fails, or a detached run that believes it is strict.
+///
+/// `Err` is the one incoherent combination: strict AND detached. A detached
+/// process's exit code reaches nobody, so "fail the build" would silently do
+/// nothing. Refusing beats honouring it meaninglessly.
+pub(crate) fn resolve_upload_dsyms_mode(
+    fail_flag: Option<bool>,
+    background_flag: Option<bool>,
+    env: &HashMap<String, String>,
+) -> Result<UploadDsymsMode, String> {
+    // Flag beats env, matching post-action's documented rule. The env var is
+    // NEGATIVE (`NO_FAIL`) because that is the knob users actually set; invert
+    // it here so everything downstream reasons in the positive.
+    let fail_on_error =
+        fail_flag.unwrap_or_else(|| !env_truthy(env.get("BUGSEE_DSYM_UPLOAD_NO_FAIL")));
+
+    // An UNSET background choice derives from the failure policy, which
+    // preserves the shipped default: --no-fail alone still detaches.
+    let background = background_flag
+        .or_else(|| {
+            env.get("BUGSEE_DSYM_UPLOAD_BACKGROUND")
+                .filter(|v| !v.trim().is_empty())
+                .map(|v| env_truthy(Some(v)))
+        })
+        .unwrap_or(!fail_on_error);
+
+    if fail_on_error && background {
+        return Err(
+            "cannot fail the build AND detach the upload: a detached process's exit code \
+             reaches nobody, so the failure could never reach the build. Use --no-fail with \
+             --background, or drop --background to keep failures observable."
+                .to_string(),
+        );
+    }
+
+    Ok(UploadDsymsMode {
+        fail_on_error,
+        background,
+    })
 }
 
 fn trimmed<'a>(env: &'a HashMap<String, String>, key: &str) -> &'a str {
@@ -2006,20 +2093,98 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn no_fail_is_set_by_flag_or_env_var() {
-        assert!(upload_dsyms_no_fail(true, &env_of(&[])));
-        assert!(upload_dsyms_no_fail(
-            false,
-            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")])
-        ));
-        assert!(!upload_dsyms_no_fail(false, &env_of(&[])));
-        // Xcode writes KEY="" for a blank value field — that is "unset", not
-        // "enabled", consistent with every other toggle here.
-        assert!(!upload_dsyms_no_fail(
-            false,
-            &env_of(&[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")])
-        ));
+    // ─── upload-dsyms: failure policy and detaching are independent (#28) ───
+
+    fn mode(
+        fail: Option<bool>,
+        bg: Option<bool>,
+        env: &[(&str, &str)],
+    ) -> Result<UploadDsymsMode, String> {
+        resolve_upload_dsyms_mode(fail, bg, &env_of(env))
+    }
+
+    #[test]
+    fn default_is_strict_and_synchronous() {
+        let m = mode(None, None, &[]).unwrap();
+        assert!(m.fail_on_error, "a failure must reach the build by default");
+        assert!(
+            !m.background,
+            "strict mode must stay foreground to be observable"
+        );
+    }
+
+    #[test]
+    fn no_fail_still_implies_background() {
+        // Preserves the shipped default: having accepted that failures go
+        // unseen, nothing is left for the build to wait on.
+        let m = mode(Some(false), None, &[]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(m.background);
+    }
+
+    #[test]
+    fn no_fail_plus_no_background_is_the_ci_case() {
+        // "Don't fail my build, but DO wait" — unreachable before #28, and the
+        // combination that stops a CI teardown killing a detached upload.
+        let m = mode(Some(false), Some(false), &[]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(!m.background);
+    }
+
+    #[test]
+    fn strict_and_detached_is_refused_rather_than_honoured_meaninglessly() {
+        // A detached process's exit code reaches nobody, so this would be a
+        // strict mode that silently cannot fail anything.
+        assert!(mode(Some(true), Some(true), &[]).is_err());
+        // Reachable from the environment too, where clap cannot refuse it.
+        assert!(mode(None, Some(true), &[]).is_err());
+        assert!(mode(None, None, &[("BUGSEE_DSYM_UPLOAD_BACKGROUND", "1")]).is_err());
+    }
+
+    #[test]
+    fn env_vars_drive_both_decisions() {
+        let m = mode(None, None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")]).unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            m.background,
+            "env no-fail must detach exactly like the flag"
+        );
+
+        let m = mode(
+            None,
+            None,
+            &[
+                ("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1"),
+                ("BUGSEE_DSYM_UPLOAD_BACKGROUND", "0"),
+            ],
+        )
+        .unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            !m.background,
+            "the CI case must be reachable from env alone"
+        );
+    }
+
+    #[test]
+    fn a_flag_overrides_its_env_var() {
+        // The off-switch the previous design lacked entirely: a job exporting
+        // BUGSEE_DSYM_UPLOAD_NO_FAIL globally can now opt one invocation back
+        // into strict mode. Matches post-action's documented flag-wins rule.
+        let m = mode(Some(true), None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1")]).unwrap();
+        assert!(
+            m.fail_on_error,
+            "--fail must beat BUGSEE_DSYM_UPLOAD_NO_FAIL"
+        );
+        assert!(!m.background);
+    }
+
+    #[test]
+    fn a_blank_env_value_is_unset_not_enabled() {
+        // Xcode writes KEY="" for a blank value field.
+        let m = mode(None, None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")]).unwrap();
+        assert!(m.fail_on_error);
+        assert!(!m.background);
     }
 
     #[test]
