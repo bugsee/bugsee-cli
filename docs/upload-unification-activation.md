@@ -55,6 +55,13 @@ Consequences to keep in mind:
       sidecar. These are the exact triples `CliBinaryResolver.hostTriple()`
       maps to; a missing triple makes that host fall back to native (safe but
       defeats the point).
+
+      > **Since 0.7.7 the published set is 6**, with `aarch64-pc-windows-msvc`
+      > (`.zip`) added — see bugsee/bugsee-cli#20. The checklist above records
+      > what was verified for the v0.2.0 activation and is left as it stood.
+      > An integrator whose `hostTriple()` does not map the new triple keeps
+      > falling back to native on Windows ARM64, which is safe; mapping it is
+      > the usual second step of the version-floor rollout.
 - [ ] **PRODUCTION worker can read ZIP method 93 (zstd).** This is the single
       most important gate. The worker reads both the build-info bundle and the
       zstd mapping through `from utils.compression import zipfile`, which
@@ -98,7 +105,8 @@ one workflow run — no manual binary building:
    `aarch64-apple-darwin`, `x86_64-apple-darwin`, `aarch64-unknown-linux-gnu`,
    `x86_64-unknown-linux-gnu`, `x86_64-pc-windows-msvc` — the exact set
    `CliBinaryResolver.hostTriple()` maps to), emits SHA-256 checksums, and
-   creates the GitHub Release.
+   creates the GitHub Release. (`aarch64-pc-windows-msvc` joined the set in
+   0.7.7, making it 6.)
 2. **Run `mirror-to-s3.yml`** (`workflow_dispatch`, input `tag = v0.2.0`). It
    copies the release assets to `s3://$S3_BUCKET/cli/v0.2.0/` (served as
    `https://download.bugsee.com/cli/v0.2.0/`) and refreshes `cli/latest/`.
