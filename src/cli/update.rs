@@ -222,18 +222,34 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// `(os, arch, triple)` for every target `bugsee-cli` publishes a binary for.
+///
+/// This MUST stay in lockstep with `[workspace.metadata.dist].targets` in
+/// `Cargo.toml`: a triple published but missing here makes that host's own
+/// `bugsee-cli update` refuse to run, and a triple here but not published makes
+/// it chase a 404. `published_targets_match_dist_targets` pins the two together.
+///
+/// A table rather than `match` arms so the set is enumerable from a test on any
+/// host — a `match` can only be exercised for the host it is compiled on, which
+/// is how Windows ARM64 went missing here while being added elsewhere.
+const HOST_TRIPLES: &[(&str, &str, &str)] = &[
+    ("macos", "aarch64", "aarch64-apple-darwin"),
+    ("macos", "x86_64", "x86_64-apple-darwin"),
+    ("linux", "aarch64", "aarch64-unknown-linux-gnu"),
+    ("linux", "x86_64", "x86_64-unknown-linux-gnu"),
+    ("windows", "x86_64", "x86_64-pc-windows-msvc"),
+    ("windows", "aarch64", "aarch64-pc-windows-msvc"),
+];
+
 /// The host's Rust target triple, matching what `bugsee-cli` is published for.
-/// `None` for hosts with no published build (Linux musl, Windows ARM64, …).
+/// `None` for hosts with no published build (Linux musl, FreeBSD, …).
 /// Resolved from the compile-time target via `std::env::consts`.
 pub(crate) fn host_triple() -> Option<&'static str> {
-    match (std::env::consts::OS, std::env::consts::ARCH) {
-        ("macos", "aarch64") => Some("aarch64-apple-darwin"),
-        ("macos", "x86_64") => Some("x86_64-apple-darwin"),
-        ("linux", "aarch64") => Some("aarch64-unknown-linux-gnu"),
-        ("linux", "x86_64") => Some("x86_64-unknown-linux-gnu"),
-        ("windows", "x86_64") => Some("x86_64-pc-windows-msvc"),
-        _ => None,
-    }
+    let (os, arch) = (std::env::consts::OS, std::env::consts::ARCH);
+    HOST_TRIPLES
+        .iter()
+        .find(|(o, a, _)| *o == os && *a == arch)
+        .map(|(_, _, triple)| *triple)
 }
 
 /// `cli/v<major>.x/version.txt` — the per-major "latest" pointer for `current`.
@@ -636,6 +652,68 @@ mod tests {
         ] {
             assert!(validate_version(bad).is_err(), "should reject {bad:?}");
         }
+    }
+
+    /// `[workspace.metadata.dist].targets` from `Cargo.toml`, which is the
+    /// single source of truth for what actually gets built and published.
+    fn dist_targets() -> Vec<String> {
+        let manifest = include_str!("../../Cargo.toml");
+        let section = manifest
+            .split("[workspace.metadata.dist]")
+            .nth(1)
+            .expect("Cargo.toml has a [workspace.metadata.dist] section");
+        let list_start = section
+            .find("\ntargets = [")
+            .expect("[workspace.metadata.dist] declares `targets`");
+        let list = &section[list_start..];
+        let list = &list[..list.find(']').expect("`targets` list is closed")];
+        let mut found: Vec<String> = list
+            .split('"')
+            .skip(1)
+            .step_by(2)
+            .map(str::to_owned)
+            .collect();
+        found.sort();
+        assert!(!found.is_empty(), "parsed no targets out of Cargo.toml");
+        found
+    }
+
+    /// `tests/update_e2e.rs` keeps its own copy of this mapping — it is a
+    /// separate crate (this one has no `[lib]` target), so it cannot import
+    /// `HOST_TRIPLES`. Its helper panics on an unrecognised host, which would
+    /// fail the suite on a newly published platform. Scan it rather than let the
+    /// two drift silently.
+    #[test]
+    fn update_e2e_helper_knows_every_published_target() {
+        let e2e = include_str!("../../tests/update_e2e.rs");
+        for triple in dist_targets() {
+            assert!(
+                e2e.contains(&triple),
+                "tests/update_e2e.rs has no arm for `{triple}` — its host_triple() \
+                 helper panics on an unknown host, so `cargo test` fails there"
+            );
+        }
+    }
+
+    /// The drift this guards is what bugsee/bugsee-cli#20 was: a triple gets
+    /// published while `HOST_TRIPLES` is never updated, so the binary shipped
+    /// for that platform cannot update itself. Only a test that reads the
+    /// manifest catches it — a host can exercise at most its own arm.
+    #[test]
+    fn published_targets_match_dist_targets() {
+        let mut known: Vec<String> = HOST_TRIPLES
+            .iter()
+            .map(|(_, _, triple)| (*triple).to_owned())
+            .collect();
+        known.sort();
+
+        assert_eq!(
+            dist_targets(),
+            known,
+            "HOST_TRIPLES and [workspace.metadata.dist].targets have drifted — a \
+             published target with no HOST_TRIPLES row cannot self-update, and a \
+             row with no published target chases a 404"
+        );
     }
 
     #[test]

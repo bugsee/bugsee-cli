@@ -38,6 +38,7 @@
     "@bugsee/cli-darwin-x64": "0.0.0-dev",
     "@bugsee/cli-linux-arm64": "0.0.0-dev",
     "@bugsee/cli-linux-x64": "0.0.0-dev",
+    "@bugsee/cli-win32-arm64": "0.0.0-dev",
     "@bugsee/cli-win32-x64": "0.0.0-dev"
   }
 }

@@ -74,13 +74,29 @@ npm-scope = "@bugsee"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)
-targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc", "aarch64-pc-windows-msvc"]
 # Which actions to run on pull requests
 pr-run-mode = "plan"
 # Whether to install an updater program
 install-updater = false
 # Path that installers should place binaries in
 install-path = "CARGO_HOME"
+
+# Per-target runner overrides. `aarch64-pc-windows-msvc` MUST build on a native
+# ARM64 Windows runner: dist's default for it is cargo-xwin in a container on
+# ubuntu-22.04, and `ring` fails there because it assembles its ARM64 Windows
+# `.S` files with the plain `clang` driver, which reads cargo-xwin's MSVC-style
+# `/imsvc` include flags as filenames (`clang: error: no such file or directory:
+# '/imsvc'`). Natively the host IS the target, so no flag translation happens
+# and ring/zstd-sys/zip/flate2 all build. See bugsee/bugsee-cli#20.
+#
+# NOTE the placement: this sub-table comes AFTER every key of
+# [workspace.metadata.dist]. TOML absorbs each key following a [table] header
+# into that table, so putting it mid-section silently swallows the keys below it
+# (`dist plan` then fails with "data did not match any variant of untagged enum
+# StringLikeOr"). Same hazard as the cfg(unix) dependency table — see CLAUDE.md.
+[workspace.metadata.dist.github-custom-runners]
+aarch64-pc-windows-msvc = "windows-11-arm"
 
 [dependencies]
 # CLI

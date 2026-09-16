@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Assemble the six npm packages of the @bugsee/cli family from a directory
+// Assemble the seven npm packages of the @bugsee/cli family from a directory
 // of cargo-dist release assets.
 //
 //   node npm/build.mjs --artifacts-dir release-assets [--version X.Y.Z]
@@ -51,7 +51,7 @@ function parseArgs(argv) {
   return out;
 }
 
-/** The crate version is the single source of truth for all six packages. */
+/** The crate version is the single source of truth for all seven packages. */
 function crateVersion() {
   const toml = fs.readFileSync(path.join(repoRoot, "Cargo.toml"), "utf8");
   const pkg = toml.split(/^\[/m).find((s) => s.startsWith("package]"));
@@ -124,7 +124,7 @@ fs.mkdirSync(args.out, { recursive: true });
 const built = [];
 const skipped = [];
 
-// --- the five platform packages --------------------------------------------
+// --- the six platform packages --------------------------------------------
 for (const [triple, platform] of Object.entries(PLATFORMS)) {
   const asset = artifactName(triple);
   const archive = path.join(args.artifactsDir, asset);
@@ -164,7 +164,7 @@ for (const [triple, platform] of Object.entries(PLATFORMS)) {
     repository: "https://github.com/bugsee/bugsee-cli",
     author: "Bugsee",
     // The whole mechanism: npm consults os/cpu before downloading an optional
-    // dependency, so exactly one of the five is ever fetched.
+    // dependency, so exactly one of the six is ever fetched.
     os: [platform.os],
     cpu: [platform.cpu],
     ...(platform.libc ? { libc: [platform.libc] } : {}),

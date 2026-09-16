@@ -15,6 +15,12 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 /// The host triple this test binary (and therefore the bugsee-cli under test)
 /// was built for — must match what the CLI requests.
+///
+/// A deliberate duplicate of `HOST_TRIPLES` in `src/cli/update.rs`: this is a
+/// separate crate and `bugsee-cli` has no `[lib]` target to import from. The
+/// bin's `update_e2e_helper_knows_every_published_target` test scans this file
+/// so the two cannot drift — if you add a triple to
+/// `[workspace.metadata.dist].targets`, add it in both places.
 fn host_triple() -> &'static str {
     match (std::env::consts::OS, std::env::consts::ARCH) {
         ("macos", "aarch64") => "aarch64-apple-darwin",
@@ -22,6 +28,7 @@ fn host_triple() -> &'static str {
         ("linux", "aarch64") => "aarch64-unknown-linux-gnu",
         ("linux", "x86_64") => "x86_64-unknown-linux-gnu",
         ("windows", "x86_64") => "x86_64-pc-windows-msvc",
+        ("windows", "aarch64") => "aarch64-pc-windows-msvc",
         other => panic!("unsupported test host: {other:?}"),
     }
 }

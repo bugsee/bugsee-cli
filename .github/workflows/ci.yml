@@ -42,6 +42,50 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --all-targets -- -D warnings
 
+  # The release-critical guard for bugsee/bugsee-cli#20. Nothing else in this
+  # repo compiles aarch64-pc-windows-msvc before a tag push (`pr-run-mode =
+  # "plan"` means the PR Release run only plans), and dist's `host` job needs
+  # EVERY build-local-artifacts leg — so a leg that fails only at tag time means
+  # no GitHub Release, and therefore no S3 mirror and no npm publish, since both
+  # chain off `workflow_run.conclusion == 'success'`. Catch it on the PR instead.
+  #
+  # Runs NATIVELY on windows-11-arm rather than cross-compiling: under
+  # cargo-xwin, `ring` assembles its ARM64 Windows `.S` files with the plain
+  # `clang` driver and chokes on MSVC-style `/imsvc` include flags. Same reason
+  # `[workspace.metadata.dist.github-custom-runners]` pins the release leg there.
+  build-win-arm64:
+    name: build aarch64-pc-windows-msvc
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-pc-windows-msvc
+      - uses: Swatinem/rust-cache@v2
+      # Build only: the `test` job above covers behaviour, and this job exists
+      # to prove the target still compiles — ring/zstd-sys/zip/flate2 included.
+      - run: cargo build --release --target aarch64-pc-windows-msvc
+      - name: Smoke-test the binary on its native host
+        run: |
+          .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe --version
+          .\target\aarch64-pc-windows-msvc\release\bugsee-cli.exe vcs-metadata
+
+  # install.ps1 gained an ARM64 arch arm; a parse error there is invisible on
+  # Linux and only shows up when a user runs the installer.
+  installer-ps1-parses:
+    name: install.ps1 parses
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Parse installer/install.ps1
+        shell: pwsh
+        run: |
+          $errors = $null
+          $null = [System.Management.Automation.Language.Parser]::ParseFile(
+            (Resolve-Path ./installer/install.ps1), [ref]$null, [ref]$errors)
+          if ($errors) { $errors | ForEach-Object { $_.Message }; exit 1 }
+          Write-Host "install.ps1 parses clean"
+
   test:
     name: test
     runs-on: ubuntu-latest

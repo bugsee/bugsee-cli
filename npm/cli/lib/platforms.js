@@ -17,14 +17,14 @@
 // release.yml. Check the plan with `dist plan --output-format=json` — see the
 // `allow-dirty` comment in Cargo.toml.)
 //
-// NO Windows arm64 (`aarch64-pc-windows-msvc` / @bugsee/cli-win32-arm64) — see
-// bugsee/bugsee-cli#20. It is one row here plus one triple in `targets`, but it
-// cannot be validated before a tag push: ci.yml has no target matrix and
-// `pr-run-mode = "plan"`, while dist's `host` job needs EVERY
-// build-local-artifacts leg to succeed. A failing leg therefore means no
-// GitHub Release at all — and so no S3 mirror and no npm publish, since both
-// chain off `workflow_run.conclusion == 'success'`. Adding it speculatively
-// would risk the whole release pipeline, npm packaging included.
+// Windows arm64 (`aarch64-pc-windows-msvc`) IS published as of 0.7.7 — see
+// bugsee/bugsee-cli#20 for why it was absent before. It cross-compiles under
+// cargo-xwin only if `ring` can assemble its ARM64 Windows `.S` files, which it
+// cannot, so that leg builds NATIVELY on a `windows-11-arm` runner instead
+// (`[workspace.metadata.dist.github-custom-runners]` in Cargo.toml). ci.yml
+// build-checks the target on every PR so the leg cannot break a tag release:
+// dist's `host` job needs EVERY build-local-artifacts leg, and a failing leg
+// means no GitHub Release, hence no S3 mirror and no npm publish.
 
 "use strict";
 
@@ -75,6 +75,14 @@ const PLATFORMS = Object.freeze({
     bin: "bugsee-cli.exe",
     archiveExt: ".zip",
     label: "Windows x86_64",
+  },
+  "aarch64-pc-windows-msvc": {
+    pkg: "@bugsee/cli-win32-arm64",
+    os: "win32",
+    cpu: "arm64",
+    bin: "bugsee-cli.exe",
+    archiveExt: ".zip",
+    label: "Windows arm64",
   },
 });
 

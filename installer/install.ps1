@@ -18,12 +18,22 @@ $Base = if ($env:BUGSEE_CLI_BASE_URL) { $env:BUGSEE_CLI_BASE_URL } else { 'https
 $Version = $env:BUGSEE_CLI_VERSION
 $InstallDir = $env:BUGSEE_CLI_INSTALL_DIR
 
-# Only x86_64 Windows is published.
-$procArch = $env:PROCESSOR_ARCHITECTURE
-if ($procArch -ne 'AMD64') {
-    throw "bugsee-cli install error: unsupported Windows architecture '$procArch' (only x86_64/AMD64 is published)"
+# x86_64 and arm64 Windows are published.
+#
+# PROCESSOR_ARCHITECTURE reports the architecture of the *current process*, so a
+# 32-bit PowerShell on 64-bit Windows says 'x86' and the real machine
+# architecture is in PROCESSOR_ARCHITEW6432. Prefer the latter when it is set,
+# which is exactly the WOW64 case. An arm64 host running an emulated x64
+# PowerShell likewise reports AMD64 and gets the x64 build — which is the one
+# that runs correctly in that process tree.
+$procArch = if ($env:PROCESSOR_ARCHITEW6432) { $env:PROCESSOR_ARCHITEW6432 } else { $env:PROCESSOR_ARCHITECTURE }
+$triple = switch ($procArch) {
+    'AMD64' { 'x86_64-pc-windows-msvc' }
+    'ARM64' { 'aarch64-pc-windows-msvc' }
+    default {
+        throw "bugsee-cli install error: unsupported Windows architecture '$procArch' (x86_64/AMD64 and ARM64 are published)"
+    }
 }
-$triple = 'x86_64-pc-windows-msvc'
 
 if (-not $Version) {
     $Version = (Invoke-RestMethod -Uri "$Base/latest/version.txt").Trim()

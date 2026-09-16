@@ -4,22 +4,22 @@ name: Publish to npm
 # trust target on every published package's npmjs.com settings —
 # `workflow_filename = npm-publish.yml` in npm's Trusted Publisher UI.
 #
-# It publishes SEVEN packages in two independent jobs:
+# It publishes EIGHT packages in two independent jobs:
 #
 #   publish               @bugsee/bugsee-cli — the cargo-dist npm installer,
 #                         one package whose postinstall downloads the binary.
 #                         Taken verbatim from the release asset.
-#   publish-optional-deps @bugsee/cli + the five @bugsee/cli-<platform>
+#   publish-optional-deps @bugsee/cli + the six @bugsee/cli-<platform>
 #                         packages — the binary split per os/cpu behind
 #                         optionalDependencies, assembled by npm/build.mjs
 #                         from the release's binary archives. See npm/README.md.
 #
-# EVERY ONE of those seven names needs its OWN Trusted Publisher entry on
+# EVERY ONE of those eight names needs its OWN Trusted Publisher entry on
 # npmjs.com (repository bugsee/bugsee-cli, workflow npm-publish.yml) before its
 # FIRST publish. That entry lives on a PACKAGE's settings page, so it cannot
 # even be created for a name that has never been published: each new name needs
-# one manual token-auth publish first. There is no API for any of it and nothing
-# here can detect it is missing — a package without one fails at `npm publish`
+# one manual publish first, after which `npm trust github ... --allow-publish`
+# attaches the entry. Nothing here can detect it is missing — a package without one fails at `npm publish`
 # with a 404 on the PUT that reads as though the package does not exist rather
 # than as a missing trust configuration.
 #
@@ -212,7 +212,7 @@ jobs:
           # ANCHORED, unlike the `publish` job's copy above. Unanchored,
           # `^v[0-9]+\.[0-9]+\.[0-9]+` also matches `v1.2.3-rc1`, which would
           # then publish as 1.2.3-rc1 with no `--tag` and MOVE
-          # `dist-tags.latest` onto a prerelease. Here that would hit all six
+          # `dist-tags.latest` onto a prerelease. Here that would hit all seven
           # packages at once, so prereleases are matched explicitly and routed
           # to `next` rather than silently treated as stable. The same latent
           # bug in the `publish` job above is deliberately left alone: that is
@@ -283,7 +283,7 @@ jobs:
             --pattern 'bugsee-cli-*-*.zip.sha256'
           ls -la release-assets/
 
-      - name: Assemble the six packages
+      - name: Assemble the seven packages
         # No `--allow-missing`: if a target's asset is absent (a build leg
         # failed, or `targets` changed without `dist generate`), this must
         # fail here rather than publish a family whose front package pins an
@@ -298,7 +298,7 @@ jobs:
             'echo "--- $1"; cat "$1"' _ {} \;
 
       - name: Publish via OIDC
-        # ORDER IS LOAD-BEARING: the five platform packages first, the front
+        # ORDER IS LOAD-BEARING: the six platform packages first, the front
         # package last. npm skips an unresolvable optional dependency
         # SILENTLY, so publishing @bugsee/cli first opens a window in which
         # `npm install @bugsee/cli` succeeds with no binary at all and only
@@ -317,7 +317,7 @@ jobs:
         # cause, re-run the workflow, and it picks up where it stopped.
         #
         # Each `npm publish` mints its own OIDC token; trust on npmjs.com maps
-        # (repo, workflow filename) -> package, so EVERY ONE of the six
+        # (repo, workflow filename) -> package, so EVERY ONE of the seven
         # packages needs a Trusted Publisher configured for `npm-publish.yml`,
         # AND must already exist on the registry for that setting to be
         # reachable. Read npm/README.md#first-publish-bootstrap before the
