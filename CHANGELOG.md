@@ -52,8 +52,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   again.
 
 [#19]: https://github.com/bugsee/bugsee-cli/issues/19
-[#28]: https://github.com/bugsee/bugsee-cli/issues/28
 [#20]: https://github.com/bugsee/bugsee-cli/issues/20
+[#28]: https://github.com/bugsee/bugsee-cli/issues/28
 
 
 ## [0.7.6] - 2026-09-16

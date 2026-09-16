@@ -156,15 +156,16 @@ pub(crate) fn env_map() -> std::collections::HashMap<String, String> {
 /// - `xcode post-action` — the iOS post-action context, where the archive must
 ///   return fast. `--force-foreground` opts back into synchronous execution so
 ///   a size-check FAIL can gate CI.
-/// - `xcode upload-dsyms` in no-fail mode — having accepted that failures go
-///   unseen, nothing is left for the build to wait on. In STRICT mode it stays
-///   foreground: a detached daemon's exit code reaches nobody.
+/// - `xcode upload-dsyms` in BACKGROUND mode, which no-fail selects by default
+///   but `--no-background` / `BUGSEE_DSYM_UPLOAD_BACKGROUND=0` turns off. Strict
+///   mode can never be backgrounded — a detached daemon's exit code reaches
+///   nobody, so that combination is refused rather than honoured.
 ///
 /// Every other command, including the user-facing `debug-files upload` (which a
 /// developer may run directly from a terminal), stays in the foreground.
 /// Always `false` on non-unix (no `fork`).
 pub fn should_daemonize(cli: &Cli) -> bool {
-    // Read ONLY the one variable this decision depends on, and with `var_os`.
+    // Read only the variables this decision depends on, and with `var_os`.
     //
     // `std::env::vars()` PANICS on a non-UTF-8 key or value anywhere in the
     // environment, and this function runs for EVERY subcommand before anything
@@ -172,21 +173,34 @@ pub fn should_daemonize(cli: &Cli) -> bool {
     // `dsym uuid` into exit 101, a code outside the documented contract
     // entirely. Plenty of real environments carry a non-Unicode variable that
     // is none of this CLI's business.
-    const NO_FAIL: &str = "BUGSEE_DSYM_UPLOAD_NO_FAIL";
-    let mut env = std::collections::HashMap::new();
-    if let Some(v) = std::env::var_os(NO_FAIL).and_then(|v| v.into_string().ok()) {
-        env.insert(NO_FAIL.to_string(), v);
-    }
+    // EVERY variable the decision depends on. Copying a subset is worse than
+    // copying none: it silently answers a different question than `dispatch`
+    // does, and the resolver cannot tell that its input was truncated. Omitting
+    // BUGSEE_DSYM_UPLOAD_BACKGROUND here made `NO_FAIL=1 BACKGROUND=0` detach
+    // anyway, so the CI case worked through flags and not through env vars.
+    const KEYS: &[&str] = &[
+        "BUGSEE_DSYM_UPLOAD_NO_FAIL",
+        "BUGSEE_DSYM_UPLOAD_BACKGROUND",
+    ];
+    let env: std::collections::HashMap<String, String> = KEYS
+        .iter()
+        .filter_map(|k| {
+            std::env::var_os(k)
+                .and_then(|v| v.into_string().ok())
+                .map(|v| ((*k).to_string(), v))
+        })
+        .collect();
     should_daemonize_with_env(cli, &env)
 }
 
 /// [`should_daemonize`] over an explicit environment, so the decision is
 /// unit-testable without mutating the process environment.
 ///
-/// It needs the environment because `upload-dsyms`'s no-fail mode is settable
-/// EITHER by `--no-fail` or by `BUGSEE_DSYM_UPLOAD_NO_FAIL`, and the two must
-/// reach the same decision — a foreground run that also never fails is the one
-/// combination with no use case.
+/// It needs the environment because both of `upload-dsyms`'s decisions are
+/// settable by flag OR by env var, and this must reach the same answer as
+/// `dispatch` does after the runtime starts. Both call
+/// `resolve_upload_dsyms_mode`; what differs is only how the environment gets
+/// here, which is exactly where the two last diverged.
 fn should_daemonize_with_env(cli: &Cli, env: &std::collections::HashMap<String, String>) -> bool {
     if !cfg!(unix) {
         return false;

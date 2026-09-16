@@ -200,7 +200,7 @@ report is unreadable:
 | --- | --- | --- |
 | Uploaded, or nothing to upload | `0` | continues |
 | A bundle could not be read or packed | `10` / `11` | **fails** |
-| Missing / rejected app token | `20` / `21` | **fails** |
+| Missing / rejected app token, or a refused flag combination from the environment | `20` / `21` | **fails** |
 | Server error / network failure | `30` / `31` | **fails** |
 
 "Nothing to upload" — no dSYM folder, or a folder with no `.dSYM` bundles — is a
@@ -219,7 +219,7 @@ invocation back.
 | *(default)* | yes | yes |
 | `--no-fail` | no | no — detaches |
 | `--no-fail --no-background` | no | **yes** |
-| `--fail --background` | *refused* | — |
+| `--fail --background` | *refused* — exit `2` (flags) or `20` (env) | — |
 
 `--no-fail --no-background` is usually what CI wants: never break the build, but
 still wait, so a runner tearing down its process tree the moment `xcodebuild`

@@ -120,9 +120,8 @@ Environment variables (read from the Xcode build environment):
                            failures are fatal -- a detached exit code reaches
                            nobody -- and that combination is refused with exit
                            20 rather than silently ignored.
-  PROJECT_TEMP_DIR         Where the detached run writes its log, in no-fail
-                           mode only. Xcode sets this; falls back to the system
-                           temp dir.
+  PROJECT_TEMP_DIR         Where a DETACHED run writes its log. Xcode sets
+                           this; falls back to the system temp dir.
   BUGSEE_APP_TOKEN         App token (or pass --app-token).
   BUGSEE_ENDPOINT          API endpoint (or pass --endpoint).
 
@@ -131,8 +130,10 @@ Exit codes:
   0        Uploaded, or there was nothing to upload (no dSYM folder, or no
            .dSYM bundles in it). Both are reported as warnings.
   10 / 11  A bundle could not be read or packed (unreadable DWARF, disk full).
-  20 / 21  Missing or rejected app token.
+  20 / 21  Missing or rejected app token; also a refused failure/detach
+           combination arriving through the environment.
   30 / 31  Server error / network failure.
+  2        A refused failure/detach combination given as FLAGS (argv error).
 
 With --no-fail (or BUGSEE_DSYM_UPLOAD_NO_FAIL) every non-zero code becomes 0.
 
@@ -1436,6 +1437,25 @@ async fn upload_dsyms_strict(
     endpoint: &str,
     app_token: Option<&str>,
 ) -> anyhow::Result<()> {
+    // Before concluding "no folder": a CONFIGURED path we cannot reach is a
+    // failure, not an absence. `resolve_dsym_folder` tests `is_dir()`, which is
+    // false both for "does not exist" and for "an ancestor denied us the
+    // lookup" — the second is a sandbox symptom and must not read as the first.
+    let configured = trimmed(env, "DWARF_DSYM_FOLDER_PATH");
+    if !configured.is_empty() {
+        if let Err(e) = std::fs::metadata(configured) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(Error::InputNotFound(format!(
+                    "cannot reach the configured dSYM folder {configured}: {e} — if this is a \
+                     Run Script build phase, Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING \
+                     to YES, which blocks it; set it to NO on the target, or declare the \
+                     folder in the phase's input file lists"
+                ))
+                .into());
+            }
+        }
+    }
+
     // "Nothing to upload" #1: no folder to look in. A build phase on a target
     // that produces no debug symbols is a normal, correct state.
     let folder = match resolve_dsym_folder(env) {
@@ -1461,7 +1481,7 @@ async fn upload_dsyms_strict(
     // sandbox denies the directory LISTING, not the DWARF parse, so it would
     // otherwise never reach the "could not read a bundle" path below and would
     // exit 0 on this command's single most likely real failure.
-    if let Err(e) = std::fs::read_dir(&folder) {
+    if let Err(e) = probe_dsym_folder(&folder) {
         return Err(Error::InputNotFound(format!(
             "cannot read the dSYM folder {}: {e} — if this is a Run Script build \
              phase, Xcode 15+ defaults ENABLE_USER_SCRIPT_SANDBOXING to YES, which \
@@ -1473,6 +1493,35 @@ async fn upload_dsyms_strict(
     }
 
     let candidates = debug_files::discover_dsyms(std::slice::from_ref(&folder));
+
+    // A `*.dSYM` we can see but discovery rejected was almost certainly
+    // unreadable rather than malformed: `is_dsym_bundle` tests
+    // `Contents/Resources/DWARF.is_dir()`, which is false without search
+    // permission on the bundle. Such a bundle is dropped BEFORE `skipped` can
+    // count it, so without this it vanishes — the app-plus-extension case where
+    // the app uploads and the build goes green.
+    let dropped: Vec<PathBuf> = std::fs::read_dir(&folder)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("dSYM"))
+        .filter(|p| !candidates.contains(p))
+        .collect();
+    if !dropped.is_empty() {
+        return Err(input_invalid(format!(
+            "{} .dSYM bundle(s) under {} could not be read and were NOT uploaded: {} \
+             (unreadable under ENABLE_USER_SCRIPT_SANDBOXING, or a truncated bundle \
+             with no Contents/Resources/DWARF)",
+            dropped.len(),
+            folder.display(),
+            dropped
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", "),
+        )));
+    }
     if candidates.is_empty() {
         tracing::warn!(
             folder = %folder.display(),
@@ -1492,12 +1541,15 @@ async fn upload_dsyms_strict(
     // through as Some(""). Without this it POSTs to `/apps//symbols`, burns the
     // retry budget, and exits 31 — a network error for what is a misconfigured
     // token.
-    let app_token = app_token.filter(|t| !t.trim().is_empty()).ok_or_else(|| {
-        config_invalid(
-            "--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms` \
+    let app_token = app_token
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or_else(|| {
+            config_invalid(
+                "--app-token (or BUGSEE_APP_TOKEN) is required for `xcode upload-dsyms` \
              and must not be empty",
-        )
-    })?;
+            )
+        })?;
 
     // Version/build are best-effort metadata: the `.app` is not always locatable
     // from a build phase, and the server tolerates empty strings. Never fatal —
@@ -1531,7 +1583,7 @@ async fn upload_dsyms_strict(
     // exists to prevent. Triggers: a truncated or partially-written dSYM, an
     // empty Contents/Resources/DWARF, or DWARF unreadable under
     // ENABLE_USER_SCRIPT_SANDBOXING.
-    if summary.skipped > 0 && !summary.dry_run {
+    if summary.skipped > 0 {
         return Err(input_invalid(format!(
             "{} of {} dSYM bundle(s) under {} could not be read, so those symbols \
              were NOT uploaded (a truncated dSYM, an empty \
@@ -1549,6 +1601,19 @@ async fn upload_dsyms_strict(
         skipped = summary.skipped,
         "Bugsee: dSYM upload complete"
     );
+    Ok(())
+}
+
+/// Can we actually enumerate this folder?
+///
+/// `read_dir` succeeding is NOT enough: a folder that is readable but not
+/// searchable (mode 0444) opens fine and then fails on every entry, which
+/// `WalkDir`'s `filter_map(Result::ok)` turns into "empty". Draining the
+/// iterator here surfaces that as the error it is.
+fn probe_dsym_folder(folder: &Path) -> std::io::Result<()> {
+    for entry in std::fs::read_dir(folder)? {
+        entry?;
+    }
     Ok(())
 }
 
@@ -1758,6 +1823,102 @@ mod tests {
         );
     }
 
+    /// The folder LISTS but its entries cannot be stat'd (mode 0444: readable,
+    /// not searchable). `read_dir` succeeds, so the guard above passes, and
+    /// `WalkDir`'s `filter_map(Result::ok)` then silently drops every child —
+    /// "nothing to upload", exit 0, symbols lost.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_folder_whose_entries_cannot_be_read_fails_the_build() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("dsyms");
+        std::fs::create_dir_all(folder.join("App.dSYM/Contents/Resources/DWARF")).unwrap();
+        std::fs::write(folder.join("App.dSYM/Contents/Resources/DWARF/App"), b"x").unwrap();
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o444)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&folder, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "a folder we cannot look into must not read as empty"
+        );
+    }
+
+    /// One bundle in the folder is unreadable, so `is_dsym_bundle` rejects it
+    /// before `skipped` can count it. That is the app-plus-extension shape
+    /// again: the readable bundle uploads and the build goes green.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreadable_bundle_is_not_silently_dropped() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let folder = tmp.path().join("dsyms");
+        std::fs::create_dir_all(&folder).unwrap();
+        let widget = folder.join("Widget.dSYM");
+        std::fs::create_dir_all(widget.join("Contents/Resources/DWARF")).unwrap();
+        std::fs::set_permissions(&widget, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&widget, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "an unreadable .dSYM must not vanish from the count"
+        );
+    }
+
+    /// An ANCESTOR of the dSYM folder is unreadable, so `resolve_dsym_folder`'s
+    /// `is_dir()` is false and it reports "no dSYM folder" — the read_dir guard
+    /// is never even reached.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn an_unreachable_folder_is_not_reported_as_absent() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let outer = tmp.path().join("outer");
+        let folder = outer.join("dsyms");
+        std::fs::create_dir_all(folder.join("App.dSYM/Contents/Resources/DWARF")).unwrap();
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let r = upload_dsyms_strict(&env, "https://example.invalid", Some("TKN")).await;
+        std::fs::set_permissions(&outer, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            r.is_err(),
+            "a configured folder we cannot reach is a failure, not an absence"
+        );
+    }
+
+    /// Whitespace is filtered as insignificant, so it must not survive into the
+    /// URL: `" TKN "` would POST to `/apps/%20TKN%20/symbols`.
+    #[tokio::test]
+    async fn a_padded_app_token_is_trimmed_not_just_accepted() {
+        use wiremock::matchers::{method, path as wm_path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = MockServer::start().await;
+        // Only the TRIMMED path is mounted: a padded token that reaches the URL
+        // verbatim hits no mock and fails the expectation.
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "error": { "type": "ApplicationNotFoundError", "message": "x" }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        let _ = upload_dsyms_strict(&env, &server.uri(), Some("  TKN  ")).await;
+    }
+
     /// An unreadable dSYM FOLDER is the Xcode 15+ sandboxing case this command
     /// documents — and the sandbox denies the directory listing, not the DWARF
     /// parse, so it never reaches the "could not read any bundle" path. It must
@@ -1786,6 +1947,23 @@ mod tests {
     /// Xcode writes `KEY=""` when the value field is left blank, so an empty
     /// token is a REALISTIC misconfiguration — and it must be reported as one
     /// (exit 20) rather than as whatever the server says about `/apps//symbols`.
+    /// Whitespace-only counts as empty. `BUGSEE_APP_TOKEN=" "` otherwise POSTs
+    /// to `/apps/%20/symbols`, burns the retry budget and exits 31 — reporting
+    /// a network failure for a misconfigured token.
+    #[tokio::test]
+    async fn a_whitespace_only_app_token_is_a_config_error_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        fake_dsym(tmp.path(), "App");
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", tmp.path().to_str().unwrap())]);
+        let err = upload_dsyms_strict(&env, "https://example.invalid", Some("   "))
+            .await
+            .expect_err("a whitespace-only token must fail");
+        assert_eq!(
+            exit_code_of(&err),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+    }
+
     #[tokio::test]
     async fn an_empty_app_token_is_a_config_error_not_a_network_error() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2181,10 +2359,27 @@ mod tests {
 
     #[test]
     fn a_blank_env_value_is_unset_not_enabled() {
-        // Xcode writes KEY="" for a blank value field.
+        // Xcode writes KEY="" for a blank value field. BOTH variables need
+        // this: BACKGROUND="" reaching env_truthy as "falsey" would pin the
+        // upload to the foreground and silently cancel --no-fail's detaching.
         let m = mode(None, None, &[("BUGSEE_DSYM_UPLOAD_NO_FAIL", "")]).unwrap();
         assert!(m.fail_on_error);
         assert!(!m.background);
+
+        let m = mode(
+            None,
+            None,
+            &[
+                ("BUGSEE_DSYM_UPLOAD_NO_FAIL", "1"),
+                ("BUGSEE_DSYM_UPLOAD_BACKGROUND", ""),
+            ],
+        )
+        .unwrap();
+        assert!(!m.fail_on_error);
+        assert!(
+            m.background,
+            "a blank BACKGROUND is UNSET, so it must fall back to the failure policy"
+        );
     }
 
     #[test]
