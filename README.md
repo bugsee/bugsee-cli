@@ -170,12 +170,16 @@ Embeds a deterministic, content-derived UUIDv5 debug-id into JS bundles
 paired `.map` (`debug_id` + `debugId`). Idempotent. Upload the injected maps
 through `debug-files upload --type sourcemaps`.
 
-When the upload scans a directory, a map with no debug-id that no JS bundle
-points at — an extracted-CSS map, a `.d.ts.map` — is skipped with a warning,
-because `inject` never stamps those. A bundle's own map without one is still an
-error (inject did not run), and so is a scan that finds nothing uploadable. A
-map the server already has is skipped and the batch continues, so rebuilding an
-app with unchanged chunks uploads only the changed ones.
+The debug-id is derived from the bundle's bytes and its map's, so a map that
+changes under byte-identical minified JS still gets a new id (and uploads).
+
+When the upload scans a directory, maps named as stylesheet or type-declaration
+maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped: they
+never carry a debug-id. Any other map without one fails the run before anything
+is uploaded — inject did not stamp that bundle — and so does a scan that leaves
+nothing to upload. A map the server already has is skipped and the batch
+continues, so rebuilding an app with unchanged chunks uploads only the changed
+ones; `--force` re-uploads it anyway.
 
 ```
 bugsee-cli sourcemaps inject <paths>... [--dry-run]

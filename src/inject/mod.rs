@@ -1,7 +1,8 @@
 //! Debug-ID injection for source maps.
 //!
 //! Implements the deterministic-UUID scheme: each JS bundle gets a UUIDv5 derived from
-//! the file's content (so re-bundling identical code produces the same id), appended
+//! the file's content AND its paired map's (so re-bundling identical code produces the
+//! same id, and a map that changed under identical code gets a new one), appended
 //! as `//# debugId=<uuid>` plus a runtime stub that registers the id with
 //! `globalThis._bugseeDebugIds` keyed by `Error().stack`. The matching `.map` file is
 //! rewritten to embed `"debug_id": "<uuid>"` and `"debugId": "<uuid>"` (both keys for
@@ -16,7 +17,6 @@
 //! legacy top-level `uuid` fallback); `debug-files upload --type sourcemaps` reads the
 //! id back via [`read_debug_id`].
 
-use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use uuid::Uuid;
@@ -24,7 +24,8 @@ use uuid::Uuid;
 use crate::error::{Error, Result};
 
 /// Fixed namespace for Bugsee sourcemap debug-ids — keeps UUIDv5 generation
-/// stable across runs and machines (deterministic from bundle content alone).
+/// stable across runs and machines (deterministic from the bundle's content and
+/// its paired map's).
 const DEBUG_ID_NAMESPACE: Uuid = Uuid::from_bytes([
     0xb0, 0x95, 0xee, 0x5e, 0x53, 0x00, 0x4d, 0xa9, 0x8a, 0x05, 0x04, 0xde, 0xb0, 0x6a, 0x90, 0x01,
 ]);
@@ -35,10 +36,31 @@ const DEBUG_ID_COMMENT_PREFIX: &str = "//# debugId=";
 
 const SOURCE_MAPPING_URL_PREFIX: &str = "//# sourceMappingURL=";
 
-/// Content-derived debug-id (UUIDv5 over the bundle bytes) — deterministic, so
-/// identical bundles always get the same id and CI re-runs are stable.
+/// Content-derived debug-id (UUIDv5 over the bundle bytes alone) — deterministic,
+/// so identical bundles always get the same id and CI re-runs are stable. What
+/// `inject` assigns a bundle that HAS a map is [`compute_debug_id_with_map`].
 pub fn compute_debug_id(content: &[u8]) -> Uuid {
     Uuid::new_v5(&DEBUG_ID_NAMESPACE, content)
+}
+
+/// The debug-id `inject` assigns: over the bundle AND its paired map when it has
+/// one, over the bundle alone when it has none ([`compute_debug_id`]).
+///
+/// The map is part of the identity because the server dedups source maps by id
+/// alone. A minifier routinely emits byte-identical JS for a source edit that
+/// moves original lines, and a bundle-only id then kept the STALE map on the
+/// server while the upload reported the new one as already there. The bundle's
+/// length is hashed ahead of it, so the boundary between the two inputs cannot
+/// shift without changing the id.
+pub fn compute_debug_id_with_map(bundle: &[u8], map: Option<&[u8]>) -> Uuid {
+    let Some(map) = map else {
+        return compute_debug_id(bundle);
+    };
+    let mut input = Vec::with_capacity(8 + bundle.len() + map.len());
+    input.extend_from_slice(&(bundle.len() as u64).to_le_bytes());
+    input.extend_from_slice(bundle);
+    input.extend_from_slice(map);
+    Uuid::new_v5(&DEBUG_ID_NAMESPACE, &input)
 }
 
 /// The runtime stub appended to each JS bundle. On load it registers
@@ -69,14 +91,6 @@ pub struct InjectStats {
     pub maps_updated: u32,
 }
 
-/// Whether `inject` treats this file as a JS bundle (`.js`/`.cjs`/`.mjs`).
-fn is_js_bundle(path: &Path) -> bool {
-    matches!(
-        path.extension().and_then(|e| e.to_str()),
-        Some("js") | Some("cjs") | Some("mjs")
-    )
-}
-
 /// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`.
 pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
     let mut stats = InjectStats::default();
@@ -86,7 +100,14 @@ pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
             .filter_map(|e| e.ok())
         {
             let p = entry.path();
-            if p.is_file() && is_js_bundle(p) {
+            if !p.is_file() {
+                continue;
+            }
+            let is_js = matches!(
+                p.extension().and_then(|e| e.to_str()),
+                Some("js") | Some("cjs") | Some("mjs")
+            );
+            if is_js {
                 inject_one(p, dry_run, &mut stats)?;
             }
         }
@@ -94,41 +115,9 @@ pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
     Ok(stats)
 }
 
-/// The `.map` files that `inject` would stamp under `paths`: each JS bundle's
-/// paired map, resolved exactly as [`inject_paths`] resolves it. Canonicalized,
-/// so a caller can compare them against paths it reached another way.
-///
-/// This is what lets an upload tell a bundle's map that is MISSING its debug-id
-/// (inject did not run — an error) from a map no bundle points at, such as an
-/// extracted-CSS map or a `.d.ts.map`, which inject never stamps by design.
-pub fn bundle_maps(paths: &[PathBuf]) -> HashSet<PathBuf> {
-    let mut out = HashSet::new();
-    for root in paths {
-        for entry in walkdir::WalkDir::new(root)
-            .into_iter()
-            .filter_map(|e| e.ok())
-        {
-            let p = entry.path();
-            if !(p.is_file() && is_js_bundle(p)) {
-                continue;
-            }
-            // A bundle that cannot be read as text cannot be injected either, so
-            // it contributes no map — the same outcome inject would reach.
-            let Ok(content) = std::fs::read_to_string(p) else {
-                continue;
-            };
-            if let Some(map) = paired_map(p, &content) {
-                if let Ok(canonical) = std::fs::canonicalize(&map) {
-                    out.insert(canonical);
-                }
-            }
-        }
-    }
-    out
-}
-
 fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {
     let content = std::fs::read_to_string(js_path)?;
+    let map_path = paired_map(js_path, &content);
 
     let debug_id = match existing_debug_id(&content) {
         Some(id) => {
@@ -136,7 +125,8 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
             id
         }
         None => {
-            let id = compute_debug_id(content.as_bytes());
+            let map_bytes = map_path.as_deref().map(std::fs::read).transpose()?;
+            let id = compute_debug_id_with_map(content.as_bytes(), map_bytes.as_deref());
             if !dry_run {
                 std::fs::write(js_path, format!("{content}{}", runtime_stub(&id)))?;
             }
@@ -146,7 +136,7 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
         }
     };
 
-    if let Some(map_path) = paired_map(js_path, &content) {
+    if let Some(map_path) = map_path {
         if write_map_debug_id(&map_path, &debug_id, dry_run)? {
             stats.maps_updated += 1;
             tracing::debug!(path = %map_path.display(), debug_id = %debug_id, "wrote debug_id into map");
@@ -277,6 +267,61 @@ mod tests {
         let c = compute_debug_id(b"console.log(2)");
         assert_eq!(a, b, "same content -> same id");
         assert_ne!(a, c, "different content -> different id");
+    }
+
+    /// The id must change when the MAP changes, not only the bundle. A minifier
+    /// routinely emits byte-identical JS for a source edit that moves original
+    /// lines (a comment added above a function); the map then differs. The
+    /// server dedups source maps by id alone, so a bundle-only id kept the
+    /// STALE map there — and the upload reported the new one as already present.
+    #[test]
+    fn a_changed_map_under_an_unchanged_bundle_gets_a_new_debug_id() {
+        let inject_with_map = |map: &str| {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("app.js"), "console.log(1)\n").unwrap();
+            std::fs::write(dir.path().join("app.js.map"), map).unwrap();
+            inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            read_debug_id(&dir.path().join("app.js.map"))
+                .unwrap()
+                .unwrap()
+        };
+        let before = inject_with_map(r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#);
+        let same = inject_with_map(r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#);
+        let moved = inject_with_map(r#"{"version":3,"sources":["a.ts"],"mappings":"AACA"}"#);
+        assert_eq!(before, same, "same bundle + same map -> same id");
+        assert_ne!(before, moved, "same bundle + changed map -> new id");
+    }
+
+    #[test]
+    fn a_bundle_without_a_map_is_keyed_by_its_own_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let injected = std::fs::read_to_string(&js).unwrap();
+        assert_eq!(
+            existing_debug_id(&injected).unwrap(),
+            compute_debug_id(b"console.log(1)\n").to_string()
+        );
+    }
+
+    #[test]
+    fn the_map_bytes_change_the_id_but_the_bundle_bytes_still_do_too() {
+        let bundle_a = compute_debug_id_with_map(b"console.log(1)", Some(b"{}"));
+        let bundle_b = compute_debug_id_with_map(b"console.log(2)", Some(b"{}"));
+        let map_b = compute_debug_id_with_map(b"console.log(1)", Some(b"{ }"));
+        assert_ne!(bundle_a, bundle_b);
+        assert_ne!(bundle_a, map_b);
+        // The boundary between the two inputs is part of the hash: moving bytes
+        // from the end of the bundle to the start of the map is a different pair.
+        assert_ne!(
+            compute_debug_id_with_map(b"ab", Some(b"c")),
+            compute_debug_id_with_map(b"a", Some(b"bc"))
+        );
+        assert_ne!(
+            compute_debug_id_with_map(b"console.log(1)", Some(b"")),
+            compute_debug_id_with_map(b"console.log(1)", None)
+        );
     }
 
     #[test]
