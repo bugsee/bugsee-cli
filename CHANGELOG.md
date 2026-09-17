@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.8] - 2026-09-17
+
 ### Fixed
 - **Re-uploading a symbol the server already has no longer fails.** The
   appserver answers a duplicate with HTTP 200 and the code nested in its error
@@ -22,7 +24,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   deduping it, so those never received the duplicate reply (any subtype —
   Flutter, React Native, Unity, KMP, Cordova, Xamarin, .NET — and every
   non-Android app does).
-  Visible effects beyond `debug-files upload`:
+  See [#35]. Visible effects beyond `debug-files upload`:
   - `xcode upload-dsyms` no longer **fails the Xcode build** on every rebuild
     whose dSYM is unchanged.
   - `xcode post-action` now reports `dsym_uploaded: true` when every dSYM was
@@ -62,6 +64,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`debug-files upload --type sourcemaps --force`** now asks the server to
   replace a map it already has (`overwrite`), as it already did for dSYM, PDB,
   Rust and IL2CPP line maps.
+
+[#35]: https://github.com/bugsee/bugsee-cli/pull/35
 
 ## [0.7.7] - 2026-09-16
 
