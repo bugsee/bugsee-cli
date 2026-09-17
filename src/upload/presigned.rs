@@ -153,7 +153,10 @@ pub async fn register(
     tracing::debug!(url = %http::redact_url(&metadata_url), ?metadata, "POST metadata");
     // The POST is NOT retried on a retriable status (the server may have created
     // the symbol record, so a status-retry could double-create); transport
-    // retries are safe — the server dedups by hash/uuid. Telemetry header lands
+    // retries are safe for a symbol that already reached `ready` — the server
+    // dedups by declared uuid + format among READY records (not by `hash`), so a
+    // retry landing while the first attempt's record is still `uploading` can
+    // leave a second record. Telemetry header lands
     // on the POST only — the presigned PUT goes to S3, whose signature is bound
     // to a specific header set; extras there trigger SignatureDoesNotMatch.
     let post_resp = http::send_with_retry(policy, "symbol metadata POST", false, || {
@@ -436,8 +439,9 @@ mod tests {
 
     /// The appserver's real duplicate answer: HTTP 200 (`error.router.js`
     /// `onError`) with the code NESTED inside `error` by `app.utils.js` `error()`
-    /// — `code: err.offset + err.code` = 16000 + 4 — never at the top level. Matching only a top-level `code` made every re-upload of an
-    /// unchanged artifact a hard failure (exit 30) that aborted the whole batch.
+    /// — `code: err.offset + err.code` = 16000 + 4 — never at the top level.
+    /// Matching only a top-level `code` made every re-upload of an unchanged
+    /// artifact a hard failure (exit 30) that aborted the whole batch.
     #[tokio::test]
     async fn register_recognises_the_appservers_nested_duplicate_envelope() {
         let reg = register_against(serde_json::json!({

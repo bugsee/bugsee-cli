@@ -351,7 +351,9 @@ def main():
     results["sourcemaps_uninjected_bundle_map_exits_11"] = run(
         binpath, "sourcemaps_uninjected",
         ["debug-files", "upload", "--type", "sourcemaps", os.path.join(fix, "web-uninjected")] + v,
-        expect_code=11, expect_stderr="main.js.map")
+        # The ERROR must name the map: the INFO "processing source map path=…" line
+        # already contains the path, so matching the bare file name proves nothing.
+        expect_code=11, expect_stderr="main.js.map — nothing was uploaded")
     results["sourcemaps_uninjected_uploads_nothing"] = not os.path.exists(
         cappath("sourcemaps_uninjected__symbols_posts.jsonl"))
 

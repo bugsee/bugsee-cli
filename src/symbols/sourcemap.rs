@@ -7,8 +7,8 @@
 //! `symbolfiles/sourcemap.py:parse` exactly — so the upload key and the ingest
 //! key are guaranteed identical.
 //!
-//! The wire `hash` is SHA-1 of the raw `.map` bytes (server-side dedup),
-//! matching the ELF / ProGuard convention.
+//! The wire `hash` is SHA-1 of the raw `.map` bytes, matching the ELF / ProGuard
+//! convention (the appserver dedups by uuid + format, not by this hash).
 
 use sha1::{Digest as _, Sha1};
 use std::path::Path;
@@ -32,7 +32,8 @@ pub struct SourcemapIdentity {
     /// when the map carries no id (caller must `sourcemaps inject` first or
     /// pass `--uuid`).
     pub debug_id: Option<String>,
-    /// SHA-1 hex of the `.map` bytes — server uses this for dedup.
+    /// SHA-1 hex of the `.map` bytes, sent as the wire `hash`. The appserver does
+    /// NOT dedup on it today (it matches the declared uuid + format).
     pub content_sha1_hex: String,
     /// File size in bytes; logged for diagnostics.
     pub size_bytes: u64,
