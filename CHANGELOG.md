@@ -42,7 +42,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   as its own bytes.** The server dedups source maps by id alone, and a minifier
   routinely emits byte-identical JS for a source edit that moves original lines,
   so a bundle-only id kept the STALE map on the server — silently, now that a
-  duplicate is a success. A bundle with no map keeps its bundle-only id. Ids are
+  duplicate is a success. That includes webpack 5's default rebuild with
+  `[contenthash]` filenames: the JS is kept on disk unchanged — still carrying
+  its stub and old id — and only the map is re-emitted, so `inject` now
+  re-keys a bundle whose OWN stub is present when its map comes back without an
+  id and with different content (`js_restamped` in the log). A `//# debugId=`
+  another tool wrote is never re-keyed. A bundle with no map keeps its
+  bundle-only id. Ids are
   never recomputed downstream (the runtime and the worker both read the embedded
   id), so nothing else changes — except that, once, after upgrading, every
   bundle that has a map gets a new id and its map uploads again. When a bundle

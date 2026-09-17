@@ -171,7 +171,9 @@ paired `.map` (`debug_id` + `debugId`). Idempotent. Upload the injected maps
 through `debug-files upload --type sourcemaps`.
 
 The debug-id is derived from the bundle's bytes and its map's, so a map that
-changes under byte-identical minified JS still gets a new id (and uploads).
+changes under byte-identical minified JS still gets a new id (and uploads) —
+including when the bundler keeps an already-stamped bundle on disk and re-emits
+only its map (webpack `[contenthash]`): `inject` re-keys that bundle.
 
 When the upload scans a directory, maps named as stylesheet or type-declaration
 maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped: they

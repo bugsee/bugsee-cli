@@ -35,6 +35,7 @@ pub async fn dispatch(
             tracing::info!(
                 js_injected = stats.js_injected,
                 js_already_injected = stats.js_already,
+                js_restamped = stats.js_restamped,
                 maps_updated = stats.maps_updated,
                 dry_run,
                 "sourcemaps inject complete"
