@@ -16,10 +16,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `debug-files upload` over a directory stopped there: the second production
   build of a web app with one unchanged chunk could not upload its changed ones.
   The fix is in the shared presigned client, so it reaches every format that
-  registers through it — dSYM, PDB, Rust, IL2CPP line maps and source maps, and
-  ProGuard / ELF uploads for apps the server dedups (Flutter, React Native and
-  Unity subtypes, and non-Android apps; a plain Android app's mapping is
-  re-registered rather than deduped, so it never received the duplicate reply).
+  registers through it: dSYM, PDB, Rust, IL2CPP line maps, source maps, ProGuard
+  and ELF. One exception on the server side: for an Android app with NO subtype,
+  the appserver re-registers every ProGuard, ELF and source-map upload instead of
+  deduping it, so those never received the duplicate reply (any subtype —
+  Flutter, React Native, Unity, KMP, Cordova, Xamarin, .NET — and every
+  non-Android app does).
   Visible effects beyond `debug-files upload`:
   - `xcode upload-dsyms` no longer **fails the Xcode build** on every rebuild
     whose dSYM is unchanged.
@@ -29,8 +31,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   map.** In a scanned directory, maps named as stylesheet or type-declaration
   maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped without
   being read, instead of failing every other map with exit `11`. Any other map
-  without a debug-id still fails the run — now BEFORE anything is uploaded, so a
-  failed run no longer leaves a partial upload — as does a map named explicitly
+  without a debug-id still fails the run — now BEFORE anything is uploaded, so
+  that failure no longer leaves a partial upload (a network or server error
+  mid-batch still can) — as does a map named explicitly
   on the command line and a scan that leaves nothing to upload. Directory scans
   are processed in sorted order.
 
@@ -41,7 +44,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so a bundle-only id kept the STALE map on the server — silently, now that a
   duplicate is a success. A bundle with no map keeps its bundle-only id. Ids are
   never recomputed downstream (the runtime and the worker both read the embedded
-  id), so nothing else changes.
+  id), so nothing else changes — except that, once, after upgrading, every
+  bundle that has a map gets a new id and its map uploads again. A map that
+  already carries a DIFFERENT id than its bundle (a stamped map left beside a
+  re-emitted bundle) is now rewritten to the bundle's id, with a warning,
+  instead of being left mismatched.
 - **`debug-files upload --type sourcemaps --force`** now asks the server to
   replace a map it already has (`overwrite`), as it already did for dSYM, PDB,
   Rust and IL2CPP line maps.

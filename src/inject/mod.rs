@@ -188,8 +188,14 @@ fn is_contained_relative(url: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// Insert both `debug_id` and `debugId` into a `.map` JSON (no-op if either is
-/// already present). Returns whether the map was changed.
+/// Make a `.map` JSON carry `debug_id` AND `debugId` equal to the bundle's id.
+/// Returns whether the map was changed (a no-op when both already match).
+///
+/// The BUNDLE's id is authoritative — it is what the runtime reports — so a map
+/// holding a different id is rewritten rather than left alone. That happens when
+/// a bundler re-emits the JS without its stub but leaves a previously stamped map
+/// on disk: the fresh id is computed over a map that already carries the old
+/// one, and keeping the old one silently unsymbolicated the bundle.
 fn write_map_debug_id(map_path: &Path, debug_id: &str, dry_run: bool) -> Result<bool> {
     let raw = std::fs::read_to_string(map_path)?;
     let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
@@ -204,11 +210,22 @@ fn write_map_debug_id(map_path: &Path, debug_id: &str, dry_run: bool) -> Result<
             map_path.display()
         ))
     })?;
-    let has = |k: &str, o: &serde_json::Map<String, serde_json::Value>| {
-        o.get(k).and_then(serde_json::Value::as_str).is_some()
+    let current = |k: &str, o: &serde_json::Map<String, serde_json::Value>| {
+        o.get(k)
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
     };
-    if has("debug_id", obj) || has("debugId", obj) {
+    let (snake, camel) = (current("debug_id", obj), current("debugId", obj));
+    if snake.as_deref() == Some(debug_id) && camel.as_deref() == Some(debug_id) {
         return Ok(false);
+    }
+    if let Some(stale) = snake.or(camel).filter(|existing| existing != debug_id) {
+        tracing::warn!(
+            path = %map_path.display(),
+            stale = %stale,
+            debug_id = %debug_id,
+            "source map carried a different debug id than its bundle; rewriting it to the bundle's"
+        );
     }
     obj.insert(
         "debug_id".into(),
@@ -290,6 +307,77 @@ mod tests {
         let moved = inject_with_map(r#"{"version":3,"sources":["a.ts"],"mappings":"AACA"}"#);
         assert_eq!(before, same, "same bundle + same map -> same id");
         assert_ne!(before, moved, "same bundle + changed map -> new id");
+    }
+
+    /// Pinned to values derived INDEPENDENTLY (Python: SHA-1 over the namespace
+    /// bytes + name, version/variant bits set per RFC 4122 §4.3). A refactor that
+    /// changes the encoding — u32 length, big-endian, map before bundle — would
+    /// silently give every bundle a new id and re-upload every map once.
+    #[test]
+    fn the_id_encoding_is_pinned_to_independently_derived_values() {
+        let bundle = b"console.log(1)\n";
+        let map = br#"{"version":3,"mappings":"AAAA"}"#;
+        assert_eq!(
+            compute_debug_id(bundle).to_string(),
+            "9ca80e34-5d30-5aa4-912b-e209b8a484eb"
+        );
+        assert_eq!(
+            compute_debug_id_with_map(bundle, Some(map)).to_string(),
+            "256ca4fa-1d71-5674-9d8a-eb359b60f199"
+        );
+    }
+
+    /// A bundle rewritten without its stub while the previously STAMPED map stays
+    /// on disk: the new id is computed over a map that already carries the old one,
+    /// so the two can never match again. The bundle's id is the one the runtime
+    /// reports, so the map must follow it — leaving the old id there silently
+    /// unsymbolicated that bundle.
+    #[test]
+    fn a_reinjected_bundle_moves_a_stale_map_id_to_the_new_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(
+            &map,
+            r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+
+        // The bundler re-emits the JS (no stub) but leaves the stamped map.
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+
+        let bundle_id = existing_debug_id(&std::fs::read_to_string(&js).unwrap()).unwrap();
+        let map_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&map).unwrap()).unwrap();
+        assert_eq!(map_json["debug_id"].as_str().unwrap(), bundle_id);
+        assert_eq!(map_json["debugId"].as_str().unwrap(), bundle_id);
+        assert_eq!(stats.maps_updated, 1);
+    }
+
+    /// A map that exists but cannot be read fails the run BEFORE the bundle is
+    /// touched — the id depends on the map, so there is nothing sound to write.
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_map_fails_before_the_bundle_is_modified() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(&map, "{}").unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root reads regardless of mode bits; the premise does not hold there.
+        if std::fs::read(&map).is_ok() {
+            eprintln!("skipping: running with permission to read a 000 file");
+            return;
+        }
+        let result = inject_paths(&[dir.path().to_path_buf()], false);
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), "console.log(1)\n");
     }
 
     #[test]

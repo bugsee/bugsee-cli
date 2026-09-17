@@ -47,7 +47,7 @@ bugsee-cli debug-files upload <paths>... \
     [--uuid <UUID>]   # override / IL2CPP module id(s); comma-separate for multi-ABI \
     [--icon <PATH>]   # attach launcher icon to the symbol zip \
     [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
-    [--force]         # re-upload even if the server already has it (dsym/pdb/il2cpp-linemap)
+    [--force]         # re-upload even if the server already has it (dsym/pdb/rust/il2cpp-linemap/sourcemaps)
     [--dry-run]
 ```
 

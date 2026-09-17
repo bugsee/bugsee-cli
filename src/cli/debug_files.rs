@@ -1430,7 +1430,7 @@ async fn run_sourcemap_upload(
     if planned.is_empty() {
         return Err(input_invalid(format!(
             "nothing to upload under {}: all {skipped} source maps are stylesheet or \
-             type-declaration maps (`.css.map`, `.d.ts.map`), which carry no debug id — point the \
+             type-declaration maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`), which carry no debug id — point the \
              upload at the directory holding your JS bundles' maps",
             paths
                 .iter()
@@ -2043,6 +2043,9 @@ mod sourcemap_upload_tests {
             // Only a SUFFIX marks a stylesheet map; these are JS maps.
             (".", "legacy.css.map.js.map"),
             (".", "types.d.ts.mapper.js.map"),
+            // ...and the suffix must be the whole segment, dot included.
+            (".", "precss.map"),
+            (".", "types.ts.map"),
         ] {
             let tmp = tempfile::tempdir().unwrap();
             write(
@@ -2174,8 +2177,6 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 1, "only the changed map is PUT");
     }
 
-    /// A CI re-run of an unchanged build: every map is already there. That is a
-    /// success with nothing transferred, not "nothing uploaded".
     /// The duplicate reply reaches every format through the shared client; this
     /// pins it for a format with its own loop — an unchanged `mapping.txt` on a
     /// CI re-run.
@@ -2213,6 +2214,8 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 0);
     }
 
+    /// A CI re-run of an unchanged build: every map is already there. That is a
+    /// success with nothing transferred, not "nothing uploaded".
     #[tokio::test]
     async fn a_rerun_where_every_map_is_already_on_the_server_succeeds_without_a_put() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2232,6 +2235,56 @@ mod sourcemap_upload_tests {
 
         assert_eq!(posted_ids(&server).await, vec!["did-a", "did-b"]);
         assert_eq!(puts(&server).await, 0);
+    }
+
+    /// `--force` through the real CLI surface: parsed, dispatched, and on the wire.
+    /// Calling `run_sourcemap_upload` directly cannot catch `dispatch` dropping it.
+    #[tokio::test]
+    async fn the_force_flag_reaches_a_source_map_upload_through_dispatch() {
+        use clap::Parser;
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "app.js.map",
+                br#"{"version":3,"debug_id":"did-1","mappings":""}"#,
+            );
+            let server = collector(&[]).await;
+            let uri = server.uri();
+            let dir = tmp.path().to_str().unwrap();
+            let mut args = vec![
+                "bugsee-cli",
+                "--endpoint",
+                &uri,
+                "--app-token",
+                "TKN",
+                "debug-files",
+                "upload",
+                "--type",
+                "sourcemaps",
+                dir,
+                "--version",
+                "1",
+                "--build",
+                "1",
+            ];
+            if force {
+                args.push("--force");
+            }
+            crate::cli::dispatch(crate::cli::Cli::try_parse_from(args).unwrap())
+                .await
+                .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            assert_eq!(
+                body.get("overwrite").cloned(),
+                force.then_some(serde_json::Value::Bool(true))
+            );
+        }
     }
 
     /// `--force` is the escape hatch for a map the server would dedup: it must
