@@ -70,13 +70,24 @@ pub fn compute_debug_id_with_map(bundle: &[u8], map: Option<&[u8]>) -> Uuid {
 /// global resolution) so it can never throw in a customer bundle.
 fn runtime_stub(debug_id: &impl std::fmt::Display) -> String {
     format!(
+        "{}\n{prefix}{id}\n",
+        runtime_registration(debug_id),
+        prefix = DEBUG_ID_COMMENT_PREFIX,
+        id = debug_id,
+    )
+}
+
+/// The runtime half of [`runtime_stub`], without the `//# debugId=` comment: on
+/// load it registers `globalThis._bugseeDebugIds[<this script's Error stack>] =
+/// <debug_id>`, which is what the SDK reads at crash time.
+fn runtime_registration(debug_id: &impl std::fmt::Display) -> String {
+    format!(
         "\n;!function(){{try{{var e=\"undefined\"!=typeof window?window:\
 \"undefined\"!=typeof global?global:\"undefined\"!=typeof globalThis?globalThis:\
 \"undefined\"!=typeof self?self:{{}},n=(new e.Error).stack;\
 n&&(e._bugseeDebugIds=e._bugseeDebugIds||{{}},e._bugseeDebugIds[n]=\"{id}\")\
-}}catch(e){{}}}}();\n{prefix}{id}\n",
+}}catch(e){{}}}}();",
         id = debug_id,
-        prefix = DEBUG_ID_COMMENT_PREFIX,
     )
 }
 
@@ -92,6 +103,9 @@ pub struct InjectStats {
     /// Already-injected JS files re-stamped with a new id because their map was
     /// regenerated with different content.
     pub js_restamped: u32,
+    /// JS files carrying a debug-id another tool wrote, given our runtime
+    /// registration under that id.
+    pub js_registered: u32,
 }
 
 /// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`.
@@ -142,6 +156,21 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
                     "re-stamped debug-id: the bundle's map was regenerated"
                 );
                 (fresh.to_string(), true)
+            }
+            // Another tool's id (Rollup 4 `sourcemapDebugIds` writes its own comment):
+            // keep the id — its map already carries it — but add our runtime
+            // registration, without which the SDK cannot attach it to a crash frame.
+            None if !content.contains(&runtime_registration(&id)) => {
+                if !dry_run {
+                    std::fs::write(js_path, format!("{content}{}", runtime_registration(&id)))?;
+                }
+                stats.js_registered += 1;
+                tracing::info!(
+                    path = %js_path.display(),
+                    debug_id = %id,
+                    "registered an existing debug-id another tool wrote"
+                );
+                (id, false)
             }
             None => {
                 stats.js_already += 1;
@@ -657,7 +686,11 @@ mod tests {
         .unwrap();
         let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
         assert_eq!(stats.js_restamped, 0);
-        assert_eq!(std::fs::read_to_string(&js).unwrap(), bundle);
+        // Never re-keyed: the id stays; only our runtime registration is added.
+        assert_eq!(
+            std::fs::read_to_string(&js).unwrap(),
+            format!("{bundle}{}", runtime_registration(&id))
+        );
         assert_eq!(
             read_debug_id(&dir.path().join("app.js.map"))
                 .unwrap()
@@ -760,6 +793,132 @@ mod tests {
         let z =
             existing_debug_id(&std::fs::read_to_string(dir.path().join("z.js")).unwrap()).unwrap();
         assert_eq!(read_debug_id(&map).unwrap().unwrap(), z);
+    }
+
+    /// Exactly what Rollup 4 (4.60, `output.sourcemapDebugIds: true`) writes: its own
+    /// `//# debugId=` comment in the bundle and `debugId` (only) in the map.
+    fn rollup_bundle(dir: &Path) -> (PathBuf, PathBuf, &'static str) {
+        let id = "95557fe1-d7e8-44fc-afd2-effc11361d0b";
+        let js = dir.join("index.js");
+        let map = dir.join("index.js.map");
+        std::fs::write(
+            &js,
+            format!(
+                "function boom(){{ throw new Error(\"x\"); }}\nboom();\n\nexport {{ boom }};\n\
+                 //# debugId={id}\n//# sourceMappingURL=index.js.map\n"
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            &map,
+            format!(r#"{{"version":3,"file":"index.js","sources":["src/index.js"],"mappings":"AAAA","debugId":"{id}"}}"#),
+        )
+        .unwrap();
+        (js, map, id)
+    }
+
+    /// A bundle that already carries a debug-id ANOTHER tool wrote used to count as
+    /// "already injected" — so it never got our runtime registration, and the SDK
+    /// could not attach that bundle's debug-id to a crash frame. It now gets the
+    /// registration under THAT id (never a new one: the map already carries it),
+    /// without a second `//# debugId=` comment.
+    #[test]
+    fn a_foreign_debug_id_gets_our_runtime_registration_under_that_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let (js, map, id) = rollup_bundle(dir.path());
+        let before = std::fs::read_to_string(&js).unwrap();
+
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+
+        let after = std::fs::read_to_string(&js).unwrap();
+        assert_eq!(after, format!("{before}{}", runtime_registration(&id)));
+        assert_eq!(after.matches(DEBUG_ID_COMMENT_PREFIX).count(), 1);
+        assert_eq!(existing_debug_id(&after).unwrap(), id);
+        assert_eq!(
+            (stats.js_registered, stats.js_already, stats.js_injected),
+            (1, 0, 0)
+        );
+        let map_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&map).unwrap()).unwrap();
+        assert_eq!(
+            (map_json["debug_id"].as_str(), map_json["debugId"].as_str()),
+            (Some(id), Some(id))
+        );
+
+        // Idempotent: the registration is found, nothing is appended again.
+        let again = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), after);
+        assert_eq!(
+            (again.js_registered, again.js_already, again.maps_updated),
+            (0, 1, 0)
+        );
+    }
+
+    #[test]
+    fn a_dry_run_reports_the_registration_without_writing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let (js, _map, _id) = rollup_bundle(dir.path());
+        let before = std::fs::read_to_string(&js).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        assert_eq!(stats.js_registered, 1);
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), before);
+    }
+
+    /// Our own stub already registers the id: a bundle we injected is never given
+    /// a second registration, however often inject runs.
+    #[test]
+    fn a_bundle_we_injected_is_never_registered_twice() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stamped = std::fs::read_to_string(&js).unwrap();
+        for _ in 0..2 {
+            let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            assert_eq!(stats.js_registered, 0);
+        }
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), stamped);
+        assert_eq!(stamped.matches("_bugseeDebugIds[n]").count(), 1);
+    }
+
+    /// A registered foreign id is still never RE-KEYED: when the tool re-emits its
+    /// map without an id, the map takes the bundle's id and nothing loops.
+    #[test]
+    fn a_registered_foreign_id_is_not_rekeyed_when_its_map_comes_back_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (js, map, id) = rollup_bundle(dir.path());
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let registered = std::fs::read_to_string(&js).unwrap();
+
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAKA"}"#).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!((stats.js_restamped, stats.js_registered), (0, 0));
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), registered);
+        assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
+    }
+
+    /// Byte-for-byte what every earlier CLI appended: re-keying recognises OUR stub by
+    /// exact suffix, so bundles stamped by an older CLI must keep matching.
+    #[test]
+    fn the_runtime_stub_bytes_are_unchanged() {
+        assert_eq!(
+            runtime_stub(&"ID"),
+            "\n;!function(){try{var e=\"undefined\"!=typeof window?window:\"undefined\"!=typeof global?global:\"undefined\"!=typeof globalThis?globalThis:\"undefined\"!=typeof self?self:{},n=(new e.Error).stack;n&&(e._bugseeDebugIds=e._bugseeDebugIds||{},e._bugseeDebugIds[n]=\"ID\")}catch(e){}}();\n//# debugId=ID\n"
+        );
+    }
+
+    /// The stub is registration + comment, and restamp_id strips exactly that — the
+    /// split must not change what an existing injected bundle ends with.
+    #[test]
+    fn the_runtime_stub_is_the_registration_followed_by_the_comment() {
+        let id = "5d2f9a3c-1b7e-4c8a-9f10-2a3b4c5d6e7f";
+        assert_eq!(
+            runtime_stub(&id),
+            format!(
+                "{}\n{DEBUG_ID_COMMENT_PREFIX}{id}\n",
+                runtime_registration(&id)
+            )
+        );
     }
 
     #[test]

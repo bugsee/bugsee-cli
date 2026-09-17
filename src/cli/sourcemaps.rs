@@ -10,7 +10,9 @@ pub enum SourcemapsCommand {
     /// Rewrites every `.js`/`.cjs`/`.mjs` file to append a `//# debugId=<uuid>` comment plus a
     /// tiny runtime stub that registers the debug ID with `globalThis._bugseeDebugIds`, and
     /// rewrites every matching `.map` file to embed the same `debug_id`. Re-running on
-    /// already-injected files is a no-op.
+    /// already-injected files is a no-op. A bundle that already carries a debug ID another
+    /// tool wrote (e.g. Rollup's `output.sourcemapDebugIds`) keeps that ID and only gains
+    /// the runtime registration.
     ///
     /// Upload the injected maps with `bugsee-cli debug-files upload --type sourcemaps`.
     Inject {
@@ -36,6 +38,7 @@ pub async fn dispatch(
                 js_injected = stats.js_injected,
                 js_already_injected = stats.js_already,
                 js_restamped = stats.js_restamped,
+                js_registered = stats.js_registered,
                 maps_updated = stats.maps_updated,
                 dry_run,
                 "sourcemaps inject complete"

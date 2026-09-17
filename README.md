@@ -175,6 +175,11 @@ changes under byte-identical minified JS still gets a new id (and uploads) —
 including when the bundler keeps an already-stamped bundle on disk and re-emits
 only its map (webpack `[contenthash]`): `inject` re-keys that bundle.
 
+A bundle that already carries a `//# debugId=` another tool wrote (Rollup 4's
+`output.sourcemapDebugIds`) keeps that id — its map already carries it — and
+gains only the `_bugseeDebugIds` runtime registration, without which the SDK
+cannot attach the id to a crash frame.
+
 When the upload scans a directory, maps named as stylesheet or type-declaration
 maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped: they
 never carry a debug-id. Any other map without one fails the run before anything
