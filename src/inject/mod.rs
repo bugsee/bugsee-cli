@@ -68,7 +68,7 @@ pub fn compute_debug_id_with_map(bundle: &[u8], map: Option<&[u8]>) -> Uuid {
 /// self-identification the SDK reads at crash time to recover the
 /// debug-id of the bundle a frame belongs to. Defensive (try/catch, multi-env
 /// global resolution) so it can never throw in a customer bundle.
-fn runtime_stub(debug_id: &Uuid) -> String {
+fn runtime_stub(debug_id: &impl std::fmt::Display) -> String {
     format!(
         "\n;!function(){{try{{var e=\"undefined\"!=typeof window?window:\
 \"undefined\"!=typeof global?global:\"undefined\"!=typeof globalThis?globalThis:\
@@ -89,6 +89,9 @@ pub struct InjectStats {
     pub js_already: u32,
     /// `.map` files that gained a `debug_id`.
     pub maps_updated: u32,
+    /// Already-injected JS files re-stamped with a new id because their map was
+    /// regenerated with different content.
+    pub js_restamped: u32,
 }
 
 /// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`.
@@ -123,10 +126,28 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
     let map_path = paired_map(js_path, &content);
 
     let (debug_id, freshly_computed) = match existing_debug_id(&content) {
-        Some(id) => {
-            stats.js_already += 1;
-            (id, false)
-        }
+        Some(id) => match restamp_id(&content, &id, map_path.as_deref())? {
+            // Our stub, over a map regenerated with different content: re-key the
+            // bundle, or the upload dedups against the STALE map (webpack keeps a
+            // `[contenthash]` JS file it considers unchanged but re-emits its map).
+            Some((original, fresh)) => {
+                if !dry_run {
+                    std::fs::write(js_path, format!("{original}{}", runtime_stub(&fresh)))?;
+                }
+                stats.js_restamped += 1;
+                tracing::info!(
+                    path = %js_path.display(),
+                    stale = %id,
+                    debug_id = %fresh,
+                    "re-stamped debug-id: the bundle's map was regenerated"
+                );
+                (fresh.to_string(), true)
+            }
+            None => {
+                stats.js_already += 1;
+                (id, false)
+            }
+        },
         None => {
             let map_bytes = map_path.as_deref().map(std::fs::read).transpose()?;
             let id = compute_debug_id_with_map(content.as_bytes(), map_bytes.as_deref());
@@ -146,6 +167,42 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
         }
     }
     Ok(())
+}
+
+/// For a bundle that already carries `id`: the original bundle text and the id it
+/// should carry NOW, when that differs — or `None` to keep `id`.
+///
+/// Re-keying needs two things. The id must be in OUR stub, the exact suffix
+/// [`runtime_stub`] appends, so the original bytes are recoverable; a
+/// `//# debugId=` another tool wrote cannot be stripped safely. And the map must
+/// carry NO id, i.e. it was regenerated since the stamp. A stamped map is the
+/// one the id was computed over, plus the id itself, so hashing it again could
+/// never reproduce the id and would re-key on every run.
+fn restamp_id<'a>(
+    content: &'a str,
+    id: &str,
+    map_path: Option<&Path>,
+) -> Result<Option<(&'a str, Uuid)>> {
+    let Some(map_path) = map_path else {
+        return Ok(None);
+    };
+    let Some(original) = content.strip_suffix(runtime_stub(&id).as_str()) else {
+        return Ok(None);
+    };
+    let map_bytes = std::fs::read(map_path)?;
+    // A map that is not JSON is not re-keyed here: writing the id into it fails
+    // next, and it must fail BEFORE the bundle is rewritten, as it always did.
+    let Ok(map) = serde_json::from_slice::<serde_json::Value>(&map_bytes) else {
+        return Ok(None);
+    };
+    let carries_id = ["debug_id", "debugId"]
+        .iter()
+        .any(|k| map.get(*k).and_then(serde_json::Value::as_str).is_some());
+    if carries_id {
+        return Ok(None);
+    }
+    let fresh = compute_debug_id_with_map(original.as_bytes(), Some(&map_bytes));
+    Ok((fresh.to_string() != id).then_some((original, fresh)))
 }
 
 /// Read an existing debug-id from a bundle's `//# debugId=` comment (idempotency).
@@ -520,6 +577,189 @@ mod tests {
             assert_eq!(stats.maps_updated, 0);
             assert_eq!(std::fs::read(&map).unwrap(), after_first);
         }
+    }
+
+    /// webpack 5 with `[contenthash]` filenames and no `output.clean` (its
+    /// default): a source edit that only moves original lines leaves the JS
+    /// byte-identical, so webpack SKIPS rewriting it — our stub and old id stay —
+    /// and re-emits only the map, without an id. Filling the new map with the old
+    /// id made the upload a server-side duplicate and kept the STALE map.
+    #[test]
+    fn a_map_regenerated_beside_an_unchanged_stamped_bundle_gets_a_new_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("main.abc123.js");
+        let map = dir.path().join("main.abc123.js.map");
+        let bundle = "console.log(1)\n//# sourceMappingURL=main.abc123.js.map\n";
+        std::fs::write(&js, bundle).unwrap();
+        std::fs::write(
+            &map,
+            r#"{"version":3,"sources":["a.ts"],"mappings":"AAEA"}"#,
+        )
+        .unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let first = read_debug_id(&map).unwrap().unwrap();
+
+        // Rebuild: JS untouched on disk, map re-emitted with shifted mappings and no id.
+        let moved = r#"{"version":3,"sources":["a.ts"],"mappings":"AAKA"}"#;
+        std::fs::write(&map, moved).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+
+        let expected =
+            compute_debug_id_with_map(bundle.as_bytes(), Some(moved.as_bytes())).to_string();
+        assert_ne!(expected, first);
+        let js_after = std::fs::read_to_string(&js).unwrap();
+        assert_eq!(existing_debug_id(&js_after).unwrap(), expected);
+        assert_eq!(js_after, format!("{bundle}{}", runtime_stub(&expected)));
+        assert_eq!(read_debug_id(&map).unwrap().unwrap(), expected);
+        assert_eq!(stats.js_restamped, 1);
+        assert_eq!(stats.maps_updated, 1);
+
+        // And it settles: nothing changes on the next run.
+        let again = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!((again.js_restamped, again.maps_updated), (0, 0));
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), js_after);
+    }
+
+    /// The same rebuild with a map that did NOT change keeps the id and the bytes.
+    #[test]
+    fn an_identical_map_regenerated_beside_a_stamped_bundle_keeps_its_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        let original_map = r#"{"version":3,"sources":["a.ts"],"mappings":"AAEA"}"#;
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(&map, original_map).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let js_stamped = std::fs::read_to_string(&js).unwrap();
+        let id = read_debug_id(&map).unwrap().unwrap();
+
+        std::fs::write(&map, original_map).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!(stats.js_restamped, 0);
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
+        assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
+    }
+
+    /// A `//# debugId=` another tool wrote (Rollup's `sourcemapDebugIds`) is not our
+    /// stub, so the original bundle bytes cannot be recovered to re-key it: the
+    /// map is filled with that id, as before.
+    #[test]
+    fn a_foreign_debug_id_comment_is_never_restamped() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let id = "5d2f9a3c-1b7e-4c8a-9f10-2a3b4c5d6e7f";
+        let bundle = format!("console.log(1)\n//# debugId={id}\n");
+        std::fs::write(&js, &bundle).unwrap();
+        std::fs::write(
+            dir.path().join("app.js.map"),
+            r#"{"version":3,"mappings":"AAKA"}"#,
+        )
+        .unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!(stats.js_restamped, 0);
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), bundle);
+        assert_eq!(
+            read_debug_id(&dir.path().join("app.js.map"))
+                .unwrap()
+                .unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    fn a_regenerated_map_that_is_not_json_fails_without_touching_the_bundle() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let js_stamped = std::fs::read_to_string(&js).unwrap();
+
+        std::fs::write(&map, "not json").unwrap();
+        assert!(inject_paths(&[dir.path().to_path_buf()], false).is_err());
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
+    }
+
+    /// A stamped bundle whose map lost ONE of its keys still has its id in the map:
+    /// it is the map the id was computed over, so it gains the missing key and the
+    /// bundle is NOT re-keyed (which would repeat on every run).
+    #[test]
+    fn a_map_keeping_only_one_id_key_is_not_treated_as_regenerated() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let js_stamped = std::fs::read_to_string(&js).unwrap();
+        let id = read_debug_id(&map).unwrap().unwrap();
+
+        std::fs::write(
+            &map,
+            format!(r#"{{"version":3,"mappings":"AAEA","debugId":"{id}"}}"#),
+        )
+        .unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!(stats.js_restamped, 0);
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
+        assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
+    }
+
+    #[test]
+    fn a_dry_run_reports_a_restamp_without_writing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let js_stamped = std::fs::read_to_string(&js).unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAKA"}"#).unwrap();
+
+        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        assert_eq!((stats.js_restamped, stats.maps_updated), (1, 1));
+        assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
+        assert_eq!(read_debug_id(&map).unwrap(), None);
+    }
+
+    /// Dry-run takes the SAME decision the real run would: a freshly injected
+    /// bundle beside a stale stamped map is a Replace (maps_updated 1), not a
+    /// "shared map" Conflict.
+    #[test]
+    fn a_dry_run_replaces_a_stale_map_like_the_real_run() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("app.js");
+        let map = dir.path().join("app.js.map");
+        std::fs::write(&js, "console.log(1)\n").unwrap();
+        std::fs::write(
+            &map,
+            r#"{"version":3,"mappings":"","debug_id":"11111111-1111-5111-8111-111111111111","debugId":"11111111-1111-5111-8111-111111111111"}"#,
+        )
+        .unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        assert_eq!((stats.js_injected, stats.maps_updated), (1, 1));
+    }
+
+    /// Bundles are processed in sorted order, so a map two bundles share ends up
+    /// with the id of the one that sorts LAST, on every file system.
+    #[test]
+    fn bundles_are_walked_in_sorted_order() {
+        let dir = tempfile::tempdir().unwrap();
+        // Created in reverse order, so directory order is not name order by accident.
+        for name in ["z.js", "m.js", "a.js"] {
+            std::fs::write(
+                dir.path().join(name),
+                format!("console.log('{name}')\n//# sourceMappingURL=shared.map\n"),
+            )
+            .unwrap();
+        }
+        let map = dir.path().join("shared.map");
+        std::fs::write(&map, r#"{"version":3,"mappings":""}"#).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let z =
+            existing_debug_id(&std::fs::read_to_string(dir.path().join("z.js")).unwrap()).unwrap();
+        assert_eq!(read_debug_id(&map).unwrap().unwrap(), z);
     }
 
     #[test]

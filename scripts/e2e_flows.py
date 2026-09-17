@@ -332,6 +332,23 @@ def main():
         print("    stderr:", (r.stderr or "").strip()[-800:])
     vendor_id = json.load(open(os.path.join(fix, "web", "vendor.js.map"))).get("debug_id")
     main_id = json.load(open(os.path.join(fix, "web", "main.js.map"))).get("debug_id")
+    # webpack 5 `[contenthash]` rebuild after a source edit that only moved lines:
+    # the stamped JS is kept byte-identical on disk, only the map is re-emitted (no
+    # id). inject must re-key the bundle, or the upload dedups against the stale map.
+    main_js = os.path.join(fix, "web", "main.js")
+    main_map = os.path.join(fix, "web", "main.js.map")
+    js_before = open(main_js).read()
+    with open(main_map, "w") as f:
+        json.dump({"version": 3, "sources": ["main.ts"], "names": [], "mappings": "AAKA"}, f)
+    r = subprocess.run([binpath, "sourcemaps", "inject", os.path.join(fix, "web")],
+                       capture_output=True, text=True)
+    main_id_after = json.load(open(main_map)).get("debug_id")
+    results["sourcemaps_regenerated_map_rekeys_its_stamped_bundle"] = (
+        r.returncode == 0 and main_id_after not in (None, main_id)
+        and f"//# debugId={main_id_after}" in open(main_js).read()
+        and f"//# debugId={main_id}" not in open(main_js).read()
+        and js_before != open(main_js).read())
+    main_id = main_id_after
     STATE["duplicate_uuids"] = {vendor_id}
     results["sourcemaps_rebuild_with_css_and_unchanged_chunk"] = run(
         binpath, "sourcemaps_rebuild",
