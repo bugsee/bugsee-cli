@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.9] - 2026-09-17
+
 ### Fixed
 - **`sourcemaps inject` now registers a debug-id another tool already wrote.**
   A bundle carrying its own `//# debugId=` — Rollup 4 writes one with
@@ -15,7 +17,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   map already carries it) and gains only the registration, without a second
   comment; it is still never re-keyed. `js_registered` in the log counts them.
   Verified against real Rollup 4.60 output: after inject, loading the bundle
-  registers Rollup's id.
+  registers Rollup's id. See [#40].
+
+[#40]: https://github.com/bugsee/bugsee-cli/pull/40
 
 ## [0.7.8] - 2026-09-17
 
