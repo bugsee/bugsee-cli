@@ -6,7 +6,6 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
-use crate::inject;
 use crate::symbols::{dsym, elf, il2cpp_linemap, pdb, proguard, rust, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
@@ -51,6 +50,10 @@ pub enum DebugFilesCommand {
         /// `--type pdb`, whose identity is read out of the file itself and
         /// could never match an override at crash time.
         ///
+        /// For `--type sourcemaps`, the id keys EVERY map found — meant for a
+        /// single map passed by path (e.g. a React Native bundle's), and it
+        /// turns off the stylesheet / type-declaration skip.
+        ///
         /// For `--type il2cpp-linemap`, pass one or more IL2CPP module UUIDs
         /// (comma-separate values, and/or repeat `--uuid`, and/or append via
         /// `--il2cpp-uuid` for multi-ABI Android build-ids).
@@ -83,11 +86,13 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         zstd_level: Option<i64>,
 
-        /// Force a re-upload even if the server already has the symbol. Applies
-        /// to `--type dsym`, `--type pdb`, `--type rust` (when those declare
-        /// identity up front), and `--type il2cpp-linemap` — sets `overwrite` on
-        /// the metadata POST so format-scoped peers are replaced. Other types
-        /// (proguard, elf, sourcemaps) ignore this flag today.
+        /// Force a re-upload even if the server already has the symbol. Without
+        /// it, a symbol the server already has is skipped (exit 0) and the rest
+        /// of the batch continues. Applies to `--type dsym`, `--type pdb`,
+        /// `--type rust` (when those declare identity up front),
+        /// `--type il2cpp-linemap` and `--type sourcemaps` — sets `overwrite` on
+        /// the metadata POST so format-scoped peers are replaced. Proguard and
+        /// elf ignore this flag today.
         #[arg(long)]
         force: bool,
 
@@ -144,9 +149,10 @@ pub enum DebugFileType {
     Wasm,
     /// JS source maps (React Native / web). Keyed by the debug-id embedded by
     /// `bugsee-cli sourcemaps inject` (or a caller-supplied `--uuid`). In a
-    /// scanned directory, a map with no debug-id that no JS bundle points at
-    /// (e.g. an extracted-CSS map) is skipped with a warning; one a bundle does
-    /// point at is an error. A map already on the server is skipped.
+    /// scanned directory, maps NAMED as stylesheet or type-declaration maps
+    /// (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped; any
+    /// other map without a debug-id fails the run before anything is uploaded,
+    /// and so does a scan that leaves nothing to upload.
     Sourcemaps,
     /// Unity IL2CPP `LineNumberMappings.json` (+ MethodMap / il2cppFileRoot)
     /// bundle. Keyed by the IL2CPP module UUID(s) (`libil2cpp` / UnityFramework);
@@ -322,6 +328,7 @@ pub async fn dispatch(
                     &build,
                     parsed_override,
                     strategy,
+                    force,
                     dry_run,
                 )
                 .await;
@@ -1319,17 +1326,17 @@ async fn run_il2cpp_linemap_upload(
 /// via [`sourcemap::identify`]. A map carrying no id is a hard error — the
 /// caller must run `sourcemaps inject` first, or pass `--uuid` to key by a
 /// caller-owned id — with ONE exception: a map reached by walking a directory
-/// that no JS bundle points at (an extracted-CSS map, a `.d.ts.map`). `inject`
-/// never stamps those by design, so they are skipped with a warning instead of
-/// aborting every other map in the build. A walk that leaves nothing uploadable
-/// is still an error, so a forgotten `inject` cannot pass silently.
+/// whose NAME marks it as a stylesheet or type-declaration map
+/// ([`is_stylesheet_or_declaration_map`]). Those never carry a debug-id and are
+/// never symbolicated, so they are skipped, unread, instead of aborting every
+/// JS map in the build. A walk that leaves nothing to upload is still an error.
+///
+/// Every map is identified and keyed BEFORE the first upload, so a map that
+/// cannot be keyed fails the run without leaving a partial upload behind.
 ///
 /// A map the server already has is a per-file no-op (`already_existed`); the
 /// batch continues, which is what lets a second build of an app with unchanged
-/// chunks upload its changed ones. The map is packed as a single Zstd entry and uploaded
-/// through the shared presigned protocol; the worker auto-detects the
-/// `sourcemap` format from the unzipped JSON and re-derives the same debug-id
-/// (`symbolfiles/sourcemap.py:parse`).
+/// chunks upload its changed ones. `force` asks the server to replace it.
 #[allow(clippy::too_many_arguments)]
 async fn run_sourcemap_upload(
     paths: &[PathBuf],
@@ -1339,6 +1346,7 @@ async fn run_sourcemap_upload(
     build: &str,
     uuid_override: Option<Uuid>,
     strategy: Strategy,
+    force: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let candidates = discover_sourcemaps(paths);
@@ -1359,37 +1367,25 @@ async fn run_sourcemap_upload(
         Some(http::build_client()?)
     };
 
-    let mut uploaded = 0u32;
-    let mut already_existed = 0u32;
-    let mut skipped_unkeyed = 0u32;
-    let mut keyed = 0u32;
-    // Built only if a walked map turns out to have no id, since it reads every
-    // JS bundle in the tree.
-    let mut bundle_maps: Option<std::collections::HashSet<PathBuf>> = None;
+    // Pass 1: identify and key every map, uploading nothing.
+    let mut planned = Vec::with_capacity(candidates.len());
+    let mut skipped = 0usize;
     for SourcemapCandidate {
         path: map_path,
         explicit,
     } in candidates
     {
+        if !explicit && uuid_override.is_none() && is_stylesheet_or_declaration_map(&map_path) {
+            skipped += 1;
+            tracing::info!(
+                path = %map_path.display(),
+                "skipping a stylesheet / type-declaration map (it carries no debug id and is never \
+                 symbolicated)"
+            );
+            continue;
+        }
         tracing::info!(path = %map_path.display(), "processing source map");
         let identity = sourcemap::identify(&map_path)?;
-
-        if uuid_override.is_none() && identity.debug_id.is_none() && !explicit {
-            let bundle_maps = bundle_maps.get_or_insert_with(|| inject::bundle_maps(paths));
-            let belongs_to_a_bundle = std::fs::canonicalize(&map_path)
-                .map(|canonical| bundle_maps.contains(&canonical))
-                .unwrap_or(false);
-            if !belongs_to_a_bundle {
-                skipped_unkeyed += 1;
-                tracing::warn!(
-                    path = %map_path.display(),
-                    "skipping source map with no debug id that no JS bundle points at \
-                     (e.g. an extracted-CSS or .d.ts map, which `sourcemaps inject` never stamps)"
-                );
-                continue;
-            }
-        }
-        keyed += 1;
 
         // Resolve the keying id: an explicit --uuid override wins; otherwise the
         // embedded debug-id. A map with neither cannot be keyed — fail loudly
@@ -1411,9 +1407,13 @@ async fn run_sourcemap_upload(
             }
             None => identity.debug_id.clone().ok_or_else(|| {
                 input_invalid(format!(
-                    "source map has no debug_id/debugId/uuid: {} — run \
-                     `bugsee-cli sourcemaps inject <bundle-dir>` first to embed one, \
-                     or pass --uuid to key by a caller-owned id",
+                    "source map has no debug_id/debugId/uuid: {} — nothing was uploaded. Run \
+                     `bugsee-cli sourcemaps inject <dir>` over the directory holding its JS \
+                     bundle first: inject stamps a `.js`/`.cjs`/`.mjs` bundle's map when it sits \
+                     beside the bundle as `<bundle>.map`, or when the bundle's \
+                     `//# sourceMappingURL=` names it by a relative path inside the bundle's \
+                     directory. For a single map whose id you own (e.g. a React Native \
+                     bundle's), pass that file with --uuid",
                     map_path.display()
                 ))
             })?,
@@ -1424,7 +1424,26 @@ async fn run_sourcemap_upload(
             size_bytes = identity.size_bytes,
             "identified"
         );
+        planned.push((map_path, identity, resolved_id));
+    }
 
+    if planned.is_empty() {
+        return Err(input_invalid(format!(
+            "nothing to upload under {}: all {skipped} source maps are stylesheet or \
+             type-declaration maps (`.css.map`, `.d.ts.map`), which carry no debug id — point the \
+             upload at the directory holding your JS bundles' maps",
+            paths
+                .iter()
+                .map(|p| p.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+
+    // Pass 2: pack and upload.
+    let mut uploaded = 0u32;
+    let mut already_existed = 0u32;
+    for (map_path, identity, resolved_id) in planned {
         let tmpdir = tempfile::tempdir()?;
         let zip_path = tmpdir.path().join("sourcemap.zip");
 
@@ -1456,7 +1475,7 @@ async fn run_sourcemap_upload(
             transform: None,
             format: Some("sourcemap"),
             uuids: None,
-            overwrite: None,
+            overwrite: if force { Some(true) } else { None },
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
         let outcome = presigned::upload(
@@ -1480,30 +1499,31 @@ async fn run_sourcemap_upload(
         }
     }
 
-    if keyed == 0 {
-        return Err(input_invalid(format!(
-            "no source map under {} carries a debug id ({skipped_unkeyed} skipped as belonging \
-             to no JS bundle) — run `bugsee-cli sourcemaps inject <bundle-dir>` first to embed \
-             one, or pass --uuid to key by a caller-owned id",
-            paths
-                .iter()
-                .map(|p| p.display().to_string())
-                .collect::<Vec<_>>()
-                .join(", ")
-        )));
-    }
-
     if dry_run {
-        tracing::info!(skipped_unkeyed, "dry-run complete");
+        tracing::info!(skipped, "dry-run complete");
     } else {
-        tracing::info!(
-            uploaded,
-            already_existed,
-            skipped_unkeyed,
-            "upload complete"
-        );
+        tracing::info!(uploaded, already_existed, skipped, "upload complete");
     }
     Ok(())
+}
+
+/// Whether a `.map`'s name marks it as a stylesheet (`.css.map`) or TypeScript
+/// declaration (`.d.ts.map` / `.d.mts.map` / `.d.cts.map`) source map.
+///
+/// Deliberately by NAME only. Deciding "this map belongs to no bundle" by
+/// pairing maps with the bundles in the walk looked more general, but every gap
+/// in the pairing — a maps directory uploaded on its own, a React Native
+/// `.bundle`, a `../` or absolute `sourceMappingURL` — silently skipped a real
+/// JS map and let CI pass with that bundle unsymbolicated. A name can only
+/// prove a map is NOT JavaScript, which is the one case that is safe to skip.
+fn is_stylesheet_or_declaration_map(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let name = name.to_ascii_lowercase();
+    [".css.map", ".d.ts.map", ".d.mts.map", ".d.cts.map"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// Pack a `.dSYM` bundle's entries into a temp zip with the chosen strategy.
@@ -1779,6 +1799,7 @@ mod sourcemap_upload_tests {
             uuid_override,
             Strategy::Zstd(11),
             false,
+            false,
         )
         .await
         .unwrap();
@@ -1863,6 +1884,7 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
+            false,
         )
         .await
         .unwrap_err();
@@ -1890,6 +1912,7 @@ mod sourcemap_upload_tests {
             "1",
             None,
             Strategy::Zstd(11),
+            false,
             true,
         )
         .await
@@ -1898,7 +1921,7 @@ mod sourcemap_upload_tests {
 
     /// A mock collector that signs every metadata POST and accepts every PUT,
     /// except POSTs whose `uuid` is in `already_there`, which get the appserver's
-    /// real duplicate envelope. Returns the server and the ids POSTed, in order.
+    /// real duplicate envelope.
     async fn collector(already_there: &[&str]) -> MockServer {
         use wiremock::matchers::body_partial_json;
         let server = MockServer::start().await;
@@ -1969,22 +1992,20 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
+            false,
         )
         .await
     }
 
-    /// A webpack/Vite build with extracted CSS: `inject` stamps the JS bundle's
-    /// map and (correctly) leaves the CSS map alone, since no JS bundle points at
-    /// it. The upload walk reaches both — and used to abort the WHOLE batch on the
-    /// CSS map (exit 11) before or after the JS one, depending on walk order.
+    /// A webpack build with extracted CSS emits `main.css.map` beside the JS
+    /// map, and a TypeScript library emits `.d.ts.map`s. Neither ever gets a
+    /// debug-id and neither is symbolicated, but the upload walk reaches both —
+    /// and used to abort the WHOLE batch on them (exit 11). They are skipped by
+    /// NAME, before being read, so even one that is not parseable JSON (here: a
+    /// BOM-prefixed CSS map) cannot stop the JS maps.
     #[tokio::test]
-    async fn a_css_map_no_bundle_points_at_is_skipped_and_the_js_map_still_uploads() {
+    async fn stylesheet_and_declaration_maps_are_skipped_and_the_js_maps_still_upload() {
         let tmp = tempfile::tempdir().unwrap();
-        write(
-            tmp.path(),
-            "main.js",
-            b"console.log(1)\n//# debugId=did-js\n",
-        );
         write(
             tmp.path(),
             "main.js.map",
@@ -1995,11 +2016,10 @@ mod sourcemap_upload_tests {
             "main.css.map",
             br#"{"version":3,"sources":["a.css"],"mappings":""}"#,
         );
-        write(
-            tmp.path(),
-            "types.d.ts.map",
-            br#"{"version":3,"sources":["types.ts"],"mappings":""}"#,
-        );
+        write(tmp.path(), "theme.CSS.map", b"\xEF\xBB\xBF{\"version\":3}");
+        for name in ["types.d.ts.map", "esm.d.mts.map", "cjs.d.cts.map"] {
+            write(tmp.path(), name, br#"{"version":3,"mappings":""}"#);
+        }
 
         let server = collector(&[]).await;
         upload_dir(tmp.path(), &server.uri()).await.unwrap();
@@ -2008,71 +2028,122 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 1);
     }
 
-    /// The skip is for maps that belong to no bundle. A bundle's own map without
-    /// a debug-id means `inject` did not run (or failed) — uploading nothing for
-    /// it would leave that bundle's crashes unsymbolicated, so it stays fatal.
+    /// Only a name can prove a map is not JavaScript. Anything else without a
+    /// debug-id is a bundle `inject` did not stamp — its own map in the walk, a
+    /// map kept in a separate directory, a React Native `.bundle` map — and
+    /// uploading the rest would leave that bundle's crashes unsymbolicated while
+    /// CI stays green. So it fails the run, as before, even when siblings have ids.
     #[tokio::test]
-    async fn a_js_bundles_own_map_without_a_debug_id_still_fails_the_run() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(tmp.path(), "app.js", b"console.log(1)\n");
-        write(tmp.path(), "app.js.map", br#"{"version":3,"mappings":""}"#);
+    async fn a_js_map_without_a_debug_id_fails_the_run_wherever_its_bundle_is() {
+        for (dir, name) in [
+            (".", "app.js.map"),
+            ("maps", "app.js.map"),
+            (".", "index.android.bundle.map"),
+            (".", "chunk.mjs.map"),
+            // Only a SUFFIX marks a stylesheet map; these are JS maps.
+            (".", "legacy.css.map.js.map"),
+            (".", "types.d.ts.mapper.js.map"),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "aaa-stamped.js.map",
+                br#"{"version":3,"debug_id":"did-ok","mappings":""}"#,
+            );
+            std::fs::create_dir_all(tmp.path().join(dir)).unwrap();
+            write(
+                &tmp.path().join(dir),
+                name,
+                br#"{"version":3,"mappings":""}"#,
+            );
 
-        let server = collector(&[]).await;
-        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("no debug_id") && msg.contains("app.js.map"),
-            "{msg}"
-        );
-        assert_eq!(
-            crate::error::classify(&err),
-            crate::exit_code::ExitCode::InputInvalid
-        );
+            let server = collector(&[]).await;
+            let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("no debug_id") && msg.contains(name), "{msg}");
+            assert!(msg.contains("sourcemaps inject"), "{msg}");
+            assert_eq!(
+                crate::error::classify(&err),
+                crate::exit_code::ExitCode::InputInvalid
+            );
+            // Checked BEFORE anything is uploaded: `aaa-stamped` sorts first, and a
+            // failing run must not leave a partial upload behind.
+            assert!(
+                posted_ids(&server).await.is_empty(),
+                "{name}: nothing uploaded"
+            );
+        }
     }
 
+    /// A file named on the command line is what the caller asked for, whatever
+    /// its name — it is never skipped.
     #[tokio::test]
-    async fn a_map_a_bundle_names_in_its_sourcemappingurl_counts_as_that_bundles_map() {
+    async fn an_explicitly_named_stylesheet_map_is_not_skipped() {
         let tmp = tempfile::tempdir().unwrap();
-        std::fs::create_dir(tmp.path().join("maps")).unwrap();
-        write(
-            tmp.path(),
-            "app.mjs",
-            b"export const x = 1\n//# sourceMappingURL=maps/app.map\n",
-        );
-        write(
-            &tmp.path().join("maps"),
-            "app.map",
-            br#"{"version":3,"mappings":""}"#,
-        );
-
-        let server = collector(&[]).await;
-        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
-        assert!(err.to_string().contains("app.map"), "{err}");
-    }
-
-    /// Skipping must never turn "nothing was uploadable" into a silent success:
-    /// a tree where NO map carries an id is the forgot-to-inject case.
-    #[tokio::test]
-    async fn a_walk_where_no_map_carries_a_debug_id_fails_loudly() {
-        let tmp = tempfile::tempdir().unwrap();
-        write(
+        let css = write(
             tmp.path(),
             "main.css.map",
             br#"{"version":3,"mappings":""}"#,
         );
-
         let server = collector(&[]).await;
-        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("no source map") && msg.contains("sourcemaps inject"),
-            "{msg}"
-        );
-        assert_eq!(
-            crate::error::classify(&err),
-            crate::exit_code::ExitCode::InputInvalid
-        );
-        assert!(posted_ids(&server).await.is_empty());
+        let err = run_sourcemap_upload(
+            &[css],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("no debug_id"), "{err}");
+    }
+
+    /// Skipping must never turn "nothing was uploadable" into a silent success —
+    /// dry-run included, since that is how a CI config gets checked.
+    #[tokio::test]
+    async fn a_walk_with_only_stylesheet_maps_fails_loudly_even_in_dry_run() {
+        for dry_run in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "main.css.map",
+                br#"{"version":3,"mappings":""}"#,
+            );
+            write(
+                tmp.path(),
+                "types.d.ts.map",
+                br#"{"version":3,"mappings":""}"#,
+            );
+
+            let server = collector(&[]).await;
+            let err = run_sourcemap_upload(
+                &[tmp.path().to_path_buf()],
+                &server.uri(),
+                "TKN",
+                "1.0",
+                "1",
+                None,
+                Strategy::Zstd(11),
+                false,
+                dry_run,
+            )
+            .await
+            .unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("nothing to upload") && msg.contains("all 2 source maps"),
+                "{msg}"
+            );
+            assert_eq!(
+                crate::error::classify(&err),
+                crate::exit_code::ExitCode::InputInvalid
+            );
+            assert!(posted_ids(&server).await.is_empty());
+        }
     }
 
     /// A second production build: an unchanged chunk's map is already on the
@@ -2103,6 +2174,105 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 1, "only the changed map is PUT");
     }
 
+    /// A CI re-run of an unchanged build: every map is already there. That is a
+    /// success with nothing transferred, not "nothing uploaded".
+    /// The duplicate reply reaches every format through the shared client; this
+    /// pins it for a format with its own loop — an unchanged `mapping.txt` on a
+    /// CI re-run.
+    #[tokio::test]
+    async fn an_unchanged_proguard_mapping_the_server_already_has_is_a_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mapping = write(
+            tmp.path(),
+            "mapping.txt",
+            b"com.example.Foo -> a:\n    void bar() -> b\n",
+        );
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": { "type": "DuplicateSymbolsFoundError", "code": 16004 }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        run_proguard_upload(
+            &[mapping],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            Some("33333333-3333-3333-3333-333333333333".parse().unwrap()),
+            None,
+            Strategy::Zstd(11),
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(puts(&server).await, 0);
+    }
+
+    #[tokio::test]
+    async fn a_rerun_where_every_map_is_already_on_the_server_succeeds_without_a_put() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "a.js.map",
+            br#"{"version":3,"debug_id":"did-a","mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "b.js.map",
+            br#"{"version":3,"debug_id":"did-b","mappings":""}"#,
+        );
+
+        let server = collector(&["did-a", "did-b"]).await;
+        upload_dir(tmp.path(), &server.uri()).await.unwrap();
+
+        assert_eq!(posted_ids(&server).await, vec!["did-a", "did-b"]);
+        assert_eq!(puts(&server).await, 0);
+    }
+
+    /// `--force` is the escape hatch for a map the server would dedup: it must
+    /// reach the wire as `overwrite`, and stay absent without the flag.
+    #[tokio::test]
+    async fn force_asks_the_server_to_overwrite_a_source_map() {
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(
+                tmp.path(),
+                "app.js.map",
+                br#"{"version":3,"debug_id":"did-1","mappings":""}"#,
+            );
+            let server = collector(&[]).await;
+            run_sourcemap_upload(
+                &[tmp.path().to_path_buf()],
+                &server.uri(),
+                "TKN",
+                "1.0",
+                "1",
+                None,
+                Strategy::Zstd(11),
+                force,
+                false,
+            )
+            .await
+            .unwrap();
+            let requests = server.received_requests().await.unwrap();
+            let post = requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            if force {
+                assert_eq!(body["overwrite"], serde_json::json!(true));
+            } else {
+                assert!(body.get("overwrite").is_none(), "{body}");
+            }
+        }
+    }
+
     /// `--uuid` keys every map by the caller's id, so there is nothing to skip:
     /// an unkeyed map in a scanned directory still uploads, as it always did.
     #[tokio::test]
@@ -2122,6 +2292,7 @@ mod sourcemap_upload_tests {
             "1",
             Some("22222222-2222-2222-2222-222222222222".parse().unwrap()),
             Strategy::Zstd(11),
+            false,
             false,
         )
         .await
@@ -2167,6 +2338,7 @@ mod sourcemap_upload_tests {
             "1",
             None,
             Strategy::Zstd(11),
+            false,
             true,
         )
         .await

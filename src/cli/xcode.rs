@@ -2175,6 +2175,34 @@ mod tests {
         );
     }
 
+    /// A rebuild whose dSYM is already on the server. The appserver answers with
+    /// its nested `DuplicateSymbolsFoundError` envelope; before the client
+    /// recognised it, this failed EVERY unchanged rebuild's Xcode build with 30.
+    #[tokio::test]
+    async fn an_already_uploaded_dsym_does_not_fail_the_build() {
+        let tmp = tempfile::tempdir().unwrap();
+        let Some(folder) = real_dsym(tmp.path()) else {
+            eprintln!("skipping: clang/dsymutil unavailable");
+            return;
+        };
+        let server = mock_endpoint(serde_json::json!({
+            "ok": false,
+            "error": {
+                "type": "DuplicateSymbolsFoundError",
+                "message": "A symbol file with the same identifier already exists",
+                "code": 16004
+            }
+        }))
+        .await;
+
+        let env = env_of(&[("DWARF_DSYM_FOLDER_PATH", folder.to_str().unwrap())]);
+        upload_dsyms_strict(&env, &server.uri(), Some("TKN"))
+            .await
+            .expect("a dSYM the server already has is a success");
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "registered, and nothing PUT");
+    }
+
     #[tokio::test]
     async fn server_error_fails_the_build_with_30() {
         let tmp = tempfile::tempdir().unwrap();

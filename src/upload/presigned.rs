@@ -78,7 +78,8 @@ pub struct Metadata<'a> {
 pub enum Outcome {
     /// File was uploaded to the presigned URL.
     Uploaded,
-    /// Server already had this artifact (matched on hash); upload skipped.
+    /// Server already had this artifact; upload skipped. The server matches on
+    /// the declared uuid(s) and format among READY records — not on `hash`.
     AlreadyExists,
 }
 
@@ -98,14 +99,17 @@ struct ErrorPayload {
     error_type: Option<String>,
     #[serde(default)]
     message: Option<String>,
+    /// Kept loosely typed: only its numeric value is ever compared, and a
+    /// non-integer here must not fail the parse of an otherwise readable error.
     #[serde(default)]
-    code: Option<i64>,
+    code: Option<serde_json::Value>,
 }
 
 /// Whether the metadata response says the server already has this symbol.
 ///
-/// The appserver's error serializer (`code/app.utils.js` `error()`) answers a
-/// duplicate with HTTP 200 and the code NESTED in the envelope —
+/// The appserver answers a duplicate with HTTP 200 (`code/routing/routers/
+/// error.router.js` `onError`) and the code NESTED in the envelope that
+/// `code/app.utils.js` `error()` builds —
 /// `{ok: false, error: {type: "DuplicateSymbolsFoundError", code: 16004}}` —
 /// so the nested code and the error type are both checked. A top-level
 /// `code: 16004` is accepted too: it is what this client originally matched on,
@@ -114,7 +118,7 @@ struct ErrorPayload {
 fn is_already_exists(parsed: &MetadataResponse) -> bool {
     parsed.code == Some(CODE_ALREADY_EXISTS)
         || parsed.error.as_ref().is_some_and(|e| {
-            e.code == Some(CODE_ALREADY_EXISTS)
+            e.code.as_ref().and_then(serde_json::Value::as_i64) == Some(CODE_ALREADY_EXISTS)
                 || e.error_type.as_deref() == Some(TYPE_ALREADY_EXISTS)
         })
 }
@@ -330,9 +334,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/apps/TKN/symbols"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 16004 })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": { "type": "DuplicateSymbolsFoundError", "code": 16004 }
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -365,9 +370,10 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/apps/TKN/symbols"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(serde_json::json!({ "code": 16004 })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": false,
+                "error": { "type": "DuplicateSymbolsFoundError", "code": 16004 }
+            })))
             .expect(1)
             .mount(&server)
             .await;
@@ -428,10 +434,9 @@ mod tests {
         .await
     }
 
-    /// The appserver's real duplicate answer. Its error serializer
-    /// (`code/app.utils.js` `error()`) sends HTTP 200 with the code NESTED inside
-    /// `error` — `code: err.offset + err.code` = 16000 + 4 — never at the top
-    /// level. Matching only a top-level `code` made every re-upload of an
+    /// The appserver's real duplicate answer: HTTP 200 (`error.router.js`
+    /// `onError`) with the code NESTED inside `error` by `app.utils.js` `error()`
+    /// — `code: err.offset + err.code` = 16000 + 4 — never at the top level. Matching only a top-level `code` made every re-upload of an
     /// unchanged artifact a hard failure (exit 30) that aborted the whole batch.
     #[tokio::test]
     async fn register_recognises_the_appservers_nested_duplicate_envelope() {
@@ -504,6 +509,28 @@ mod tests {
         assert!(matches!(err, Error::AppTokenRejected), "got {err:?}");
     }
 
+    /// The envelope's `code` is not ours to type strictly: a proxy or a future
+    /// serializer that sends it as a string must not turn a recognisable error
+    /// into "response body was not valid JSON" (exit 30 instead of 21).
+    #[tokio::test]
+    async fn register_tolerates_a_non_numeric_nested_code() {
+        let err = register_against(serde_json::json!({
+            "ok": false,
+            "error": { "type": "ApplicationNotFoundError", "code": "2001" }
+        }))
+        .await
+        .unwrap_err();
+        assert!(matches!(err, Error::AppTokenRejected), "got {err:?}");
+
+        let reg = register_against(serde_json::json!({
+            "ok": false,
+            "error": { "type": "DuplicateSymbolsFoundError", "code": "16004" }
+        }))
+        .await
+        .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+    }
+
     #[tokio::test]
     async fn upload_skips_the_put_when_the_server_reports_the_nested_duplicate() {
         let server = MockServer::start().await;
@@ -534,6 +561,17 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(outcome, Outcome::AlreadyExists);
+    }
+
+    /// The shape this client first matched on, and which no current appserver
+    /// route sends. Still accepted — the check is free — but pinned under its own
+    /// name so it is not mistaken for the real reply.
+    #[tokio::test]
+    async fn register_still_accepts_a_legacy_top_level_16004() {
+        let reg = register_against(serde_json::json!({ "code": 16004 }))
+            .await
+            .unwrap();
+        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
     }
 
     #[tokio::test]

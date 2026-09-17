@@ -7,24 +7,44 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Fixed
-- **Re-uploading a symbol the server already has no longer fails the upload.**
-  The appserver answers a duplicate with HTTP 200 and the code nested in its
-  error envelope — `{ok: false, error: {type: "DuplicateSymbolsFoundError",
-  code: 16004}}` — but the client only recognised a top-level `code: 16004`, so
-  every already-uploaded artifact was a hard failure (exit `30`) instead of an
-  `already_existed` skip. For `debug-files upload` over a directory this aborted
-  the rest of the batch: the second production build of any web app with an
-  unchanged chunk could not upload its changed ones. The fix is in the shared
-  presigned client, so dSYM, ELF, ProGuard, PDB, Rust, IL2CPP line-map and
-  source-map uploads all get it.
+- **Re-uploading a symbol the server already has no longer fails.** The
+  appserver answers a duplicate with HTTP 200 and the code nested in its error
+  envelope — `{ok: false, error: {type: "DuplicateSymbolsFoundError", code:
+  16004}}` — but the client only recognised a top-level `code: 16004`, which no
+  current route sends. Every already-uploaded symbol was therefore a hard failure
+  (exit `30`) instead of an `already_existed` skip (exit `0`), and a
+  `debug-files upload` over a directory stopped there: the second production
+  build of a web app with one unchanged chunk could not upload its changed ones.
+  The fix is in the shared presigned client, so it reaches every format that
+  registers through it — dSYM, PDB, Rust, IL2CPP line maps and source maps, and
+  ProGuard / ELF uploads for apps the server dedups (Flutter, React Native and
+  Unity subtypes, and non-Android apps; a plain Android app's mapping is
+  re-registered rather than deduped, so it never received the duplicate reply).
+  Visible effects beyond `debug-files upload`:
+  - `xcode upload-dsyms` no longer **fails the Xcode build** on every rebuild
+    whose dSYM is unchanged.
+  - `xcode post-action` now reports `dsym_uploaded: true` when every dSYM was
+    already on the server, instead of `false`.
 - **`debug-files upload --type sourcemaps` no longer aborts on a CSS source
-  map.** In a scanned directory, a map with no debug-id that no JS bundle points
-  at (an extracted-CSS map, a `.d.ts.map` — `sourcemaps inject` never stamps
-  those) is skipped with a warning instead of failing every other map with exit
-  `11`. A bundle's own map without a debug-id, a map named explicitly on the
-  command line, and a scan that leaves nothing uploadable all still fail.
-  Directory scans are also processed in sorted order, so a batch runs the same
-  way on every run and platform.
+  map.** In a scanned directory, maps named as stylesheet or type-declaration
+  maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped without
+  being read, instead of failing every other map with exit `11`. Any other map
+  without a debug-id still fails the run — now BEFORE anything is uploaded, so a
+  failed run no longer leaves a partial upload — as does a map named explicitly
+  on the command line and a scan that leaves nothing to upload. Directory scans
+  are processed in sorted order.
+
+### Changed
+- **`sourcemaps inject` derives a bundle's debug-id from its paired map as well
+  as its own bytes.** The server dedups source maps by id alone, and a minifier
+  routinely emits byte-identical JS for a source edit that moves original lines,
+  so a bundle-only id kept the STALE map on the server — silently, now that a
+  duplicate is a success. A bundle with no map keeps its bundle-only id. Ids are
+  never recomputed downstream (the runtime and the worker both read the embedded
+  id), so nothing else changes.
+- **`debug-files upload --type sourcemaps --force`** now asks the server to
+  replace a map it already has (`overwrite`), as it already did for dSYM, PDB,
+  Rust and IL2CPP line maps.
 
 ## [0.7.7] - 2026-09-16
 

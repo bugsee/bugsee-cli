@@ -213,6 +213,9 @@ def make_fixtures(fix):
         f.write("console.log('main');\n")
     with open(os.path.join(uninjected, "main.js.map"), "w") as f:
         json.dump({"version": 3, "sources": ["main.ts"], "names": [], "mappings": "AAAA"}, f)
+    with open(os.path.join(uninjected, "aaa.js.map"), "w") as f:
+        json.dump({"version": 3, "debug_id": "11111111-1111-1111-1111-111111111111",
+                   "sources": ["aaa.ts"], "names": [], "mappings": "AAAA"}, f)
     import zipfile as zf
     with zf.ZipFile(os.path.join(fix, "native-debug-symbols.zip"), "w") as z:
         z.writestr("arm64-v8a/libfoo.so", b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 256)
@@ -278,13 +281,13 @@ def make_fixtures(fix):
                 print(f"  [warn] rust/macOS dSYM layout fixture failed: {e}")
 
 
-def run(binpath, flow, args, expect_code=0):
+def run(binpath, flow, args, expect_code=0, expect_stderr=None):
     STATE["flow"] = flow
     env = dict(os.environ, BUGSEE_APP_TOKEN=TOKEN)
     endpoint = f"http://127.0.0.1:{STATE['port']}"
     cmd = [binpath, "--endpoint", endpoint, "--app-token", TOKEN] + args
     r = subprocess.run(cmd, capture_output=True, text=True, env=env)
-    ok = (r.returncode == expect_code)
+    ok = (r.returncode == expect_code) and (expect_stderr is None or expect_stderr in (r.stderr or ""))
     print(f"  [{'PASS' if ok else f'FAIL(rc={r.returncode})'}] {flow}: {' '.join(args[:4])} ...")
     if not ok:
         print("    stderr:", (r.stderr or "").strip()[-800:])
@@ -322,8 +325,11 @@ def main():
 
     # A SECOND production build: `vendor` is unchanged, so the server already has
     # its map. The CSS map belongs to no bundle. Both used to abort the batch.
-    subprocess.run([binpath, "sourcemaps", "inject", os.path.join(fix, "web")],
-                   capture_output=True, text=True, check=True)
+    r = subprocess.run([binpath, "sourcemaps", "inject", os.path.join(fix, "web")],
+                       capture_output=True, text=True)
+    results["sourcemaps_inject_web"] = (r.returncode == 0)
+    if r.returncode != 0:
+        print("    stderr:", (r.stderr or "").strip()[-800:])
     vendor_id = json.load(open(os.path.join(fix, "web", "vendor.js.map"))).get("debug_id")
     main_id = json.load(open(os.path.join(fix, "web", "main.js.map"))).get("debug_id")
     STATE["duplicate_uuids"] = {vendor_id}
@@ -345,7 +351,9 @@ def main():
     results["sourcemaps_uninjected_bundle_map_exits_11"] = run(
         binpath, "sourcemaps_uninjected",
         ["debug-files", "upload", "--type", "sourcemaps", os.path.join(fix, "web-uninjected")] + v,
-        expect_code=11)
+        expect_code=11, expect_stderr="main.js.map")
+    results["sourcemaps_uninjected_uploads_nothing"] = not os.path.exists(
+        cappath("sourcemaps_uninjected__symbols_posts.jsonl"))
 
     results["proguard"] = run(binpath, "proguard", ["debug-files", "upload", "--type", "proguard",
                                                     os.path.join(fix, "mapping.txt")] + v)
