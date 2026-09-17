@@ -286,7 +286,9 @@ def run(binpath, flow, args, expect_code=0, expect_stderr=None):
     env = dict(os.environ, BUGSEE_APP_TOKEN=TOKEN)
     endpoint = f"http://127.0.0.1:{STATE['port']}"
     cmd = [binpath, "--endpoint", endpoint, "--app-token", TOKEN] + args
-    r = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    # The CLI writes UTF-8; without an explicit encoding Windows decodes with the ANSI code page and any
+    # non-ASCII byte in stderr (the "—" in an error message) no longer matches `expect_stderr`.
+    r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env)
     ok = (r.returncode == expect_code) and (expect_stderr is None or expect_stderr in (r.stderr or ""))
     print(f"  [{'PASS' if ok else f'FAIL(rc={r.returncode})'}] {flow}: {' '.join(args[:4])} ...")
     if not ok:
