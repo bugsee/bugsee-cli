@@ -95,7 +95,10 @@ pub struct InjectStats {
 pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
     let mut stats = InjectStats::default();
     for root in paths {
+        // Sorted, so a run is the same on every file system (it decides, e.g.,
+        // which bundle first stamps a map two bundles share).
         for entry in walkdir::WalkDir::new(root)
+            .sort_by_file_name()
             .into_iter()
             .filter_map(|e| e.ok())
         {
@@ -119,10 +122,10 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
     let content = std::fs::read_to_string(js_path)?;
     let map_path = paired_map(js_path, &content);
 
-    let debug_id = match existing_debug_id(&content) {
+    let (debug_id, freshly_computed) = match existing_debug_id(&content) {
         Some(id) => {
             stats.js_already += 1;
-            id
+            (id, false)
         }
         None => {
             let map_bytes = map_path.as_deref().map(std::fs::read).transpose()?;
@@ -132,12 +135,12 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
             }
             stats.js_injected += 1;
             tracing::info!(path = %js_path.display(), debug_id = %id, "injected debug-id");
-            id.to_string()
+            (id.to_string(), true)
         }
     };
 
     if let Some(map_path) = map_path {
-        if write_map_debug_id(&map_path, &debug_id, dry_run)? {
+        if write_map_debug_id(&map_path, &debug_id, freshly_computed, dry_run)? {
             stats.maps_updated += 1;
             tracing::debug!(path = %map_path.display(), debug_id = %debug_id, "wrote debug_id into map");
         }
@@ -188,15 +191,55 @@ fn is_contained_relative(url: &str) -> bool {
         .all(|c| matches!(c, Component::Normal(_) | Component::CurDir))
 }
 
-/// Make a `.map` JSON carry `debug_id` AND `debugId` equal to the bundle's id.
-/// Returns whether the map was changed (a no-op when both already match).
+/// What to do with a map's existing id keys, given its bundle's id.
+#[derive(Debug, PartialEq, Eq)]
+enum MapIdAction {
+    /// Both keys already carry the bundle's id.
+    Keep,
+    /// A key is missing (or not a string) and none disagrees: write the bundle's id.
+    Fill,
+    /// A key carries a different id, and the bundle's id was JUST computed: replace it.
+    Replace { stale: String },
+    /// A key carries a different id, but the bundle already had its id: leave the map.
+    Conflict { stale: String },
+}
+
+/// Decide [`MapIdAction`]. Ids compare case-insensitively (a UUID is the same id
+/// in either case).
 ///
-/// The BUNDLE's id is authoritative — it is what the runtime reports — so a map
-/// holding a different id is rewritten rather than left alone. That happens when
-/// a bundler re-emits the JS without its stub but leaves a previously stamped map
-/// on disk: the fresh id is computed over a map that already carries the old
-/// one, and keeping the old one silently unsymbolicated the bundle.
-fn write_map_debug_id(map_path: &Path, debug_id: &str, dry_run: bool) -> Result<bool> {
+/// Replacing is right only when the bundle's id was just computed: that is the
+/// re-emitted-bundle-beside-a-stamped-map case, where the fresh id is hashed over
+/// a map that already carries the old one and could never match it again. When
+/// the bundle ALREADY carried its id, a disagreeing map is someone else's — most
+/// plausibly one map named by two bundles — and rewriting it would flip it back
+/// and forth on every run.
+fn map_id_action(
+    snake: Option<&str>,
+    camel: Option<&str>,
+    debug_id: &str,
+    freshly_computed: bool,
+) -> MapIdAction {
+    let stale = [snake, camel]
+        .into_iter()
+        .flatten()
+        .find(|existing| !existing.eq_ignore_ascii_case(debug_id))
+        .map(str::to_string);
+    match stale {
+        Some(stale) if freshly_computed => MapIdAction::Replace { stale },
+        Some(stale) => MapIdAction::Conflict { stale },
+        None if snake.is_some() && camel.is_some() => MapIdAction::Keep,
+        None => MapIdAction::Fill,
+    }
+}
+
+/// Make a `.map` JSON carry `debug_id` AND `debugId` equal to the bundle's id,
+/// as [`map_id_action`] decides. Returns whether the map was changed.
+fn write_map_debug_id(
+    map_path: &Path,
+    debug_id: &str,
+    freshly_computed: bool,
+    dry_run: bool,
+) -> Result<bool> {
     let raw = std::fs::read_to_string(map_path)?;
     let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
         Error::InputInvalid(format!(
@@ -210,22 +253,36 @@ fn write_map_debug_id(map_path: &Path, debug_id: &str, dry_run: bool) -> Result<
             map_path.display()
         ))
     })?;
-    let current = |k: &str, o: &serde_json::Map<String, serde_json::Value>| {
-        o.get(k)
+    let current = |k: &str| {
+        obj.get(k)
             .and_then(serde_json::Value::as_str)
             .map(str::to_string)
     };
-    let (snake, camel) = (current("debug_id", obj), current("debugId", obj));
-    if snake.as_deref() == Some(debug_id) && camel.as_deref() == Some(debug_id) {
-        return Ok(false);
-    }
-    if let Some(stale) = snake.or(camel).filter(|existing| existing != debug_id) {
-        tracing::warn!(
+    let (snake, camel) = (current("debug_id"), current("debugId"));
+    match map_id_action(
+        snake.as_deref(),
+        camel.as_deref(),
+        debug_id,
+        freshly_computed,
+    ) {
+        MapIdAction::Keep => return Ok(false),
+        MapIdAction::Fill => {}
+        MapIdAction::Replace { stale } => tracing::warn!(
             path = %map_path.display(),
             stale = %stale,
             debug_id = %debug_id,
-            "source map carried a different debug id than its bundle; rewriting it to the bundle's"
-        );
+            "source map carried a different debug id than its freshly injected bundle; rewriting it to the bundle's"
+        ),
+        MapIdAction::Conflict { stale } => {
+            tracing::warn!(
+                path = %map_path.display(),
+                map_debug_id = %stale,
+                bundle_debug_id = %debug_id,
+                "source map carries a different debug id than its bundle, which already had one; left as is \
+                 (is this map shared by more than one bundle?)"
+            );
+            return Ok(false);
+        }
     }
     obj.insert(
         "debug_id".into(),
@@ -378,6 +435,91 @@ mod tests {
         std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(&js).unwrap(), "console.log(1)\n");
+    }
+
+    #[test]
+    fn map_id_action_decides_per_key_and_ignores_case() {
+        use MapIdAction::*;
+        let id = "0b8c1a2e-0000-5000-8000-000000000001";
+        let upper = "0B8C1A2E-0000-5000-8000-000000000001";
+        let old = "11111111-1111-5111-8111-111111111111";
+        let stale = || old.to_string();
+        for fresh in [false, true] {
+            assert_eq!(map_id_action(Some(id), Some(id), id, fresh), Keep);
+            assert_eq!(map_id_action(Some(upper), Some(id), id, fresh), Keep);
+            assert_eq!(map_id_action(None, Some(id), id, fresh), Fill);
+            assert_eq!(map_id_action(Some(id), None, id, fresh), Fill);
+            assert_eq!(map_id_action(None, None, id, fresh), Fill);
+        }
+        // A stale key is found whichever key holds it, even when the other matches.
+        for (snake, camel) in [
+            (Some(id), Some(old)),
+            (Some(old), Some(id)),
+            (Some(old), None),
+            (None, Some(old)),
+        ] {
+            assert_eq!(
+                map_id_action(snake, camel, id, true),
+                Replace { stale: stale() }
+            );
+            assert_eq!(
+                map_id_action(snake, camel, id, false),
+                Conflict { stale: stale() }
+            );
+        }
+    }
+
+    /// A map carrying only `debugId` — as Rollup 4's `sourcemapDebugIds` writes it —
+    /// beside a bundle that already has `//# debugId=`: it gains `debug_id` once,
+    /// and a second run changes nothing.
+    #[test]
+    fn a_map_with_only_a_matching_debug_id_camel_key_gains_the_other_key_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let id = "5d2f9a3c-1b7e-4c8a-9f10-2a3b4c5d6e7f";
+        std::fs::write(
+            dir.path().join("app.js"),
+            format!("console.log(1)\n//# sourceMappingURL=app.js.map\n//# debugId={id}\n"),
+        )
+        .unwrap();
+        let map = dir.path().join("app.js.map");
+        std::fs::write(
+            &map,
+            format!(r#"{{"version":3,"mappings":"","debugId":"{id}"}}"#),
+        )
+        .unwrap();
+
+        let first = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let map_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&map).unwrap()).unwrap();
+        assert_eq!(first.maps_updated, 1);
+        assert_eq!(map_json["debug_id"], id);
+        assert_eq!(map_json["debugId"], id);
+        let second = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        assert_eq!(second.maps_updated, 0);
+    }
+
+    /// Two bundles naming ONE map: it cannot carry both ids. Whatever the first run
+    /// leaves, later runs must not keep rewriting it — `inject` is idempotent.
+    #[test]
+    fn a_map_shared_by_two_bundles_settles_instead_of_flipping_every_run() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.js", "b.js"] {
+            std::fs::write(
+                dir.path().join(name),
+                format!("console.log('{name}')\n//# sourceMappingURL=shared.map\n"),
+            )
+            .unwrap();
+        }
+        let map = dir.path().join("shared.map");
+        std::fs::write(&map, r#"{"version":3,"mappings":""}"#).unwrap();
+
+        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let after_first = std::fs::read(&map).unwrap();
+        for _ in 0..2 {
+            let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            assert_eq!(stats.maps_updated, 0);
+            assert_eq!(std::fs::read(&map).unwrap(), after_first);
+        }
     }
 
     #[test]

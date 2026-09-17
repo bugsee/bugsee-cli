@@ -45,10 +45,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   duplicate is a success. A bundle with no map keeps its bundle-only id. Ids are
   never recomputed downstream (the runtime and the worker both read the embedded
   id), so nothing else changes — except that, once, after upgrading, every
-  bundle that has a map gets a new id and its map uploads again. A map that
-  already carries a DIFFERENT id than its bundle (a stamped map left beside a
-  re-emitted bundle) is now rewritten to the bundle's id, with a warning,
-  instead of being left mismatched.
+  bundle that has a map gets a new id and its map uploads again. When a bundle
+  is freshly injected beside a map that already carries a DIFFERENT id (a
+  stamped map left beside a re-emitted bundle), the map is rewritten to the
+  bundle's id with a warning instead of being left mismatched; a map that
+  disagrees with a bundle which ALREADY had its id (e.g. one map named by two
+  bundles) is left as is, with a warning, so `inject` stays idempotent. A map
+  missing one of `debug_id` / `debugId` gains it. Bundles are walked in sorted
+  order.
 - **`debug-files upload --type sourcemaps --force`** now asks the server to
   replace a map it already has (`overwrite`), as it already did for dSYM, PDB,
   Rust and IL2CPP line maps.
