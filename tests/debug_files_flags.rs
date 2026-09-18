@@ -153,18 +153,23 @@ fn sourcemap_only_flags_are_rejected_for_other_types() {
     let tmp = tempfile::tempdir().unwrap();
 
     for kind in ["proguard", "elf", "dsym", "pdb", "rust", "il2cpp-linemap"] {
+        // The WHOLE sentence, not just its opening: rustfmt re-indenting a wrapped string literal
+        // bakes that indentation into the message, and a prefix match still passes while the user
+        // reads a line with 22 spaces in the middle of it. That happened here.
         upload(kind, &["--allow-empty", tmp.path().to_str().unwrap()])
             .assert()
             .code(CONFIG_INVALID)
             .stderr(contains(
-                "--allow-empty is only valid for --type sourcemaps",
+                "--allow-empty is only valid for --type sourcemaps — every other type treats an \
+                 empty input as a configuration mistake",
             ));
 
         upload(kind, &["--concurrency", "4", tmp.path().to_str().unwrap()])
             .assert()
             .code(CONFIG_INVALID)
             .stderr(contains(
-                "--concurrency is only valid for --type sourcemaps",
+                "--concurrency is only valid for --type sourcemaps — no other type uploads a \
+                 batch of independent files",
             ));
     }
 }

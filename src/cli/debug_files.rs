@@ -52,7 +52,9 @@ pub enum DebugFilesCommand {
         ///
         /// For `--type sourcemaps`, the id keys EVERY map found — meant for a
         /// single map passed by path (e.g. a React Native bundle's), and it
-        /// turns off the stylesheet / type-declaration skip.
+        /// turns off the stylesheet / type-declaration skip. Because one id
+        /// then covers every map, the uploads are forced sequential and
+        /// `--concurrency` is ignored: those registrations must not race.
         ///
         /// For `--type il2cpp-linemap`, pass one or more IL2CPP module UUIDs
         /// (comma-separate values, and/or repeat `--uuid`, and/or append via
@@ -102,7 +104,9 @@ pub enum DebugFilesCommand {
         /// scales with how many maps there are — one per 8, at least 4, at most 8 — and never
         /// exceeds the map count. That default stays modest on purpose: on a slow CI uplink the
         /// transfer is bandwidth-bound and more streams only add latency. Raise it if you have
-        /// measured your own link; `--concurrency 1` restores strictly sequential uploads.
+        /// measured your own link; `--concurrency 1` restores strictly sequential uploads. An
+        /// explicit `--uuid` forces sequential uploads whatever this says: it keys every map in
+        /// the scan under one id, and those registrations must not race each other.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..=32))]
         concurrency: Option<u16>,
 
@@ -253,12 +257,12 @@ pub async fn dispatch(
             // green with exit 10 anyway.
             if kind != DebugFileType::Sourcemaps && allow_empty {
                 return Err(config_invalid(
-                    "--allow-empty is only valid for --type sourcemaps — every other type treats                      an empty input as a configuration mistake",
+                    "--allow-empty is only valid for --type sourcemaps — every other type treats an empty input as a configuration mistake",
                 ));
             }
             if kind != DebugFileType::Sourcemaps && concurrency.is_some() {
                 return Err(config_invalid(
-                    "--concurrency is only valid for --type sourcemaps — no other type uploads a                      batch of independent files",
+                    "--concurrency is only valid for --type sourcemaps — no other type uploads a batch of independent files",
                 ));
             }
 
