@@ -48,15 +48,55 @@ fn sha256_hex(bytes: &[u8]) -> String {
     h.finalize().iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// Build a plain tar (system `tar` auto-detects "no compression" by content, so
-/// the `.tar.xz` name is fine) containing `bugsee-cli-<triple>/bugsee-cli` with
-/// `payload` as its bytes — the shape `install()` extracts with
+/// The extension the release publishes for this host — the same split `artifact_urls` makes in
+/// `src/cli/update.rs`. Windows gets a `.zip`; everything else a `.tar.xz`. Hard-coding `.tar.xz`
+/// here meant the Windows run asked the mock for a file it never mounted and read a 404 as a
+/// product failure.
+fn artifact_ext() -> &'static str {
+    if cfg!(windows) {
+        "zip"
+    } else {
+        "tar.xz"
+    }
+}
+
+/// The binary name inside the archive, which `install()` looks for after extraction.
+fn archived_binary_name() -> &'static str {
+    if cfg!(windows) {
+        "bugsee-cli.exe"
+    } else {
+        "bugsee-cli"
+    }
+}
+
+/// Build the archive this host's release would publish, containing
+/// `bugsee-cli-<triple>/<binary>` with `payload` as its bytes — the shape `install()` extracts with
 /// `--strip-components=1`.
-fn build_release_tar(dir: &Path, triple: &str, payload: &[u8]) -> Vec<u8> {
+///
+/// A plain tar on Unix (system `tar` auto-detects "no compression" by content, so the `.tar.xz` name
+/// is fine) and a real ZIP on Windows, which is what the release ships and what bsdtar extracts
+/// there.
+fn build_release_archive(dir: &Path, triple: &str, payload: &[u8]) -> Vec<u8> {
     let staging = dir.join("staging");
     let wrapper = staging.join(format!("bugsee-cli-{triple}"));
     std::fs::create_dir_all(&wrapper).unwrap();
-    std::fs::write(wrapper.join("bugsee-cli"), payload).unwrap();
+    std::fs::write(wrapper.join(archived_binary_name()), payload).unwrap();
+
+    if cfg!(windows) {
+        let zip_path = dir.join("artefact.zip");
+        let file = std::fs::File::create(&zip_path).unwrap();
+        let mut writer = zip::ZipWriter::new(file);
+        writer
+            .start_file(
+                format!("bugsee-cli-{triple}/{}", archived_binary_name()),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+        std::io::Write::write_all(&mut writer, payload).unwrap();
+        writer.finish().unwrap();
+        return std::fs::read(&zip_path).unwrap();
+    }
+
     let tar_path = dir.join("artefact.tar.xz");
     let ok = std::process::Command::new("tar")
         .args([
@@ -111,19 +151,23 @@ async fn update_self_replaces_to_a_newer_same_major_release() {
     // sentinel we can detect after the replace.
     let newer = format!("{}.99.0", current_major());
     let sentinel = b"SENTINEL-NEW-BUGSEE-CLI-BINARY-vNEXT".to_vec();
-    let tar = build_release_tar(tmp.path(), triple, &sentinel);
-    let sha = sha256_hex(&tar);
+    let artefact = build_release_archive(tmp.path(), triple, &sentinel);
+    let sha = sha256_hex(&artefact);
 
     let server = MockServer::start().await;
     mount_pointer(&server, &newer).await;
     Mock::given(method("GET"))
-        .and(wm_path(format!("/v{newer}/bugsee-cli-{triple}.tar.xz")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar.clone()))
+        .and(wm_path(format!(
+            "/v{newer}/bugsee-cli-{triple}.{}",
+            artifact_ext()
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(artefact.clone()))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(wm_path(format!(
-            "/v{newer}/bugsee-cli-{triple}.tar.xz.sha256"
+            "/v{newer}/bugsee-cli-{triple}.{}.sha256",
+            artifact_ext()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_string(format!("{sha}  x")))
         .mount(&server)
@@ -246,7 +290,10 @@ async fn update_download_failure_without_max_age_errors_and_keeps_binary() {
     let server = MockServer::start().await;
     mount_pointer(&server, &newer).await;
     Mock::given(method("GET"))
-        .and(wm_path(format!("/v{newer}/bugsee-cli-{triple}.tar.xz")))
+        .and(wm_path(format!(
+            "/v{newer}/bugsee-cli-{triple}.{}",
+            artifact_ext()
+        )))
         .respond_with(ResponseTemplate::new(500))
         .mount(&server)
         .await;
@@ -320,18 +367,22 @@ async fn update_readonly_dir_fails_safe_and_keeps_binary() {
     // in-place replace, because the directory is not writable.
     let newer = format!("{}.99.0", current_major());
     let sentinel = b"SENTINEL-SHOULD-NEVER-LAND".to_vec();
-    let tar = build_release_tar(tmp.path(), triple, &sentinel);
-    let sha = sha256_hex(&tar);
+    let artefact = build_release_archive(tmp.path(), triple, &sentinel);
+    let sha = sha256_hex(&artefact);
     let server = MockServer::start().await;
     mount_pointer(&server, &newer).await;
     Mock::given(method("GET"))
-        .and(wm_path(format!("/v{newer}/bugsee-cli-{triple}.tar.xz")))
-        .respond_with(ResponseTemplate::new(200).set_body_bytes(tar))
+        .and(wm_path(format!(
+            "/v{newer}/bugsee-cli-{triple}.{}",
+            artifact_ext()
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(artefact))
         .mount(&server)
         .await;
     Mock::given(method("GET"))
         .and(wm_path(format!(
-            "/v{newer}/bugsee-cli-{triple}.tar.xz.sha256"
+            "/v{newer}/bugsee-cli-{triple}.{}.sha256",
+            artifact_ext()
         )))
         .respond_with(ResponseTemplate::new(200).set_body_string(format!("{sha}  x")))
         .mount(&server)
