@@ -1443,7 +1443,22 @@ async fn upload_one_sourcemap(
     // `--strip-sources-content`: pack a COPY without the embedded original source. The file on disk
     // is the caller's build output — rewriting it would take away their own debugging, and the
     // bundler plugins delete these maps after a successful upload anyway.
-    let stripped = stripped_copy_without_sources(map_path, tmpdir.path(), ctx)?;
+    //
+    // On the blocking pool for the same reason the packing is: parsing and re-serializing a
+    // multi-megabyte map costs more than the zstd does, and every upload future is polled by ONE
+    // task.
+    let stripped = {
+        let (owned_path, tmp_owned, strip) = (
+            map_path.to_path_buf(),
+            tmpdir.path().to_path_buf(),
+            ctx.strip_sources_content,
+        );
+        tokio::task::spawn_blocking(move || {
+            stripped_copy_without_sources(&owned_path, &tmp_owned, strip)
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("stripping {} failed to run: {e}", map_path.display()))??
+    };
     let (map_path, identity) = match stripped.as_ref() {
         Some((path, id)) => (path.as_path(), id),
         None => (map_path, identity),
@@ -1769,6 +1784,23 @@ fn is_stylesheet_or_declaration_map(path: &Path) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+/// Remove every `sourcesContent` a source map can carry; `true` when one was there.
+///
+/// Not just the top-level key: an INDEXED map (spec §Index-Map) keeps its source inside
+/// `sections[i].map`, and those sections nest. Stripping only the top level left the source in the
+/// upload while reporting success — the flag's whole promise, failing silently.
+fn remove_sources_content(map: &mut serde_json::Map<String, serde_json::Value>) -> bool {
+    let mut removed = map.remove("sourcesContent").is_some();
+    if let Some(serde_json::Value::Array(sections)) = map.get_mut("sections") {
+        for section in sections {
+            if let Some(serde_json::Value::Object(inner)) = section.get_mut("map") {
+                removed |= remove_sources_content(inner);
+            }
+        }
+    }
+    removed
+}
+
 /// A copy of `map_path` with `sourcesContent` removed, plus its recomputed identity — or `None`
 /// when nothing needs stripping (flag off, no `sourcesContent`, or the map is not the JSON object we
 /// expect, which is a privacy preference's business to ignore rather than to fail over).
@@ -1779,16 +1811,16 @@ fn is_stylesheet_or_declaration_map(path: &Path) -> bool {
 fn stripped_copy_without_sources(
     map_path: &Path,
     tmpdir: &Path,
-    ctx: SourcemapUploadCtx<'_>,
+    strip: bool,
 ) -> anyhow::Result<Option<(PathBuf, sourcemap::SourcemapIdentity)>> {
-    if !ctx.strip_sources_content {
+    if !strip {
         return Ok(None);
     }
     let bytes = std::fs::read(map_path)?;
     let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice(&bytes) else {
         return Ok(None);
     };
-    if map.remove("sourcesContent").is_none() {
+    if !remove_sources_content(&mut map) {
         return Ok(None);
     }
     let stripped = serde_json::to_vec(&map)?;
@@ -3252,6 +3284,54 @@ mod sourcemap_upload_tests {
             uploaded_map_json(&server).await["sourcesContent"],
             serde_json::json!(["const x = 1;"])
         );
+    }
+
+    /// An INDEXED map (spec §Index-Map: `{"version":3,"sections":[{"offset":…,"map":{…}}]}`) keeps
+    /// its source inside each section, not at the top level. Removing only the top-level key left
+    /// the source in the upload while reporting success — the flag's entire promise, failing
+    /// silently. Webpack emits these for `devtool: 'source-map'` with certain plugins, and the
+    /// worker symbolicates them.
+    #[tokio::test]
+    async fn strip_reaches_inside_an_indexed_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "app.js.map",
+            br#"{"version":3,"debug_id":"55555555-5555-5555-5555-555555555555","sections":[
+                {"offset":{"line":0,"column":0},"map":{"version":3,"sources":["a.ts"],"sourcesContent":["const password = 'hunter2';"],"names":[],"mappings":"AAAA"}},
+                {"offset":{"line":9,"column":0},"map":{"version":3,"sources":["b.ts"],"sourcesContent":["const other = 2;"],"names":[],"mappings":"AACA"}}
+            ]}"#,
+        );
+        let server = collector(&[]).await;
+
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let body = String::from_utf8(uploaded_map_bytes(&server).await).unwrap();
+        assert!(
+            !body.contains("hunter2") && !body.contains("sourcesContent"),
+            "source must not leave the machine in a section either: {body}"
+        );
+        // …and the map is still usable: sections, offsets, mappings and the key survive.
+        let uploaded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(uploaded["sections"].as_array().unwrap().len(), 2);
+        assert_eq!(uploaded["sections"][1]["offset"]["line"], 9);
+        assert_eq!(uploaded["sections"][0]["map"]["mappings"], "AAAA");
+        assert_eq!(uploaded["debug_id"], "55555555-5555-5555-5555-555555555555");
     }
 
     /// A map that carries no `sourcesContent` — or is not the JSON we expect — uploads unchanged

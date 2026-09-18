@@ -222,8 +222,9 @@ rather than fatal there (`unkeyed` in the completion log) — the whole flow can
 freshly built directory, where `sourcemaps inject --dry-run` has deliberately written nothing yet.
 A REAL run still refuses such a map (exit 11): uploading it would register a symbol nothing can find.
 
-`--strip-sources-content` uploads each map WITHOUT its `sourcesContent`, for teams who would rather
-their source did not leave the build machine. Symbolication still resolves file, line and column;
+`--strip-sources-content` uploads each map WITHOUT its `sourcesContent` — including the copies an
+indexed map keeps inside `sections[].map` — for teams who would rather their source did not leave
+the build machine. Symbolication still resolves file, line and column;
 what is lost is the source snippet shown beside a crash frame. The map on disk is never modified —
 only the copy that is uploaded — and the declared `hash` describes the stripped bytes. A map that
 carries no `sourcesContent` is uploaded byte-for-byte unchanged.
@@ -235,8 +236,9 @@ A path that does not exist is an error regardless (`path does not exist: <p>`,
 exit 10) — including when other paths do hold maps — so a typo or a build that
 never ran cannot half-upload a build's symbols.
 
-Both flags apply to `--type sourcemaps` only, and are rejected (exit 20) for any
-other type rather than accepted and ignored.
+`--concurrency`, `--allow-empty` and `--strip-sources-content` apply to
+`--type sourcemaps` only, and are rejected (exit 20) for any other type rather
+than accepted and ignored.
 
 `--exclude <glob>` (repeatable) keeps `inject` out of part of a build output — `--exclude
 '**/node_modules/**'` leaves vendored third-party code inside a server bundle untouched, `--exclude
@@ -289,7 +291,7 @@ still break, so keep `--allow-sri` off and check a deploy before trusting it.
 ```
 bugsee-cli sourcemaps inject <paths>... [--exclude <glob>]... [--allow-sri] [--dry-run]
 bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b> \
-    [--concurrency N] [--allow-empty]
+    [--concurrency N] [--allow-empty] [--strip-sources-content]
 ```
 
 ### `xcode upload-dsyms`
