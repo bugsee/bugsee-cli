@@ -21,12 +21,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   bytes it names; that is the canonical SRI deployment (hash locally, serve from a CDN) and treating
   every absolute URL as somebody else's file would have missed it entirely.
 
-  The guard refuses only over a file this run would really stamp, sharing one list with the walk
+  The guard refuses only over a file this run would really REWRITE — so re-running `inject` stays a
+  no-op, including on a build stamped once with `--allow-sri` — and it shares one list with the walk
   that does the stamping: an `--exclude`d file, a stale page pinning a deleted bundle, a pin on
   something outside the output, and a file argument naming an unpinned bundle all proceed. Also not
-  flagged: a genuine third-party CDN script, a non-JS target, an empty `integrity`,
+  flagged: a third-party CDN script (unless it shares a file name with one of your bundles, in
+  which case it is treated as yours — the safer error), a non-JS target, an empty `integrity`,
   `data-integrity`/`data-src`, an inline script, a commented-out tag, and `rel=prefetch` (a failed
   prefetch is discarded, not fatal).
+
+  Pages are read from anywhere under the given paths, plus any sitting directly in a given path's
+  parent (the usual layout is `dist/index.html` beside `dist/assets/*.js`). `--dry-run` refuses too:
+  the preview of a run that would refuse is a refusal, and it says why.
 
   It cannot see SRI that never reaches the emitted HTML — a manifest consumed by a server template,
   a page rendered at request time (Next.js `experimental.sri`), or HTML written outside the directory
@@ -36,10 +42,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`sourcemaps inject --exclude <glob>`** (repeatable) — leave part of a build output alone. A
   stock `next build` with browser source maps on has 39 JS files and 12 maps, and a Nuxt
   `.output/server/node_modules` holds 22 vendored `.mjs`; `--exclude '**/node_modules/**'` keeps
-  `inject` out of third-party code inside the build output. Matched against the path relative to
-  the absolute path, the path relative to the current directory, and the path relative to each
-  walked root, so `dist/vendor/**`, `vendor/**` and an absolute path all work whether the root is
-  passed as `dist`, `./dist` or absolute. An unparseable OR EMPTY pattern is a configuration error
+  `inject` out of third-party code inside the build output. Matched against the absolute path, the path
+  relative to the current directory, and the path relative to each walked root, so
+  `dist/vendor/**`, `vendor/**` and an absolute path all work whether the root is passed as `dist`,
+  `./dist` or absolute. `*` crosses `/` (globset's default). An unparseable OR EMPTY pattern is a configuration error
   (exit 20), never a silent "matches nothing" that would rewrite the files you meant to protect.
   `js_excluded` is reported in the completion log.
 
