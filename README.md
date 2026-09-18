@@ -48,7 +48,7 @@ bugsee-cli debug-files upload <paths>... \
     [--icon <PATH>]   # attach launcher icon to the symbol zip \
     [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
     [--force]         # re-upload even if the server already has it (dsym/pdb/rust/il2cpp-linemap/sourcemaps)
-    [--concurrency N] # sourcemaps only: max uploads in flight, 1..=32, default 6
+    [--concurrency N] # sourcemaps only: ceiling on uploads in flight, 1..=32 (default: scaled)
     [--allow-empty]   # sourcemaps only: "nothing to upload" is success, not exit 10
     [--dry-run]
 ```
@@ -190,12 +190,26 @@ nothing to upload, unless `--allow-empty` says otherwise. A map the server
 already has is skipped and the batch continues, so rebuilding an app with
 unchanged chunks uploads only the changed ones; `--force` re-uploads it anyway.
 
-Maps upload **several at a time** (`--concurrency`, default 6). Each map is an
-independent register + PUT pair, so a build with one map per chunk used to spend
-its upload time waiting on round-trips: 60 maps against a mock with 50 ms of
-latency took 7.01 s serially and 1.49 s at the default concurrency (0.86 s
-at 12). Pass
-`--concurrency 1` for strictly sequential uploads.
+Maps upload **several at a time**. Each map is an independent register + PUT
+pair, so a build with one map per chunk used to spend its upload time waiting on
+round-trips. Against a mock with 50 ms of latency:
+
+| maps | serial (`--concurrency 1`) | default |
+|------|----------------------------|---------|
+| 60   | 7.09 s                     | 1.31 s  |
+| 200  | 23.58 s                    | 4.10 s  |
+
+`--concurrency N` sets a **ceiling**, not a fixed width: no more uploads run than
+there are maps, so a 3-map build runs 3 at a time whatever the ceiling says. Left
+unset, the ceiling scales with the batch — one upload per 8 maps, at least 4, at
+most 8.
+
+That cap is deliberately modest. On a fast link more streams keep helping (200
+maps: 2.75 s at `--concurrency 16`), but the machine that suffers most from
+serial uploads is a CI box on a thin uplink, where the transfer is
+bandwidth-bound and extra streams only add latency to each one. Raise it if you
+have measured your own link; `--concurrency 1` restores strictly sequential
+uploads.
 
 `--allow-empty` turns "nothing to upload" into success (exit 0) instead of
 exit 10 — a monorepo package built without maps, or a framework whose server

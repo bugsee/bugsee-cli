@@ -96,12 +96,15 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         force: bool,
 
-        /// Max uploads in flight (1..=32, default 6). `--type sourcemaps` only: a web build
-        /// has one map per chunk, and each is an independent register + PUT pair, so a
-        /// few-hundred-chunk app spent most of its upload time waiting on round-trips.
-        /// `--concurrency 1` restores strictly sequential uploads.
-        #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY, value_parser = clap::value_parser!(u16).range(1..=32))]
-        concurrency: u16,
+        /// Ceiling on uploads in flight (1..=32). `--type sourcemaps` only: a web build has one
+        /// map per chunk, and each is an independent register + PUT pair, so a few-hundred-chunk
+        /// app spent most of its upload time waiting on round-trips. Left unset, the ceiling
+        /// scales with how many maps there are — one per 8, at least 4, at most 8 — and never
+        /// exceeds the map count. That default stays modest on purpose: on a slow CI uplink the
+        /// transfer is bandwidth-bound and more streams only add latency. Raise it if you have
+        /// measured your own link; `--concurrency 1` restores strictly sequential uploads.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=32))]
+        concurrency: Option<u16>,
 
         /// Treat "nothing to upload" as success instead of exit 10. `--type sourcemaps` only:
         /// a monorepo package built without maps, or a framework whose server output has none,
@@ -345,7 +348,7 @@ pub async fn dispatch(
                     parsed_override,
                     strategy,
                     force,
-                    usize::from(concurrency),
+                    concurrency.map(usize::from),
                     allow_empty,
                     dry_run,
                 )
@@ -1000,11 +1003,36 @@ pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// and they execute in parallel, bounded here.
 const ELF_UPLOAD_CONCURRENCY: usize = 6;
 
-/// Default for `--concurrency` on `--type sourcemaps`: the same bound the native path uses. A web
-/// build has one map per chunk and each is an independent register + PUT pair, so uploading them one
-/// after another spent the whole step waiting on round-trips — measured at 7.15 s for 60 maps against
-/// 50 ms of latency, which is ~40 s for a 200-chunk app at a realistic RTT.
-const DEFAULT_UPLOAD_CONCURRENCY: u16 = 6;
+/// How the default upload concurrency scales: one more upload in flight per this many maps.
+///
+/// `--concurrency` sets a CEILING, not a fixed width — `buffer_unordered` never opens more uploads
+/// than there are maps, so a 3-map build already runs 3 at a time whatever the ceiling says. What
+/// the ceiling should be depends on how much there is to send: a handful of maps is over in one
+/// round-trip either way, while a chunked web app is where the waiting lives. Measured against a
+/// mock with 50 ms of latency, 200 maps: 6.30 s at 4, 4.77 s at 6, 3.07 s at 12, 1.91 s at 24.
+/// Every extra connection is also load on a shared API (whose throttling the metadata POST answers
+/// with a 429) and bandwidth contention on a thin CI uplink, so the ramp is gentle and capped well
+/// below the fastest value measured on a fast link.
+const MAPS_PER_UPLOAD_SLOT: usize = 8;
+
+/// Floor for the scaled default: below this, concurrency is bounded by the map count anyway.
+const MIN_DEFAULT_UPLOAD_CONCURRENCY: usize = 4;
+
+/// Ceiling for the scaled default. Deliberately conservative rather than the fastest value measured
+/// here: on a fat link more streams keep helping (200 maps at 50 ms: 3.07 s at 12, 1.91 s at 24),
+/// but the machine that suffers most from serial uploads is a CI box on a thin uplink, where the
+/// transfer is bandwidth-bound and extra streams only add queueing and latency to each one. 8 keeps
+/// most of the win on a good link without gambling on a bad one. `--concurrency N` (up to 32) is
+/// there for anyone who has measured their own.
+const MAX_DEFAULT_UPLOAD_CONCURRENCY: usize = 8;
+
+/// The default ceiling for `map_count` maps: `map_count / MAPS_PER_UPLOAD_SLOT`, clamped.
+fn default_upload_concurrency(map_count: usize) -> usize {
+    map_count.div_ceil(MAPS_PER_UPLOAD_SLOT).clamp(
+        MIN_DEFAULT_UPLOAD_CONCURRENCY,
+        MAX_DEFAULT_UPLOAD_CONCURRENCY,
+    )
+}
 
 /// Shared, cheaply-copyable parameters for a single `.so` upload pipeline.
 #[derive(Clone, Copy)]
@@ -1445,7 +1473,7 @@ async fn run_sourcemap_upload(
     uuid_override: Option<Uuid>,
     strategy: Strategy,
     force: bool,
-    concurrency: usize,
+    concurrency: Option<usize>,
     allow_empty: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
@@ -1566,6 +1594,14 @@ async fn run_sourcemap_upload(
     // Pass 2: pack and upload, several at a time. Each map is an independent register + PUT pair, so
     // the only thing serial uploads bought was waiting: the identification above is where ordering
     // matters (it is sorted, and it fails before anything is uploaded), not here.
+    // `buffer_unordered` never opens more than there are maps, so this is a ceiling: the actual
+    // width is `min(ceiling, planned.len())`.
+    let ceiling = concurrency.unwrap_or_else(|| default_upload_concurrency(planned.len()));
+    tracing::info!(
+        maps = planned.len(),
+        concurrency = ceiling.min(planned.len()),
+        "uploading"
+    );
     let uploads: Vec<anyhow::Result<Option<presigned::Outcome>>> =
         futures_util::stream::iter(planned)
             .map(|(map_path, identity, resolved_id)| {
@@ -1589,7 +1625,7 @@ async fn run_sourcemap_upload(
                     .await
                 }
             })
-            .buffer_unordered(concurrency)
+            .buffer_unordered(ceiling)
             .collect()
             .await;
 
@@ -1903,7 +1939,7 @@ mod sourcemap_upload_tests {
             uuid_override,
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             false,
         )
@@ -1990,7 +2026,7 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             false,
         )
@@ -2021,7 +2057,7 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             true,
         )
@@ -2101,22 +2137,14 @@ mod sourcemap_upload_tests {
         .await
     }
 
-    /// The knobs the newer tests vary; everything else matches `upload_dir`.
-    #[derive(Clone, Copy)]
+    /// The knobs the newer tests vary; everything else matches `upload_dir`. Defaults are the
+    /// production ones: no explicit ceiling (so the scaled default applies), no `--allow-empty`,
+    /// not a dry run.
+    #[derive(Clone, Copy, Default)]
     struct SourcemapUploadTweak {
-        concurrency: usize,
+        concurrency: Option<usize>,
         allow_empty: bool,
         dry_run: bool,
-    }
-
-    impl Default for SourcemapUploadTweak {
-        fn default() -> Self {
-            Self {
-                concurrency: usize::from(DEFAULT_UPLOAD_CONCURRENCY),
-                allow_empty: false,
-                dry_run: false,
-            }
-        }
     }
 
     async fn upload_paths(
@@ -2269,7 +2297,7 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             false,
         )
@@ -2305,7 +2333,7 @@ mod sourcemap_upload_tests {
                 None,
                 Strategy::Zstd(11),
                 false,
-                usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+                None,
                 false,
                 dry_run,
             )
@@ -2349,7 +2377,7 @@ mod sourcemap_upload_tests {
             &[tmp.path().to_path_buf()],
             &server.uri(),
             SourcemapUploadTweak {
-                concurrency: 1,
+                concurrency: Some(1),
                 ..SourcemapUploadTweak::default()
             },
         )
@@ -2494,7 +2522,7 @@ mod sourcemap_upload_tests {
                 None,
                 Strategy::Zstd(11),
                 force,
-                usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+                None,
                 false,
                 false,
             )
@@ -2534,7 +2562,7 @@ mod sourcemap_upload_tests {
             Some("22222222-2222-2222-2222-222222222222".parse().unwrap()),
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             false,
         )
@@ -2547,12 +2575,29 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 1);
     }
 
+    /// The ceiling scales with how much there is to send, floor 4, cap 12.
+    #[test]
+    fn the_default_ceiling_scales_with_the_number_of_maps() {
+        // A small build is bounded by its own map count anyway, so the floor is what applies.
+        assert_eq!(default_upload_concurrency(0), 4);
+        assert_eq!(default_upload_concurrency(1), 4);
+        assert_eq!(default_upload_concurrency(32), 4);
+        // Past the floor it ramps one slot per 8 maps …
+        assert_eq!(default_upload_concurrency(33), 5);
+        assert_eq!(default_upload_concurrency(60), 8);
+        assert_eq!(default_upload_concurrency(64), 8);
+        // … and stops there. A faster link keeps rewarding more streams, but a CI box on a thin
+        // uplink does not, and that is the machine this exists for. `--concurrency` goes higher.
+        assert_eq!(default_upload_concurrency(200), 8);
+        assert_eq!(default_upload_concurrency(100_000), 8);
+    }
+
     /// A map is two round-trips and they used to run strictly one after another: 60 maps took 7.15 s
     /// against a mock with 50 ms of latency (120 requests, the serial floor), and a 200-chunk app at a
     /// realistic RTT spends ~40 s of build time on uploads alone.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn uploads_overlap_unless_concurrency_is_one() {
-        async fn arrivals(concurrency: usize) -> Vec<&'static str> {
+        async fn arrivals(concurrency: Option<usize>) -> Vec<&'static str> {
             let tmp = tempfile::tempdir().unwrap();
             for i in 0..6 {
                 write(
@@ -2605,7 +2650,16 @@ mod sourcemap_upload_tests {
             log.snapshot()
         }
 
-        let parallel = arrivals(4).await;
+        // No flag: 6 maps sit under the floor, so the ceiling is 4 — NOT the map count, and not a
+        // fixed 6. Exactly 4 POSTs go out before the first PUT.
+        let defaulted = arrivals(None).await;
+        assert_eq!(
+            defaulted.iter().position(|k| *k == "PUT"),
+            Some(4),
+            "the default ceiling should be the ramp's floor of 4 ({defaulted:?})"
+        );
+
+        let parallel = arrivals(Some(4)).await;
         let first_put = parallel.iter().position(|k| *k == "PUT").expect("no PUT");
         assert!(
             first_put > 1,
@@ -2616,7 +2670,7 @@ mod sourcemap_upload_tests {
             "more uploads in flight than asked for ({parallel:?})"
         );
 
-        let sequential = arrivals(1).await;
+        let sequential = arrivals(Some(1)).await;
         assert_eq!(
             sequential,
             vec![
@@ -2777,7 +2831,7 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
-            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            None,
             false,
             true,
         )

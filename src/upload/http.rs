@@ -126,8 +126,14 @@ where
         match make().send().await {
             Ok(resp) => {
                 let status = resp.status();
+                // A 429 is retried even when `retry_on_status` is false. That flag exists to protect
+                // NON-IDEMPOTENT requests, where a 5xx may mean the server processed the request and
+                // only the response was lost — but a 429 says it was rejected outright, so a retry
+                // cannot double-register anything. Those same requests (symbol metadata POST, build
+                // registration) are the first to be throttled when several uploads run at once.
+                let throttled = status == reqwest::StatusCode::TOO_MANY_REQUESTS;
                 if status.is_success()
-                    || !retry_on_status
+                    || (!retry_on_status && !throttled)
                     || !is_retriable_status(status)
                     || attempt >= policy.max_attempts
                 {
@@ -298,6 +304,37 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(resp.status().as_u16(), 503);
+    }
+
+    /// A 429 says the server REJECTED the request without processing it, so retrying it cannot
+    /// double-register anything — which is the whole reason the non-idempotent POSTs (symbol
+    /// metadata, build registration) pass `retry_on_status = false`. They are also exactly the
+    /// requests that get throttled first when many uploads run at once, and before this a single
+    /// 429 failed the whole upload.
+    #[tokio::test]
+    async fn a_429_is_retried_even_when_statuses_are_not_retriable() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(429))
+            .up_to_n_times(2)
+            .with_priority(1)
+            .expect(2)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let client = build_client().unwrap();
+        let url = server.uri();
+        let resp = send_with_retry(RetryPolicy::fast(5), "test post", false, || {
+            client.post(&url).body(Vec::<u8>::new())
+        })
+        .await
+        .unwrap();
+        assert!(resp.status().is_success());
     }
 
     #[tokio::test]
