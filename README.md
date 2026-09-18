@@ -233,9 +233,16 @@ other type rather than accepted and ignored.
 
 `--exclude <glob>` (repeatable) keeps `inject` out of part of a build output — `--exclude
 '**/node_modules/**'` leaves vendored third-party code inside a server bundle untouched, `--exclude
-'polyfills*.js'` skips one file by name. Globs are matched against the path relative to each walked
-root and against the full path; an unparseable pattern is a configuration error (exit 20) rather
-than a silent "matches nothing", which would rewrite exactly the files you meant to protect.
+'polyfills*.js'` skips one file by name.
+
+A pattern is tried against the absolute path, the path relative to the current directory, and the
+path relative to each walked root, so `dist/vendor/**`, `vendor/**` and an absolute path all work
+whether you pass `dist`, `./dist` or the absolute directory. `*` crosses `/` (globset's default), so
+`*.js` matches `vendor/v.js` too — anchor with a leading `/` or a directory prefix if you do not want
+that. An unparseable or empty pattern is a configuration error (exit 20) rather than a silent
+"matches nothing", which would rewrite exactly the files you meant to protect. Patterns select
+BUNDLES: an excluded bundle's `.map` is left alone with it, but a pattern matching only `.map` files
+excludes nothing.
 
 **A bundle with no source map is still stamped, on purpose.** It looks like waste — the id cannot
 resolve to a symbol — but a crash frame carrying a debug-id whose map was never uploaded marks the
@@ -254,6 +261,17 @@ stops before writing anything. Angular's `subresourceIntegrity: true` is the sam
 
 Fix it by stamping BEFORE the hashes are computed, by `--exclude`-ing the pinned files, or — if your
 build recomputes hashes after this runs — with `--allow-sri`.
+
+The guard only ever refuses over a file this run would really stamp, so an excluded file, a stale
+page pinning a bundle that no longer exists, or a page pinning something outside the output does not
+stop it. A URL is matched literally first and then by file name, so a `publicPath` — a CDN origin,
+`/static/`, `/_next/` — still resolves to the local bytes it names; the cost of that fallback is that
+a third-party script sharing a file name with one of your bundles would be treated as yours.
+
+**It cannot see SRI that is not in the emitted HTML**: a manifest consumed by a server template
+(`webpack-assets-manifest` with `integrity: true`), a page rendered at request time (Next.js
+`experimental.sri`), or HTML your build writes outside the directory you point this at. Those builds
+still break, so keep `--allow-sri` off and check a deploy before trusting it.
 
 ```
 bugsee-cli sourcemaps inject <paths>... [--exclude <glob>]... [--allow-sri] [--dry-run]
