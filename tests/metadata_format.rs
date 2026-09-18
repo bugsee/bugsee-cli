@@ -6,10 +6,11 @@
 
 use std::path::PathBuf;
 
-use assert_cmd::Command;
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn proguard_upload_sends_format_mapping() {
@@ -37,25 +38,24 @@ async fn proguard_upload_sends_format_mapping() {
     let endpoint = server.uri();
     let path = mapping.to_string_lossy().into_owned();
     tokio::task::spawn_blocking(move || {
-        let mut c = Command::cargo_bin("bugsee-cli").unwrap();
-        c.env_clear()
-            .args([
-                "--endpoint",
-                &endpoint,
-                "--app-token",
-                "TKN",
-                "debug-files",
-                "upload",
-                "--type",
-                "proguard",
-                "--version",
-                "1.0",
-                "--build",
-                "1",
-                &path,
-            ])
-            .assert()
-            .success();
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "proguard",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            &path,
+        ])
+        .assert()
+        .success();
     })
     .await
     .unwrap();
@@ -88,25 +88,24 @@ async fn sourcemap_upload_sends_format_sourcemap() {
     let endpoint = server.uri();
     let path = map_path.to_string_lossy().into_owned();
     tokio::task::spawn_blocking(move || {
-        let mut c = Command::cargo_bin("bugsee-cli").unwrap();
-        c.env_clear()
-            .args([
-                "--endpoint",
-                &endpoint,
-                "--app-token",
-                "TKN",
-                "debug-files",
-                "upload",
-                "--type",
-                "sourcemaps",
-                "--version",
-                "1.0",
-                "--build",
-                "1",
-                &path,
-            ])
-            .assert()
-            .success();
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "sourcemaps",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            &path,
+        ])
+        .assert()
+        .success();
     })
     .await
     .unwrap();
@@ -137,28 +136,27 @@ async fn il2cpp_linemap_upload_sends_format_il2cpp_linemap() {
     let endpoint = server.uri();
     let path = root.to_string_lossy().into_owned();
     tokio::task::spawn_blocking(move || {
-        let mut c = Command::cargo_bin("bugsee-cli").unwrap();
-        c.env_clear()
-            .args([
-                "--endpoint",
-                &endpoint,
-                "--app-token",
-                "TKN",
-                "debug-files",
-                "upload",
-                "--type",
-                "il2cpp-linemap",
-                "--version",
-                "1.0",
-                "--build",
-                "1",
-                "--uuid",
-                "deadbeefcafebabe",
-                "--force",
-                &path,
-            ])
-            .assert()
-            .success();
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "il2cpp-linemap",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            "--uuid",
+            "deadbeefcafebabe",
+            "--force",
+            &path,
+        ])
+        .assert()
+        .success();
     })
     .await
     .unwrap();

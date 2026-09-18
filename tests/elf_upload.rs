@@ -11,10 +11,11 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-use assert_cmd::Command;
 use serde_json::json;
 use wiremock::matchers::{body_string_contains, method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
+
+mod common;
 
 /// `file(1)` on the fixture: `BuildID[md5/uuid]=bca64abfec40dbb631bb8f1c37414472`.
 const FIXTURE_BUILD_ID: &str = "bca64abfec40dbb631bb8f1c37414472";
@@ -65,29 +66,28 @@ async fn elf_upload_registers_each_so_by_its_real_build_id() {
     let zip = zip_path.to_string_lossy().into_owned();
     // assert_cmd is blocking; keep it off the async runtime so the mock serves.
     tokio::task::spawn_blocking(move || {
-        let mut c = Command::cargo_bin("bugsee-cli").unwrap();
-        c.env_clear()
-            .args([
-                "--endpoint",
-                &endpoint,
-                "--app-token",
-                "TKN",
-                "debug-files",
-                "upload",
-                "--type",
-                "elf",
-                "--version",
-                "1.0",
-                "--build",
-                "1",
-                // The build UUID is still accepted but must NOT become the
-                // symbol identity — the real build-id above proves that.
-                "--uuid",
-                "00000000-0000-0000-0000-000000000000",
-                &zip,
-            ])
-            .assert()
-            .success();
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "elf",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            // The build UUID is still accepted but must NOT become the
+            // symbol identity — the real build-id above proves that.
+            "--uuid",
+            "00000000-0000-0000-0000-000000000000",
+            &zip,
+        ])
+        .assert()
+        .success();
     })
     .await
     .unwrap();
