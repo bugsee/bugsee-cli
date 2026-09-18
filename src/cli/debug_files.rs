@@ -96,6 +96,20 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         force: bool,
 
+        /// Max uploads in flight (1..=32, default 6). `--type sourcemaps` only: a web build
+        /// has one map per chunk, and each is an independent register + PUT pair, so a
+        /// few-hundred-chunk app spent most of its upload time waiting on round-trips.
+        /// `--concurrency 1` restores strictly sequential uploads.
+        #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY, value_parser = clap::value_parser!(u16).range(1..=32))]
+        concurrency: u16,
+
+        /// Treat "nothing to upload" as success instead of exit 10. `--type sourcemaps` only:
+        /// a monorepo package built without maps, or a framework whose server output has none,
+        /// is a legitimate no-op rather than a reason to fail the caller's build. A path that
+        /// does not exist is still an error.
+        #[arg(long)]
+        allow_empty: bool,
+
         /// Dry-run — discover and pack files but skip the HTTP upload.
         #[arg(long)]
         dry_run: bool,
@@ -187,6 +201,8 @@ pub async fn dispatch(
             no_zstd,
             zstd_level,
             force,
+            concurrency,
+            allow_empty,
             dry_run,
         } => {
             let kind = r#type.unwrap_or(DebugFileType::Proguard);
@@ -329,6 +345,8 @@ pub async fn dispatch(
                     parsed_override,
                     strategy,
                     force,
+                    usize::from(concurrency),
+                    allow_empty,
                     dry_run,
                 )
                 .await;
@@ -982,6 +1000,12 @@ pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
 /// and they execute in parallel, bounded here.
 const ELF_UPLOAD_CONCURRENCY: usize = 6;
 
+/// Default for `--concurrency` on `--type sourcemaps`: the same bound the native path uses. A web
+/// build has one map per chunk and each is an independent register + PUT pair, so uploading them one
+/// after another spent the whole step waiting on round-trips — measured at 7.15 s for 60 maps against
+/// 50 ms of latency, which is ~40 s for a 200-chunk app at a realistic RTT.
+const DEFAULT_UPLOAD_CONCURRENCY: u16 = 6;
+
 /// Shared, cheaply-copyable parameters for a single `.so` upload pipeline.
 #[derive(Clone, Copy)]
 struct ElfUploadCtx<'a> {
@@ -1319,6 +1343,80 @@ async fn run_il2cpp_linemap_upload(
     Ok(())
 }
 
+/// Shared, cheaply-copyable parameters for one source-map upload.
+#[derive(Clone, Copy)]
+struct SourcemapUploadCtx<'a> {
+    endpoint: &'a str,
+    app_token: &'a str,
+    version: &'a str,
+    build: &'a str,
+    strategy: Strategy,
+    force: bool,
+}
+
+/// Pack ONE `.map` and register + PUT it. `None` when this was a dry run (packed, never sent).
+async fn upload_one_sourcemap(
+    client: Option<&reqwest::Client>,
+    ctx: SourcemapUploadCtx<'_>,
+    map_path: &Path,
+    identity: &sourcemap::SourcemapIdentity,
+    resolved_id: &str,
+    dry_run: bool,
+) -> anyhow::Result<Option<presigned::Outcome>> {
+    let tmpdir = tempfile::tempdir()?;
+    let zip_path = tmpdir.path().join("sourcemap.zip");
+
+    // Single entry: just the `.map`. Keeping the zip to one file means the
+    // worker's first-file extraction always lands on the map, and its
+    // content-based format detection classifies it as `sourcemap`.
+    let entry_name = map_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("bundle.js.map");
+    let entries = vec![ZipEntry::compressed(entry_name, map_path)];
+    let zip_size = compress::pack_entries(&entries, &zip_path, ctx.strategy)?;
+    tracing::info!(path = %map_path.display(), zip_size, strategy = ?ctx.strategy, "packed");
+
+    if dry_run {
+        tracing::info!(
+            "dry-run: would POST metadata + PUT {} ({} bytes)",
+            zip_path.display(),
+            zip_size
+        );
+        return Ok(None);
+    }
+
+    let metadata = presigned::Metadata {
+        uuid: Some(resolved_id),
+        version: ctx.version,
+        build: ctx.build,
+        hash: Some(&identity.content_sha1_hex),
+        transform: None,
+        format: Some("sourcemap"),
+        uuids: None,
+        overwrite: if ctx.force { Some(true) } else { None },
+    };
+    let client = client.expect("client constructed when !dry_run");
+    let outcome = presigned::upload(
+        client,
+        RetryPolicy::default(),
+        ctx.endpoint,
+        ctx.app_token,
+        &metadata,
+        &zip_path,
+    )
+    .await?;
+    match outcome {
+        presigned::Outcome::Uploaded => {
+            tracing::info!(debug_id = %resolved_id, "uploaded");
+        }
+        presigned::Outcome::AlreadyExists => {
+            tracing::info!(debug_id = %resolved_id, "already on server, skipped");
+        }
+    }
+    Ok(Some(outcome))
+}
+
 /// Pack and upload one or more JS source maps, keyed by their debug-id.
 ///
 /// Each `.map` is keyed on the server by the debug-id `sourcemaps inject`
@@ -1347,10 +1445,27 @@ async fn run_sourcemap_upload(
     uuid_override: Option<Uuid>,
     strategy: Strategy,
     force: bool,
+    concurrency: usize,
+    allow_empty: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
+    // A path that does not exist is a typo, not an empty build: it must not be swallowed by
+    // `--allow-empty`, and naming it beats the "no .map files found under …" it used to produce.
+    for path in paths {
+        if !path.exists() {
+            return Err(input_not_found(format!(
+                "path does not exist: {}",
+                path.display()
+            )));
+        }
+    }
+
     let candidates = discover_sourcemaps(paths);
     if candidates.is_empty() {
+        if allow_empty {
+            tracing::info!("no .map source-map files found — nothing to upload (--allow-empty)");
+            return Ok(());
+        }
         return Err(input_not_found(format!(
             "no .map source-map files found under: {}",
             paths
@@ -1428,6 +1543,14 @@ async fn run_sourcemap_upload(
     }
 
     if planned.is_empty() {
+        if allow_empty {
+            tracing::info!(
+                skipped,
+                "every source map found is a stylesheet / type-declaration map — nothing to upload \
+                 (--allow-empty)"
+            );
+            return Ok(());
+        }
         return Err(input_invalid(format!(
             "nothing to upload under {}: all {skipped} source maps are stylesheet or \
              type-declaration maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`), which carry no debug id — point the \
@@ -1440,62 +1563,43 @@ async fn run_sourcemap_upload(
         )));
     }
 
-    // Pass 2: pack and upload.
+    // Pass 2: pack and upload, several at a time. Each map is an independent register + PUT pair, so
+    // the only thing serial uploads bought was waiting: the identification above is where ordering
+    // matters (it is sorted, and it fails before anything is uploaded), not here.
+    let uploads: Vec<anyhow::Result<Option<presigned::Outcome>>> =
+        futures_util::stream::iter(planned)
+            .map(|(map_path, identity, resolved_id)| {
+                let client = client.clone();
+                async move {
+                    upload_one_sourcemap(
+                        client.as_ref(),
+                        SourcemapUploadCtx {
+                            endpoint,
+                            app_token,
+                            version,
+                            build,
+                            strategy,
+                            force,
+                        },
+                        &map_path,
+                        &identity,
+                        &resolved_id,
+                        dry_run,
+                    )
+                    .await
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
-    for (map_path, identity, resolved_id) in planned {
-        let tmpdir = tempfile::tempdir()?;
-        let zip_path = tmpdir.path().join("sourcemap.zip");
-
-        // Single entry: just the `.map`. Keeping the zip to one file means the
-        // worker's first-file extraction always lands on the map, and its
-        // content-based format detection classifies it as `sourcemap`.
-        let entry_name = map_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("bundle.js.map");
-        let entries = vec![ZipEntry::compressed(entry_name, &map_path)];
-        let zip_size = compress::pack_entries(&entries, &zip_path, strategy)?;
-        tracing::info!(zip_size, ?strategy, "packed");
-
-        if dry_run {
-            tracing::info!(
-                "dry-run: would POST metadata + PUT {} ({} bytes)",
-                zip_path.display(),
-                zip_size
-            );
-            continue;
-        }
-
-        let metadata = presigned::Metadata {
-            uuid: Some(&resolved_id),
-            version,
-            build,
-            hash: Some(&identity.content_sha1_hex),
-            transform: None,
-            format: Some("sourcemap"),
-            uuids: None,
-            overwrite: if force { Some(true) } else { None },
-        };
-        let client = client.as_ref().expect("client constructed when !dry_run");
-        let outcome = presigned::upload(
-            client,
-            RetryPolicy::default(),
-            endpoint,
-            app_token,
-            &metadata,
-            &zip_path,
-        )
-        .await?;
-        match outcome {
-            presigned::Outcome::Uploaded => {
-                uploaded += 1;
-                tracing::info!(debug_id = %resolved_id, "uploaded");
-            }
-            presigned::Outcome::AlreadyExists => {
-                already_existed += 1;
-                tracing::info!(debug_id = %resolved_id, "already on server, skipped");
-            }
+    for outcome in uploads {
+        match outcome? {
+            Some(presigned::Outcome::Uploaded) => uploaded += 1,
+            Some(presigned::Outcome::AlreadyExists) => already_existed += 1,
+            None => {} // dry run: packed, not sent
         }
     }
 
@@ -1799,6 +1903,8 @@ mod sourcemap_upload_tests {
             uuid_override,
             Strategy::Zstd(11),
             false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            false,
             false,
         )
         .await
@@ -1884,6 +1990,8 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            false,
             false,
         )
         .await
@@ -1912,6 +2020,8 @@ mod sourcemap_upload_tests {
             "1",
             None,
             Strategy::Zstd(11),
+            false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
             false,
             true,
         )
@@ -1983,8 +2093,39 @@ mod sourcemap_upload_tests {
     }
 
     async fn upload_dir(dir: &std::path::Path, endpoint: &str) -> anyhow::Result<()> {
-        run_sourcemap_upload(
+        upload_paths(
             &[dir.to_path_buf()],
+            endpoint,
+            SourcemapUploadTweak::default(),
+        )
+        .await
+    }
+
+    /// The knobs the newer tests vary; everything else matches `upload_dir`.
+    #[derive(Clone, Copy)]
+    struct SourcemapUploadTweak {
+        concurrency: usize,
+        allow_empty: bool,
+        dry_run: bool,
+    }
+
+    impl Default for SourcemapUploadTweak {
+        fn default() -> Self {
+            Self {
+                concurrency: usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+                allow_empty: false,
+                dry_run: false,
+            }
+        }
+    }
+
+    async fn upload_paths(
+        paths: &[PathBuf],
+        endpoint: &str,
+        tweak: SourcemapUploadTweak,
+    ) -> anyhow::Result<()> {
+        run_sourcemap_upload(
+            paths,
             endpoint,
             "TKN",
             "1.0",
@@ -1992,9 +2133,39 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
-            false,
+            tweak.concurrency,
+            tweak.allow_empty,
+            tweak.dry_run,
         )
         .await
+    }
+
+    /// Records the ORDER in which requests arrive. With the metadata response delayed, the pattern is
+    /// decisive without measuring any duration: overlapping uploads put several POSTs on the wire before
+    /// the first PUT, while sequential ones strictly alternate POST, PUT, POST, PUT.
+    #[derive(Clone)]
+    struct ArrivalLog(std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>);
+
+    impl ArrivalLog {
+        fn new() -> Self {
+            Self(std::sync::Arc::new(std::sync::Mutex::new(Vec::new())))
+        }
+        fn snapshot(&self) -> Vec<&'static str> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    struct RecordArrival {
+        log: ArrivalLog,
+        kind: &'static str,
+        response: ResponseTemplate,
+    }
+
+    impl wiremock::Respond for RecordArrival {
+        fn respond(&self, _req: &wiremock::Request) -> ResponseTemplate {
+            self.log.0.lock().unwrap().push(self.kind);
+            self.response.clone()
+        }
     }
 
     /// A webpack build with extracted CSS emits `main.css.map` beside the JS
@@ -2098,6 +2269,8 @@ mod sourcemap_upload_tests {
             None,
             Strategy::Zstd(11),
             false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            false,
             false,
         )
         .await
@@ -2131,6 +2304,8 @@ mod sourcemap_upload_tests {
                 "1",
                 None,
                 Strategy::Zstd(11),
+                false,
+                usize::from(DEFAULT_UPLOAD_CONCURRENCY),
                 false,
                 dry_run,
             )
@@ -2168,7 +2343,18 @@ mod sourcemap_upload_tests {
         );
 
         let server = collector(&["did-unchanged"]).await;
-        upload_dir(tmp.path(), &server.uri()).await.unwrap();
+        // `--concurrency 1`: the sorted walk order is then the UPLOAD order too, which is what makes
+        // "the duplicate did not stop its sibling" observable as a sequence.
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                concurrency: 1,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             posted_ids(&server).await,
@@ -2308,6 +2494,8 @@ mod sourcemap_upload_tests {
                 None,
                 Strategy::Zstd(11),
                 force,
+                usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+                false,
                 false,
             )
             .await
@@ -2346,6 +2534,8 @@ mod sourcemap_upload_tests {
             Some("22222222-2222-2222-2222-222222222222".parse().unwrap()),
             Strategy::Zstd(11),
             false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
+            false,
             false,
         )
         .await
@@ -2355,6 +2545,201 @@ mod sourcemap_upload_tests {
             vec!["22222222-2222-2222-2222-222222222222"]
         );
         assert_eq!(puts(&server).await, 1);
+    }
+
+    /// A map is two round-trips and they used to run strictly one after another: 60 maps took 7.15 s
+    /// against a mock with 50 ms of latency (120 requests, the serial floor), and a 200-chunk app at a
+    /// realistic RTT spends ~40 s of build time on uploads alone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn uploads_overlap_unless_concurrency_is_one() {
+        async fn arrivals(concurrency: usize) -> Vec<&'static str> {
+            let tmp = tempfile::tempdir().unwrap();
+            for i in 0..6 {
+                write(
+                    tmp.path(),
+                    &format!("c{i}.js.map"),
+                    format!(r#"{{"version":3,"debug_id":"did-{i}","mappings":""}}"#).as_bytes(),
+                );
+            }
+            let server = MockServer::start().await;
+            let log = ArrivalLog::new();
+            let put_url = format!("{}/sourcemap-put", server.uri());
+            Mock::given(method("POST"))
+                .and(wm_path("/apps/TKN/symbols"))
+                .respond_with(RecordArrival {
+                    log: log.clone(),
+                    kind: "POST",
+                    // Delaying the RESPONSE holds each upload open, so a second one can only start if
+                    // the uploads genuinely overlap.
+                    response: ResponseTemplate::new(200)
+                        .set_body_json(serde_json::json!({ "code": 0, "endpoint": put_url }))
+                        .set_delay(std::time::Duration::from_millis(150)),
+                })
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(wm_path("/sourcemap-put"))
+                .respond_with(RecordArrival {
+                    log: log.clone(),
+                    kind: "PUT",
+                    response: ResponseTemplate::new(200),
+                })
+                .mount(&server)
+                .await;
+
+            upload_paths(
+                &[tmp.path().to_path_buf()],
+                &server.uri(),
+                SourcemapUploadTweak {
+                    concurrency,
+                    ..SourcemapUploadTweak::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                posted_ids(&server).await.len(),
+                6,
+                "every map is still uploaded"
+            );
+            log.snapshot()
+        }
+
+        let parallel = arrivals(4).await;
+        let first_put = parallel.iter().position(|k| *k == "PUT").expect("no PUT");
+        assert!(
+            first_put > 1,
+            "uploads never overlapped: only {first_put} POST(s) before the first PUT ({parallel:?})"
+        );
+        assert!(
+            first_put <= 4,
+            "more uploads in flight than asked for ({parallel:?})"
+        );
+
+        let sequential = arrivals(1).await;
+        assert_eq!(
+            sequential,
+            vec![
+                "POST", "PUT", "POST", "PUT", "POST", "PUT", "POST", "PUT", "POST", "PUT", "POST",
+                "PUT"
+            ],
+            "concurrency 1 must stay strictly sequential"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failing_upload_still_fails_the_run_when_uploads_overlap() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            write(
+                tmp.path(),
+                &format!("c{i}.js.map"),
+                format!(r#"{{"version":3,"debug_id":"did-{i}","mappings":""}}"#).as_bytes(),
+            );
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "uuid": "did-3" }),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let put_url = format!("{}/sourcemap-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/sourcemap-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::UploadServer
+        );
+    }
+
+    /// A build step that legitimately produces no maps — a monorepo package built without them, a
+    /// framework whose server output has none — must not fail the caller's build. Opt-in, because a
+    /// scan that finds nothing is a configuration mistake as often as it is a legitimate no-op.
+    #[tokio::test]
+    async fn allow_empty_turns_an_empty_scan_into_a_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "app.js", b"console.log(1)");
+        let server = collector(&[]).await;
+
+        let err = upload_dir(tmp.path(), &server.uri()).await.unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputNotFound
+        );
+
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                allow_empty: true,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(posted_ids(&server).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn allow_empty_also_covers_a_walk_of_only_stylesheet_maps() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "main.css.map",
+            br#"{"version":3,"mappings":""}"#,
+        );
+        let server = collector(&[]).await;
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                allow_empty: true,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(posted_ids(&server).await.is_empty());
+    }
+
+    /// A path that does not exist is a typo, not an empty build: `--allow-empty` must not swallow it.
+    #[tokio::test]
+    async fn allow_empty_does_not_swallow_a_path_that_does_not_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("nope");
+        let server = collector(&[]).await;
+        let err = upload_paths(
+            &[missing],
+            &server.uri(),
+            SourcemapUploadTweak {
+                allow_empty: true,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputNotFound
+        );
+        assert!(err.to_string().contains("does not exist"), "{err}");
     }
 
     #[test]
@@ -2391,6 +2776,8 @@ mod sourcemap_upload_tests {
             "1",
             None,
             Strategy::Zstd(11),
+            false,
+            usize::from(DEFAULT_UPLOAD_CONCURRENCY),
             false,
             true,
         )

@@ -206,6 +206,20 @@ def make_fixtures(fix):
     with open(os.path.join(web, "main.css.map"), "w") as f:
         json.dump({"version": 3, "sources": ["main.css"], "names": [], "mappings": "AAAA"}, f)
 
+    # A build that emitted no maps at all — `--allow-empty` turns it into a no-op.
+    nomaps = os.path.join(fix, "web-no-maps")
+    os.makedirs(nomaps, exist_ok=True)
+    with open(os.path.join(nomaps, "main.js"), "w") as f:
+        f.write("console.log('main');\n")
+
+    # Enough chunks that a concurrent upload actually interleaves.
+    many = os.path.join(fix, "web-many")
+    os.makedirs(many, exist_ok=True)
+    for i in range(8):
+        with open(os.path.join(many, f"c{i}.js.map"), "w") as f:
+            json.dump({"version": 3, "debug_id": f"22222222-2222-2222-2222-00000000000{i}",
+                       "sources": [f"c{i}.ts"], "names": [], "mappings": "AAAA"}, f)
+
     # The same shape where inject never ran: the bundle's own map has no id.
     uninjected = os.path.join(fix, "web-uninjected")
     os.makedirs(uninjected, exist_ok=True)
@@ -375,6 +389,42 @@ def main():
         expect_code=11, expect_stderr="main.js.map — nothing was uploaded")
     results["sourcemaps_uninjected_uploads_nothing"] = not os.path.exists(
         cappath("sourcemaps_uninjected__symbols_posts.jsonl"))
+
+    # --concurrency uploads several maps at once: every one of them must still be registered
+    # exactly once. (The unit tests prove the overlap itself; this proves nothing is dropped.)
+    results["sourcemaps_concurrent_upload"] = run(
+        binpath, "sourcemaps_many",
+        ["debug-files", "upload", "--type", "sourcemaps", "--concurrency", "4",
+         os.path.join(fix, "web-many")] + v)
+    try:
+        posted = sorted(json.loads(line).get("uuid")
+                        for line in open(cappath("sourcemaps_many__symbols_posts.jsonl"), "rb"))
+        results["sourcemaps_concurrent_upload_registers_every_map"] = (
+            posted == sorted(f"22222222-2222-2222-2222-00000000000{i}" for i in range(8))
+            and STATE["puts"].get("sourcemaps_many") == 8)
+        if not results["sourcemaps_concurrent_upload_registers_every_map"]:
+            print(f"  [warn] posted={posted!r} puts={STATE['puts'].get('sourcemaps_many')!r}")
+    except Exception as e:
+        print("  [warn] could not verify the concurrent flow:", e)
+        results["sourcemaps_concurrent_upload_registers_every_map"] = False
+
+    # "The build emitted no maps" is an error by default and a no-op with --allow-empty;
+    # a path that does not exist stays an error either way, so a typo is not swallowed.
+    results["sourcemaps_no_maps_exits_10"] = run(
+        binpath, "sourcemaps_empty",
+        ["debug-files", "upload", "--type", "sourcemaps", os.path.join(fix, "web-no-maps")] + v,
+        expect_code=10, expect_stderr="no .map source-map files found under")
+    results["sourcemaps_allow_empty_is_success"] = run(
+        binpath, "sourcemaps_empty_ok",
+        ["debug-files", "upload", "--type", "sourcemaps", "--allow-empty",
+         os.path.join(fix, "web-no-maps")] + v)
+    results["sourcemaps_allow_empty_uploads_nothing"] = not os.path.exists(
+        cappath("sourcemaps_empty_ok__symbols_posts.jsonl"))
+    results["sourcemaps_allow_empty_still_fails_a_missing_path"] = run(
+        binpath, "sourcemaps_missing_path",
+        ["debug-files", "upload", "--type", "sourcemaps", "--allow-empty",
+         os.path.join(fix, "web-does-not-exist")] + v,
+        expect_code=10, expect_stderr="path does not exist")
 
     results["proguard"] = run(binpath, "proguard", ["debug-files", "upload", "--type", "proguard",
                                                     os.path.join(fix, "mapping.txt")] + v)
