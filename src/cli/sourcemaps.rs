@@ -31,6 +31,16 @@ pub enum SourcemapsCommand {
         #[arg(long)]
         exclude: Vec<String>,
 
+        /// Inject even when the build pins its own script hashes (Subresource Integrity).
+        ///
+        /// Injecting appends bytes to every `.js`, so a hash the HTML already pins stops matching
+        /// and the browser refuses to run the script — the page loads and nothing executes
+        /// (measured in Chromium 151 on a real webpack + webpack-subresource-integrity build).
+        /// That is refused by default. Pass this only if your build recomputes the hashes AFTER
+        /// this runs; otherwise stamp earlier, or `--exclude` the pinned files.
+        #[arg(long)]
+        allow_sri: bool,
+
         /// Dry-run — report what would change without writing.
         #[arg(long)]
         dry_run: bool,
@@ -46,9 +56,10 @@ pub async fn dispatch(
         SourcemapsCommand::Inject {
             paths,
             exclude,
+            allow_sri,
             dry_run,
         } => {
-            let stats = inject::inject_paths(&paths, &exclude, dry_run)?;
+            let stats = inject::inject_paths(&paths, &exclude, allow_sri, dry_run)?;
             tracing::info!(
                 js_injected = stats.js_injected,
                 js_already_injected = stats.js_already,

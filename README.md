@@ -244,8 +244,19 @@ unsymbolicated instead. Measured on a stock `next build` with browser source map
 12 maps, so 27 bundles are stamped without one; that is the case that produces the prompt. Use
 `--exclude` when you would rather those files were not touched at all.
 
+**A build that pins its own script hashes is REFUSED** (exit 20). Injecting appends bytes to every
+`.js`, so a Subresource Integrity hash the HTML already carries stops matching and the browser
+refuses to run the script — measured on a real webpack + `webpack-subresource-integrity` build in
+Chromium 151: before injecting the app ran, after it the entry script was blocked and the page
+executed nothing. `inject` looks for `<script integrity src=…>` and
+`<link rel=modulepreload|preload integrity href=…>` in the HTML under the paths it was given, and
+stops before writing anything. Angular's `subresourceIntegrity: true` is the same mechanism.
+
+Fix it by stamping BEFORE the hashes are computed, by `--exclude`-ing the pinned files, or — if your
+build recomputes hashes after this runs — with `--allow-sri`.
+
 ```
-bugsee-cli sourcemaps inject <paths>... [--exclude <glob>]... [--dry-run]
+bugsee-cli sourcemaps inject <paths>... [--exclude <glob>]... [--allow-sri] [--dry-run]
 bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b> \
     [--concurrency N] [--allow-empty]
 ```
