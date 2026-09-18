@@ -120,6 +120,13 @@ fn exclude_matcher(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
     }
     let mut builder = globset::GlobSetBuilder::new();
     for pattern in patterns {
+        // An empty pattern matches nothing at all. Accepting it silently is the same failure as a
+        // bad glob: the caller believes they protected a file they did not.
+        if pattern.trim().is_empty() {
+            return Err(Error::ConfigInvalid(
+                "--exclude was given an empty pattern; it would match nothing".to_string(),
+            ));
+        }
         let glob = globset::Glob::new(pattern)
             .map_err(|e| Error::ConfigInvalid(format!("--exclude {pattern:?}: {e}")))?;
         builder.add(glob);
@@ -138,6 +145,17 @@ fn is_excluded(matcher: Option<&globset::GlobSet>, roots: &[PathBuf], path: &Pat
     };
     if matcher.is_match(path) {
         return true;
+    }
+    // Relative to the CURRENT DIRECTORY as well: `--exclude 'dist/vendor/**'` is how a user thinks
+    // about their own build, and the roots are absolutized before the walk, so without this the
+    // pattern would match nothing at all.
+    if let Ok(cwd) = std::env::current_dir() {
+        if path
+            .strip_prefix(sri::lexical_normalize(&cwd))
+            .is_ok_and(|rel| matcher.is_match(rel))
+        {
+            return true;
+        }
     }
     roots.iter().any(|root| {
         let base = if root.is_file() {
@@ -167,13 +185,18 @@ pub fn inject_paths(
     dry_run: bool,
 ) -> Result<InjectStats> {
     let matcher = exclude_matcher(exclude)?;
+    // ONE list decides everything: which files get stamped, and therefore which pinned hashes could
+    // possibly be invalidated. A review of the first draft found six ways the guard and the walk
+    // could disagree when each computed its own answer — a pinned file the guard refused over but
+    // the walk would never have touched, and (worse) a page the guard skipped while the walk stamped
+    // what it pinned. They cannot disagree about a list they share.
+    let roots: Vec<PathBuf> = paths.iter().map(|p| absolutize(p)).collect();
+    let mut stats = InjectStats::default();
+    let targets = collect_targets(&roots, matcher.as_ref(), &mut stats);
+
     if !allow_sri {
-        // A file we are not going to touch cannot have its hash invalidated, so the exclusions
-        // apply here too.
-        let pinned: Vec<_> = sri::find_pinned_scripts(paths)
-            .into_iter()
-            .filter(|p| !is_excluded(matcher.as_ref(), paths, &p.script))
-            .collect();
+        let index: std::collections::BTreeSet<PathBuf> = targets.iter().cloned().collect();
+        let pinned = sri::find_pinned_scripts(&roots, &index);
         if let Some(first) = pinned.first() {
             let more = if pinned.len() > 1 {
                 format!(" (and {} more)", pinned.len() - 1)
@@ -195,10 +218,41 @@ pub fn inject_paths(
             return Err(Error::ConfigInvalid(message));
         }
     }
-    let mut stats = InjectStats::default();
-    for root in paths {
-        // Sorted, so a run is the same on every file system (it decides, e.g.,
-        // which bundle first stamps a map two bundles share).
+
+    for target in &targets {
+        inject_one(target, dry_run, &mut stats)?;
+    }
+    Ok(stats)
+}
+
+/// Absolute, `.`/`..` resolved lexically. NOT `canonicalize`: that requires the path to exist and
+/// resolves symlinks, and `inject dist` on a symlinked `dist` should still report `dist/...`.
+fn absolutize(path: &Path) -> PathBuf {
+    let joined = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(path)
+    };
+    sri::lexical_normalize(&joined)
+}
+
+/// Every `.js`/`.cjs`/`.mjs` under `roots` that this run would stamp, in walk order, de-duplicated
+/// (overlapping roots are a supported invocation: `inject a a/b`).
+///
+/// Counts the excluded ones into `stats` as it goes, so `--exclude` is reported exactly once per
+/// file even when two roots reach it.
+fn collect_targets(
+    roots: &[PathBuf],
+    matcher: Option<&globset::GlobSet>,
+    stats: &mut InjectStats,
+) -> Vec<PathBuf> {
+    let mut targets = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for root in roots {
+        // Sorted, so a run is the same on every file system (it decides, e.g., which bundle first
+        // stamps a map two bundles share).
         for entry in walkdir::WalkDir::new(root)
             .sort_by_file_name()
             .into_iter()
@@ -209,20 +263,24 @@ pub fn inject_paths(
                 continue;
             }
             let is_js = matches!(
-                p.extension().and_then(|e| e.to_str()),
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .map(str::to_ascii_lowercase)
+                    .as_deref(),
                 Some("js") | Some("cjs") | Some("mjs")
             );
-            if is_js {
-                if is_excluded(matcher.as_ref(), std::slice::from_ref(root), p) {
-                    stats.js_excluded += 1;
-                    tracing::info!(path = %p.display(), "excluded");
-                    continue;
-                }
-                inject_one(p, dry_run, &mut stats)?;
+            if !is_js || !seen.insert(p.to_path_buf()) {
+                continue;
             }
+            if is_excluded(matcher, roots, p) {
+                stats.js_excluded += 1;
+                tracing::info!(path = %p.display(), "excluded");
+                continue;
+            }
+            targets.push(p.to_path_buf());
         }
     }
-    Ok(stats)
+    targets
 }
 
 fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {
@@ -497,6 +555,10 @@ pub fn read_debug_id(map_path: &Path) -> Result<Option<String>> {
 mod tests {
     use super::*;
 
+    /// `set_current_dir` is process-global and the test harness is threaded: the tests that check a
+    /// RELATIVE root have to take turns, or they change the directory out from under each other.
+    static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn is_contained_relative_rejects_traversal_and_absolute() {
         assert!(is_contained_relative("bundle.js.map"));
@@ -599,6 +661,153 @@ mod tests {
         .unwrap();
 
         assert!(inject_paths(&[dir.path().to_path_buf()], &[], false, true).is_err());
+    }
+
+    /// A relative root (`./dist`, `../dist`) must behave exactly like the absolute one. It did not:
+    /// the guard produced an absolute path while the exclusion matched components of the path as
+    /// typed, so `inject ./dist --exclude 'polyfills*.js'` — the README's own example — refused the
+    /// run instead of excluding the file.
+    #[test]
+    fn a_relative_root_excludes_and_guards_the_same_as_an_absolute_one() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("polyfills.js"), "console.log(1)\n").unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(2)\n").unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<script src="polyfills.js" integrity="sha384-P"></script>"#,
+        )
+        .unwrap();
+
+        let _serialized = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path().parent().unwrap()).unwrap();
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let result = ["./", ""]
+            .into_iter()
+            .try_fold(Vec::new(), |mut acc, prefix| {
+                let root = PathBuf::from(format!("{prefix}{name}"));
+                inject_paths(&[root], &["polyfills*.js".to_string()], false, true).map(|stats| {
+                    acc.push(stats.js_excluded);
+                    acc
+                })
+            });
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(
+            result.unwrap(),
+            vec![1, 1],
+            "both spellings must exclude it"
+        );
+    }
+
+    /// An absolute `--exclude` pattern is documented to work, and did not when the root was
+    /// relative — the matcher only ever saw the path as typed.
+    #[test]
+    fn an_absolute_exclude_pattern_works_whatever_the_root_looks_like() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("vendor/v.js"), "console.log(1)\n").unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(2)\n").unwrap();
+        let _serialized = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path().parent().unwrap()).unwrap();
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        // Built AFTER the chdir, from the resolved working directory: on macOS the fixture lives
+        // under a `/var` symlink whose real name is `/private/var`, and the absolute path a user in
+        // that directory would type is the resolved one.
+        let absolute = format!(
+            "{}/vendor/**",
+            std::env::current_dir()
+                .unwrap()
+                .join(&name)
+                .to_string_lossy()
+        );
+        let stats = inject_paths(&[PathBuf::from(name)], &[absolute], false, true);
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(stats.unwrap().js_excluded, 1);
+    }
+
+    /// A pattern written the way the user sees their own tree — `dist/vendor/**` from the directory
+    /// above — must work. The roots are absolutized before the walk, so nothing would match without
+    /// also trying the path relative to the current directory.
+    #[test]
+    fn an_exclude_pattern_relative_to_the_current_directory_works() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("vendor/v.js"), "console.log(1)\n").unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(2)\n").unwrap();
+
+        let _serialized = CWD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir.path().parent().unwrap()).unwrap();
+        let name = dir
+            .path()
+            .file_name()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let stats = inject_paths(
+            &[PathBuf::from(&name)],
+            &[format!("{name}/vendor/**")],
+            false,
+            true,
+        );
+        std::env::set_current_dir(cwd).unwrap();
+
+        assert_eq!(stats.unwrap().js_excluded, 1);
+    }
+
+    /// An empty pattern matches nothing, which is the same failure mode as a malformed one: the
+    /// caller believes a file is protected when it is not.
+    #[test]
+    fn an_empty_exclude_pattern_is_a_configuration_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(1)\n").unwrap();
+
+        let err =
+            inject_paths(&[dir.path().to_path_buf()], &["".to_string()], false, true).unwrap_err();
+        assert!(format!("{err:#}").contains("empty pattern"), "{err:#}");
+        assert_eq!(
+            crate::error::classify(&anyhow::Error::new(err)),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+    }
+
+    /// Overlapping roots are a supported invocation (`inject a a/b`), and the exclusion must hold
+    /// for the file whichever root reached it — the guard and the walk share one list precisely so
+    /// they cannot answer differently.
+    #[test]
+    fn overlapping_roots_agree_about_an_excluded_file() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("b")).unwrap();
+        std::fs::write(dir.path().join("b/x.js"), "console.log(1)\n").unwrap();
+
+        let stats = inject_paths(
+            &[dir.path().to_path_buf(), dir.path().join("b")],
+            &["b/**".to_string()],
+            false,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!((stats.js_injected, stats.js_excluded), (0, 1));
+        assert!(!std::fs::read_to_string(dir.path().join("b/x.js"))
+            .unwrap()
+            .contains("debugId="));
     }
 
     /// `--exclude` keeps `inject` out of parts of a build output it should not rewrite. Measured

@@ -47,8 +47,10 @@ static SRC_ATTR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)[\s"'<]src\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
 static HREF_ATTR: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)[\s"'<]href\s*=\s*("[^"]*"|'[^']*'|[^\s>]+)"#).unwrap());
-static ABSOLUTE_URL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^[a-zA-Z][a-zA-Z0-9+.-]*:").unwrap());
+// `https:`, `//cdn…` — the origin half of a URL, which has no counterpart on disk. What follows it
+// still can: `publicPath` pointing at a CDN is the canonical SRI deployment.
+static ABSOLUTE_URL_PREFIX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^([a-zA-Z][a-zA-Z0-9+.-]*:)?//").unwrap());
 
 fn unquote(value: &str) -> &str {
     let bytes = value.as_bytes();
@@ -62,32 +64,61 @@ fn unquote(value: &str) -> &str {
     }
 }
 
-/// The file a `src`/`href` names, when it is one we could stamp: same-origin, and inside `root`.
-fn resolve_local_script(root: &Path, html_dir: &Path, url: &str) -> Option<PathBuf> {
-    // A URL with a scheme, or protocol-relative, is somebody else's file (a CDN): its bytes are not
-    // ours to change, so stamping cannot invalidate its hash.
-    if url.starts_with("//") || ABSOLUTE_URL.is_match(url) {
-        return None;
-    }
+/// The file a `src`/`href` names, resolved against the files this run would actually stamp.
+///
+/// `targets` is the whole point: the only hash we can invalidate is one belonging to a file we are
+/// going to rewrite. Matching against the file system instead produced both kinds of error — a stale
+/// page pinning a deleted bundle refused the run, while a page whose URL did not resolve literally
+/// (a CDN `publicPath`) sailed through and the build shipped blank.
+fn resolve_pinned_target(
+    roots: &[PathBuf],
+    targets: &BTreeSet<PathBuf>,
+    html_dir: &Path,
+    url: &str,
+) -> Option<PathBuf> {
     // Browsers strip surrounding whitespace from a URL attribute, so `src=" main.js "` loads it.
-    let path_part = url.split(['?', '#']).next().unwrap_or("").trim();
+    let trimmed = url.trim();
+    let path_part = if let Some(rest) = ABSOLUTE_URL_PREFIX.find(trimmed) {
+        // `https://cdn.example.com/assets/main.abc.js` — webpack's `output.publicPath` pointing at a
+        // CDN is the CANONICAL SRI deployment (hash the local bytes, serve them from the CDN), and
+        // those bytes are the ones sitting in the output directory. Keep the path, drop the origin.
+        let after_scheme = &trimmed[rest.end()..];
+        after_scheme.split_once('/').map(|(_, p)| p).unwrap_or("")
+    } else {
+        trimmed
+    };
+    let path_part = path_part.split(['?', '#']).next().unwrap_or("").trim();
     if path_part.is_empty() {
         return None;
     }
-    let candidate = if let Some(rooted) = path_part.strip_prefix('/') {
-        // A root-relative `/assets/app.js` is served from the output root.
-        root.join(rooted)
+
+    // 1. Where the URL literally points, relative to the page (or to the root when root-relative).
+    let literal = if let Some(rooted) = path_part.strip_prefix('/') {
+        roots
+            .iter()
+            .map(|r| lexical_normalize(&r.join(rooted)))
+            .collect::<Vec<_>>()
     } else {
-        html_dir.join(path_part)
+        vec![lexical_normalize(&html_dir.join(path_part))]
     };
-    let full = normalize(&candidate);
-    let base = normalize(root);
-    // `starts_with` on COMPONENTS, so `dist-2` is not read as inside `dist`.
-    full.starts_with(&base).then_some(full)
+    if let Some(hit) = literal.into_iter().find(|p| targets.contains(p)) {
+        return Some(hit);
+    }
+
+    // 2. Otherwise by file name. A `publicPath` — `/static/`, `/_next/`, a CDN origin — puts a
+    //    prefix in the URL that has no counterpart on disk, so the literal path resolves to nothing
+    //    while the pinned bytes are very much in the output. Bundler file names carry a content
+    //    hash, so a collision is unlikely; and refusing a build we would not have broken costs
+    //    symbolication, while missing one ships a page that loads nothing.
+    let name = Path::new(path_part).file_name()?;
+    targets
+        .iter()
+        .find(|t| t.file_name() == Some(name))
+        .cloned()
 }
 
-/// Lexical `..`/`.` resolution — the file may not exist yet, so `canonicalize` is not an option.
-fn normalize(path: &Path) -> PathBuf {
+/// Lexical `..`/`.` resolution — the path may not exist, so `canonicalize` is not an option.
+pub fn lexical_normalize(path: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for component in path.components() {
         match component {
@@ -101,21 +132,14 @@ fn normalize(path: &Path) -> PathBuf {
     out
 }
 
-fn is_js(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_ascii_lowercase)
-            .as_deref(),
-        Some("js") | Some("cjs") | Some("mjs")
-    )
-}
-
-/// Every script under `roots` whose hash an HTML page there pins.
+/// Every file this run would stamp whose hash an HTML page under `roots` pins.
 ///
 /// Empty means stamping is safe as far as SRI is concerned. Never fails on a path problem: that is
 /// the caller's to report.
-pub fn find_pinned_scripts(roots: &[PathBuf]) -> Vec<PinnedScript> {
+pub fn find_pinned_scripts(roots: &[PathBuf], targets: &BTreeSet<PathBuf>) -> Vec<PinnedScript> {
+    if targets.is_empty() {
+        return Vec::new();
+    }
     let mut found = BTreeSet::new();
     for root in roots {
         // A file argument (`inject dist/app.js`) has no HTML of its own; scan its directory.
@@ -124,19 +148,12 @@ pub fn find_pinned_scripts(roots: &[PathBuf]) -> Vec<PinnedScript> {
         } else {
             root.clone()
         };
+        // No directory filter and no depth cap: the WALK has none either, so a page under
+        // `.vitepress/dist` or `node_modules` pins a file we really are going to stamp. (Skipping
+        // them was a false negative the first draft shipped — it stamped what such a page pinned.)
         for entry in walkdir::WalkDir::new(&base)
-            .max_depth(8)
             .sort_by_file_name()
             .into_iter()
-            .filter_entry(|e| {
-                // `e.depth() > 0`: the filter must not judge the ROOT the caller named. A build
-                // output legitimately lives in a dot-directory (`.next`, `.nuxt`, `.output`, and a
-                // `tempfile` fixture), and excluding it would silently scan nothing at all.
-                let name = e.file_name().to_string_lossy();
-                !(e.depth() > 0
-                    && e.file_type().is_dir()
-                    && (name == "node_modules" || name.starts_with('.')))
-            })
             .filter_map(Result::ok)
         {
             let page = entry.path();
@@ -179,11 +196,9 @@ pub fn find_pinned_scripts(roots: &[PathBuf]) -> Vec<PinnedScript> {
                 let Some(url) = url_attr.captures(tag).and_then(|c| c.get(1)) else {
                     continue;
                 };
-                let Some(script) = resolve_local_script(&base, html_dir, unquote(url.as_str()))
-                else {
-                    continue;
-                };
-                if is_js(&script) {
+                if let Some(script) =
+                    resolve_pinned_target(roots, targets, html_dir, unquote(url.as_str()))
+                {
                     found.insert(PinnedScript {
                         html: page.to_path_buf(),
                         script,
@@ -206,11 +221,36 @@ mod tests {
         full
     }
 
-    fn pinned(dir: &Path) -> Vec<PathBuf> {
-        find_pinned_scripts(&[dir.to_path_buf()])
+    /// The files an `inject` over `dir` would stamp — every `.js`/`.cjs`/`.mjs` under it. In
+    /// production this list comes from the same walk that does the stamping, which is the point:
+    /// the guard can only refuse over a file that is really going to be rewritten.
+    fn targets_of(dirs: &[&Path]) -> BTreeSet<PathBuf> {
+        dirs.iter()
+            .flat_map(|dir| {
+                walkdir::WalkDir::new(dir)
+                    .into_iter()
+                    .filter_map(Result::ok)
+                    .filter(|e| e.file_type().is_file())
+                    .map(|e| e.path().to_path_buf())
+            })
+            .filter(|p| {
+                matches!(
+                    p.extension().and_then(|e| e.to_str()),
+                    Some("js") | Some("cjs") | Some("mjs")
+                )
+            })
+            .collect()
+    }
+
+    fn pinned_in(dir: &Path, targets: &BTreeSet<PathBuf>) -> Vec<PathBuf> {
+        find_pinned_scripts(&[dir.to_path_buf()], targets)
             .into_iter()
             .map(|p| p.script)
             .collect()
+    }
+
+    fn pinned(dir: &Path) -> Vec<PathBuf> {
+        pinned_in(dir, &targets_of(&[dir]))
     }
 
     /// The shape that breaks: webpack-subresource-integrity + html-webpack-plugin.
@@ -224,7 +264,7 @@ mod tests {
             "<!doctype html><script defer src=main.abc123.js integrity=sha384-KUBb crossorigin=anonymous></script>",
         );
 
-        let found = find_pinned_scripts(&[dir.path().to_path_buf()]);
+        let found = find_pinned_scripts(&[dir.path().to_path_buf()], &targets_of(&[dir.path()]));
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].script, dir.path().join("main.abc123.js"));
         assert_eq!(found[0].html, dir.path().join("index.html"));
@@ -318,7 +358,10 @@ mod tests {
                <script src="../vendor.js" integrity="sha384-V"></script>"#,
         );
 
-        assert_eq!(find_pinned_scripts(&[out]), Vec::new());
+        assert_eq!(
+            find_pinned_scripts(std::slice::from_ref(&out), &targets_of(&[&out])),
+            Vec::new()
+        );
     }
 
     /// Pointed at a FILE (`inject dist/app.js`), the scan still sees the page beside it — that is
@@ -333,7 +376,7 @@ mod tests {
             r#"<script src="app.js" integrity="sha384-F"></script>"#,
         );
 
-        let found = find_pinned_scripts(&[js]);
+        let found = find_pinned_scripts(std::slice::from_ref(&js), &targets_of(&[dir.path()]));
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(found[0].script, dir.path().join("app.js"));
     }
@@ -346,27 +389,190 @@ mod tests {
         write(dir.path(), "index.js", "1");
         assert_eq!(pinned(dir.path()), Vec::<PathBuf>::new());
         assert_eq!(
-            find_pinned_scripts(&[dir.path().join("does-not-exist")]),
+            find_pinned_scripts(
+                &[dir.path().join("does-not-exist")],
+                &targets_of(&[dir.path()])
+            ),
             Vec::new()
         );
     }
 
-    /// `node_modules` and dot-directories inside a build output are not the app's pages.
+    /// A page under a dot-directory or `node_modules` still pins a file the walk WILL stamp — and
+    /// the walk descends both. The first draft skipped them here and shipped that false negative:
+    /// a VitePress build (`docs/.vitepress/dist/index.html`) had its entry stamped and went blank.
     #[test]
-    fn it_skips_node_modules_and_dot_directories() {
+    fn a_page_under_a_dot_directory_or_node_modules_still_counts() {
+        for nested in [".vitepress/dist/index.html", "node_modules/pkg/index.html"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(dir.path(), "main.js", "1");
+            write(
+                dir.path(),
+                nested,
+                r#"<script src="/main.js" integrity="sha384-M"></script>"#,
+            );
+
+            assert_eq!(
+                pinned(dir.path()),
+                vec![dir.path().join("main.js")],
+                "page at {nested} was not seen"
+            );
+        }
+    }
+
+    /// `output.publicPath` pointing at a CDN is the CANONICAL SRI deployment — hash the local bytes,
+    /// serve them from the CDN — so the URL carries an origin that exists nowhere on disk while the
+    /// pinned bytes are the ones in the output directory. Dropping every absolute URL as "somebody
+    /// else's file" shipped a blank page for exactly the setup SRI exists for.
+    #[test]
+    fn a_cdn_public_path_still_resolves_to_the_local_file() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "main.abc123.js", "1");
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="https://cdn.example.com/assets/main.abc123.js" integrity="sha384-C"></script>"#,
+        );
+
+        assert_eq!(pinned(dir.path()), vec![dir.path().join("main.abc123.js")]);
+    }
+
+    /// The same shape one level down: a root-relative `publicPath` (`/static/`, `/_next/`) prefixes
+    /// the URL with a directory that does not exist under the output root.
+    #[test]
+    fn a_root_relative_public_path_resolves_by_file_name() {
         let dir = tempfile::tempdir().unwrap();
         write(dir.path(), "main.js", "1");
         write(
             dir.path(),
-            "node_modules/pkg/demo.html",
-            r#"<script src="/main.js" integrity="sha384-M"></script>"#,
+            "index.html",
+            r#"<script src="/static/main.js" integrity="sha384-S"></script>"#,
         );
+
+        assert_eq!(pinned(dir.path()), vec![dir.path().join("main.js")]);
+    }
+
+    /// The literal path wins over the file-name fallback: a build with `app.js` in two directories
+    /// must resolve to the one the page actually points at, or the refusal names the wrong file and
+    /// `--exclude`ing that file would not lift it.
+    #[test]
+    fn the_literal_path_decides_when_two_bundles_share_a_name() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "en/app.js", "1");
+        write(dir.path(), "fr/app.js", "2");
         write(
             dir.path(),
-            ".cache/page.html",
-            r#"<script src="/main.js" integrity="sha384-C"></script>"#,
+            "fr/index.html",
+            r#"<script src="app.js" integrity="sha384-F"></script>"#,
+        );
+
+        assert_eq!(pinned(dir.path()), vec![dir.path().join("fr/app.js")]);
+    }
+
+    /// …but a CDN script that is NOT part of this build stays ignored: nothing we stamp bears that
+    /// name, so nothing we do can invalidate its hash.
+    #[test]
+    fn a_third_party_cdn_script_is_still_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "main.js", "1");
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="https://cdn.example.com/jquery-3.7.1.min.js" integrity="sha384-J"></script>"#,
         );
 
         assert_eq!(pinned(dir.path()), Vec::<PathBuf>::new());
+    }
+
+    /// Only a file this run would STAMP can have its hash invalidated. A page pinning a bundle that
+    /// no longer exists (a stale `index.html` from an earlier build), or one the caller excluded, or
+    /// one outside the output entirely, must not stop the run.
+    #[test]
+    fn a_pin_on_something_we_will_not_stamp_is_ignored() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "main.js", "1");
+        write(dir.path(), "vendor/pinned.js", "2");
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="gone.OLD.js" integrity="sha384-G"></script>
+               <script src="vendor/pinned.js" integrity="sha384-V"></script>"#,
+        );
+
+        // `vendor/pinned.js` is real but NOT in the target list — the caller excluded it.
+        let targets: BTreeSet<PathBuf> = [dir.path().join("main.js")].into_iter().collect();
+        assert_eq!(pinned_in(dir.path(), &targets), Vec::<PathBuf>::new());
+    }
+
+    /// A file argument stamps ONE file, so only a pin on that file can matter. Passing the unpinned
+    /// bundle explicitly is the most direct way to follow the error's own advice.
+    #[test]
+    fn a_file_argument_only_counts_pins_on_that_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = write(dir.path(), "app.js", "1");
+        write(dir.path(), "main.js", "2");
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="main.js" integrity="sha384-M"></script>"#,
+        );
+
+        let targets: BTreeSet<PathBuf> = [app.clone()].into_iter().collect();
+        assert_eq!(
+            find_pinned_scripts(std::slice::from_ref(&app), &targets),
+            Vec::new(),
+            "only main.js is pinned, and only app.js would be stamped"
+        );
+
+        // …and a pin on the file we ARE stamping still counts.
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="app.js" integrity="sha384-A"></script>"#,
+        );
+        assert_eq!(
+            find_pinned_scripts(std::slice::from_ref(&app), &targets).len(),
+            1
+        );
+    }
+
+    /// `.htm` and `.xhtml` are pages too, and a deep page is still a page: the walk that stamps has
+    /// no depth limit, so neither can this.
+    #[test]
+    fn it_reads_htm_and_xhtml_and_deep_pages() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "a.js", "1");
+        write(dir.path(), "b.js", "2");
+        write(
+            dir.path(),
+            "legacy.htm",
+            r#"<script src="/a.js" integrity="sha384-A"></script>"#,
+        );
+        write(
+            dir.path(),
+            "a/b/c/d/e/f/g/h/i/deep.xhtml",
+            r#"<script src="/b.js" integrity="sha384-B"/>"#,
+        );
+
+        let mut found = pinned(dir.path());
+        found.sort();
+        let mut want = vec![dir.path().join("a.js"), dir.path().join("b.js")];
+        want.sort();
+        assert_eq!(found, want);
+    }
+
+    /// A comment spanning lines is still a comment (the `(?s)` flag), and `preload` counts as well
+    /// as `modulepreload`.
+    #[test]
+    fn multiline_comments_and_both_preload_rels() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "commented.js", "1");
+        write(dir.path(), "preloaded.js", "2");
+        write(
+            dir.path(),
+            "index.html",
+            "<!--\n<script src=\"commented.js\" integrity=\"sha384-C\"></script>\n-->\n             <link rel=\"preload\" as=\"script\" href=\"preloaded.js\" integrity=\"sha384-P\">",
+        );
+
+        assert_eq!(pinned(dir.path()), vec![dir.path().join("preloaded.js")]);
     }
 }
