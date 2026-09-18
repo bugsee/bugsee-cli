@@ -53,6 +53,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carrying an unresolvable debug-id `missing_sym`, which is what prompts an upload — an unstamped
   bundle is silently unsymbolicated instead.
 
+- **`debug-files upload --strip-sources-content`** (`--type sourcemaps`) — upload each map without
+  its embedded original source. `sourcesContent` carries your code verbatim, and it is what lets a
+  symbolicated crash show source lines; stripping it keeps file/line/column resolution and drops the
+  snippet, for teams who would rather their source did not leave the build machine.
+
+  The map on disk is never modified — only the copy that is uploaded — and the declared `hash`
+  describes the stripped bytes rather than the file that was read. A map that carries no
+  `sourcesContent` (or is not the JSON object we expect) is uploaded byte-for-byte unchanged: this
+  is a privacy preference, not a validator. Rejected (exit 20) for every other `--type`, since no
+  other symbol format embeds source.
+
+  Measured on a real esbuild bundle: 253 → 181 bytes uploaded, local map untouched.
+
 ### Fixed
 - **`debug-files upload --type sourcemaps --dry-run` no longer fails on a map that has no
   debug-id.** A dry run sends nothing, so an un-keyed map cannot register the unfindable symbol the

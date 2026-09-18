@@ -171,6 +171,17 @@ fn sourcemap_only_flags_are_rejected_for_other_types() {
                 "--concurrency is only valid for --type sourcemaps — no other type uploads a \
                  batch of independent files",
             ));
+
+        upload(
+            kind,
+            &["--strip-sources-content", tmp.path().to_str().unwrap()],
+        )
+        .assert()
+        .code(CONFIG_INVALID)
+        .stderr(contains(
+            "--strip-sources-content is only valid for --type sourcemaps — no other symbol format \
+             embeds source",
+        ));
     }
 }
 
