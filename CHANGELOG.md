@@ -61,7 +61,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The map on disk is never modified — only the copy that is uploaded — and the declared `hash`
   describes the stripped bytes rather than the file that was read. A map that carries no
   `sourcesContent` (or is not the JSON object we expect) is uploaded byte-for-byte unchanged: this
-  is a privacy preference, not a validator. Rejected (exit 20) for every other `--type`, since no
+  is a privacy preference, not a validator. An INDEXED map (spec §Index-Map) keeps its source inside
+  `sections[].map`, and those are stripped too — removing only the top-level key would have shipped
+  the source while reporting success. Rejected (exit 20) for every other `--type`, since no
   other symbol format embeds source.
 
   Measured on a real esbuild bundle: 253 → 181 bytes uploaded, local map untouched.
