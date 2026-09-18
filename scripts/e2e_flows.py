@@ -398,6 +398,17 @@ def main():
     results["sourcemaps_uninjected_uploads_nothing"] = not os.path.exists(
         cappath("sourcemaps_uninjected__symbols_posts.jsonl"))
 
+    # The same directory under --dry-run is the documented SAFE diagnostic, and it used to die on
+    # the first un-keyed map (exit 11) — which is why the bundler plugin skips the upload step
+    # entirely on a dry run. It now succeeds and names what `sourcemaps inject` would key.
+    results["sourcemaps_uninjected_dry_run_succeeds"] = run(
+        binpath, "sourcemaps_uninjected_dry",
+        ["debug-files", "upload", "--type", "sourcemaps", "--dry-run",
+         os.path.join(fix, "web-uninjected")] + v,
+        expect_stderr="no debug_id")
+    results["sourcemaps_dry_run_uploads_nothing"] = not os.path.exists(
+        cappath("sourcemaps_uninjected_dry__symbols_posts.jsonl"))
+
     # --concurrency uploads several maps at once: every one of them must still be registered
     # exactly once. (The unit tests prove the overlap itself; this proves nothing is dropped.)
     results["sourcemaps_concurrent_upload"] = run(

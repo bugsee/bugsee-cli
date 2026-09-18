@@ -1545,6 +1545,8 @@ async fn run_sourcemap_upload(
     // Pass 1: identify and key every map, uploading nothing.
     let mut planned = Vec::with_capacity(candidates.len());
     let mut skipped = 0usize;
+    // Maps a DRY RUN found with no debug-id. Always 0 on a real run: that returns on the first one.
+    let mut unkeyed = 0usize;
     for SourcemapCandidate {
         path: map_path,
         explicit,
@@ -1580,18 +1582,34 @@ async fn run_sourcemap_upload(
                 }
                 supplied_str
             }
-            None => identity.debug_id.clone().ok_or_else(|| {
-                input_invalid(format!(
-                    "source map has no debug_id/debugId/uuid: {} — nothing was uploaded. Run \
-                     `bugsee-cli sourcemaps inject <dir>` over the directory holding its JS \
-                     bundle first: inject stamps a `.js`/`.cjs`/`.mjs` bundle's map when it sits \
-                     beside the bundle as `<bundle>.map`, or when the bundle's \
-                     `//# sourceMappingURL=` names it by a relative path inside the bundle's \
-                     directory. For a single map whose id you own (e.g. a React Native \
-                     bundle's), pass that file with --uuid",
-                    map_path.display()
-                ))
-            })?,
+            None => match identity.debug_id.clone() {
+                Some(id) => id,
+                // A dry run sends nothing, so an un-keyed map cannot produce the unfindable symbol
+                // the real run refuses over. Failing here made the documented SAFE diagnostic
+                // unusable on a freshly built directory: `sourcemaps inject --dry-run` writes
+                // nothing by design, so every map is still un-keyed and the preview died on the
+                // first one. Reported and counted instead.
+                None if dry_run => {
+                    unkeyed += 1;
+                    tracing::warn!(
+                        path = %map_path.display(),
+                        "dry run: no debug_id — `sourcemaps inject` keys it before a real upload"
+                    );
+                    continue;
+                }
+                None => {
+                    return Err(input_invalid(format!(
+                        "source map has no debug_id/debugId/uuid: {} — nothing was uploaded. Run \
+                         `bugsee-cli sourcemaps inject <dir>` over the directory holding its JS \
+                         bundle first: inject stamps a `.js`/`.cjs`/`.mjs` bundle's map when it \
+                         sits beside the bundle as `<bundle>.map`, or when the bundle's \
+                         `//# sourceMappingURL=` names it by a relative path inside the bundle's \
+                         directory. For a single map whose id you own (e.g. a React Native \
+                         bundle's), pass that file with --uuid",
+                        map_path.display()
+                    )));
+                }
+            },
         };
         tracing::info!(
             debug_id = %resolved_id,
@@ -1603,6 +1621,17 @@ async fn run_sourcemap_upload(
     }
 
     if planned.is_empty() {
+        // A dry run over a freshly built directory: every map is un-keyed because `inject --dry-run`
+        // wrote nothing. That is the preview working, not a failure — and the stylesheet message
+        // below would be plainly wrong ("all 0 source maps are stylesheet maps").
+        if dry_run && unkeyed > 0 {
+            tracing::info!(
+                unkeyed,
+                skipped,
+                "dry-run complete: no map carries a debug_id yet — `sourcemaps inject` keys them"
+            );
+            return Ok(());
+        }
         if allow_empty {
             tracing::info!(
                 skipped,
@@ -1684,7 +1713,7 @@ async fn run_sourcemap_upload(
     }
 
     if dry_run {
-        tracing::info!(skipped, "dry-run complete");
+        tracing::info!(skipped, unkeyed, "dry-run complete");
     } else {
         tracing::info!(uploaded, already_existed, skipped, "upload complete");
     }
@@ -2892,6 +2921,107 @@ mod sourcemap_upload_tests {
         // fail — c2..c5 are never touched.
         assert_eq!(posted_ids(&server).await, vec!["did-0", "did-1"]);
         assert_eq!(puts(&server).await, 1);
+    }
+
+    /// `--dry-run` is documented as the safe diagnostic, and it could not be used on a freshly built
+    /// output directory at all: `sourcemaps inject --dry-run` writes nothing by design, so the maps
+    /// still carry no debug-id and the upload then failed with exit 11 on the FIRST one. The JS
+    /// bundler plugin works around it by skipping the upload step entirely on a dry run, which means
+    /// the one safe way to preview the flow never exercises the flow.
+    ///
+    /// A dry run sends nothing, so an un-keyed map cannot produce an unfindable symbol — the reason
+    /// the real run refuses. It is now reported and counted instead.
+    #[tokio::test]
+    async fn a_dry_run_reports_maps_with_no_debug_id_instead_of_failing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "keyed.js.map",
+            br#"{"version":3,"debug_id":"11111111-1111-1111-1111-111111111111","mappings":""}"#,
+        );
+        write(tmp.path(), "bare.js.map", br#"{"version":3,"mappings":""}"#);
+        let server = collector(&[]).await;
+
+        // The real run still refuses: uploading an un-keyed map registers a symbol nothing can find.
+        let err = upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak::default(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputInvalid
+        );
+        assert!(
+            posted_ids(&server).await.is_empty(),
+            "nothing is registered"
+        );
+
+        // The dry run succeeds, and still packs the map that IS keyed.
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                dry_run: true,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            posted_ids(&server).await.is_empty(),
+            "a dry run sends nothing"
+        );
+    }
+
+    /// …and when NOTHING is keyed, the dry run is still a success: there is nothing to warn about
+    /// twice, and failing here would put the workaround back.
+    #[tokio::test]
+    async fn a_dry_run_over_an_entirely_uninjected_build_still_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["a.js.map", "b.js.map"] {
+            write(tmp.path(), name, br#"{"version":3,"mappings":""}"#);
+        }
+        let server = collector(&[]).await;
+
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                dry_run: true,
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(puts(&server).await == 0 && posted_ids(&server).await.is_empty());
+    }
+
+    /// An explicit `--uuid` still wins on a dry run — the override is what keys the map, so it is
+    /// not "missing" at all.
+    #[tokio::test]
+    async fn a_dry_run_with_a_uuid_override_keys_the_map_as_usual() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(tmp.path(), "bare.js.map", br#"{"version":3,"mappings":""}"#);
+        let server = collector(&[]).await;
+
+        run_sourcemap_upload(
+            &[tmp.path().join("bare.js.map")],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            Some(Uuid::parse_str("22222222-2222-2222-2222-222222222222").unwrap()),
+            Strategy::Zstd(11),
+            false,
+            None,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
     }
 
     /// A build step that legitimately produces no maps — a monorepo package built without them, a

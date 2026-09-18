@@ -19,6 +19,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carrying an unresolvable debug-id `missing_sym`, which is what prompts an upload — an unstamped
   bundle is silently unsymbolicated instead.
 
+### Fixed
+- **`debug-files upload --type sourcemaps --dry-run` no longer fails on a map that has no
+  debug-id.** A dry run sends nothing, so an un-keyed map cannot register the unfindable symbol the
+  real run refuses over — but it exited 11 on the first one, which made the documented SAFE
+  diagnostic unusable on a freshly built directory: `sourcemaps inject --dry-run` writes nothing by
+  design, so every map is still un-keyed when the preview reaches it. (`@bugsee/bundler-plugin-core`
+  works around this by skipping the upload step entirely on a dry run, so the one safe way to
+  preview the flow never exercised the flow.)
+
+  Such a map is now reported (`dry run: no debug_id — …`) and counted (`unkeyed` in the completion
+  log) instead. A build where NOTHING is keyed completes as a success saying so, rather than falling
+  into the "all 0 source maps are stylesheet maps" branch, which was plainly wrong there. A real run
+  still exits 11 on the first un-keyed map, and `--uuid` still keys a map on a dry run as usual.
+
 ## [0.7.10] - 2026-09-18
 
 ### Added
