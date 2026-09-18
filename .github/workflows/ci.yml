@@ -132,7 +132,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        # windows-latest runs the suite on the platform this ships to. It was absent for a long
+        # time, and the Windows leg was a build-only job, so 500+ tests had never executed there —
+        # a test using a Unix-only API passed every check while breaking `cargo test` for every
+        # Windows developer.
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
