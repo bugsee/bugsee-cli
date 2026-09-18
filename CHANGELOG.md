@@ -20,16 +20,37 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   measured here (200 maps run in 2.75 s at `--concurrency 16`) on purpose: the
   machine that suffers most from serial uploads is a CI box on a thin uplink,
   where the transfer is bandwidth-bound and more streams only add latency.
-  `--concurrency 1` restores the old sequential behaviour; the identification
-  pass stays sorted and still fails before anything is uploaded.
+  `--concurrency 1` restores the old sequential ordering; the identification
+  pass stays sorted and still fails before anything is uploaded. An explicit
+  `--uuid` forces sequential uploads whatever the ceiling, because it keys every
+  map in the scan under the same id and those registrations must not race.
 - **`debug-files upload --allow-empty`** treats "nothing to upload" as success
   instead of exit 10 (`--type sourcemaps`). A monorepo package built without
   maps, or a framework whose server output has none, is a legitimate no-op — but
   it failed the caller's build, or (with the plugin's default) warned while the
   maps that DID exist elsewhere went unuploaded, because the pass had aborted.
   `xcode upload-dsyms` already treats nothing-to-upload as success by design.
-  A path that does not exist is still an error (`path does not exist: …`), so a
-  typo'd output directory is not swallowed by the flag.
+  A path that does not exist is an error regardless (`path does not exist: …`),
+  so a typo'd output directory is not swallowed by the flag — see Changed.
+
+### Changed
+- **A path that does not exist is now an error, even when other paths hold maps.**
+  `debug-files upload --type sourcemaps dist/ missing/` used to warn about
+  `missing/`, upload what it found under `dist/` and exit 0. It now exits 10
+  with `path does not exist: …` before uploading anything. A path the caller
+  named and the tool cannot find is a typo or a build that did not run, and
+  half-uploading a build's symbols hides that until a crash is unsymbolicated.
+  Callers that relied on the old leniency should drop the missing path from the
+  invocation. (The bundler plugins pass a single output directory and are
+  unaffected.)
+- **A failed upload stops the batch.** With the uploads now concurrent, the
+  first failure cancels the rest instead of letting every remaining map pack,
+  register and PUT into a server that has already refused one — a rejected token
+  on a 200-chunk build was 400 doomed round-trips. At `--concurrency 1` this is
+  exactly what the old sequential loop did.
+- **`--concurrency` and `--allow-empty` are rejected for other `--type`s**
+  (exit 20), rather than accepted and ignored: a caller who passed
+  `--allow-empty` to keep a build green would otherwise still get exit 10.
 
 ### Fixed
 - **A 429 no longer fails a non-idempotent upload request.** The symbol metadata

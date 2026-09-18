@@ -211,10 +211,20 @@ bandwidth-bound and extra streams only add latency to each one. Raise it if you
 have measured your own link; `--concurrency 1` restores strictly sequential
 uploads.
 
+An explicit `--uuid` keys every map in the scan under one id, so it forces
+sequential uploads whatever the ceiling says — those registrations must not race
+each other. A failed upload stops the batch rather than letting the rest run
+into a server that has already refused one.
+
 `--allow-empty` turns "nothing to upload" into success (exit 0) instead of
 exit 10 — a monorepo package built without maps, or a framework whose server
 output has none, is a legitimate no-op rather than a reason to fail the build.
-A path that does not exist is still an error, so a typo is not swallowed.
+A path that does not exist is an error regardless (`path does not exist: <p>`,
+exit 10) — including when other paths do hold maps — so a typo or a build that
+never ran cannot half-upload a build's symbols.
+
+Both flags apply to `--type sourcemaps` only, and are rejected (exit 20) for any
+other type rather than accepted and ignored.
 
 ```
 bugsee-cli sourcemaps inject <paths>... [--dry-run]

@@ -1,5 +1,5 @@
 use clap::{Subcommand, ValueEnum};
-use futures_util::StreamExt;
+use futures_util::{StreamExt, TryStreamExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 use walkdir::WalkDir;
@@ -246,6 +246,21 @@ pub async fn dispatch(
                         .map_err(|e| input_invalid(format!("--uuid is not a valid UUID: {e}")))?,
                 )
             };
+
+            // Sourcemaps is the only type that uploads a batch of independent files, and the only
+            // one for which "found nothing" can be a legitimate build shape. Silently ignoring
+            // these elsewhere would leave a caller who passed --allow-empty to keep their build
+            // green with exit 10 anyway.
+            if kind != DebugFileType::Sourcemaps && allow_empty {
+                return Err(config_invalid(
+                    "--allow-empty is only valid for --type sourcemaps — every other type treats                      an empty input as a configuration mistake",
+                ));
+            }
+            if kind != DebugFileType::Sourcemaps && concurrency.is_some() {
+                return Err(config_invalid(
+                    "--concurrency is only valid for --type sourcemaps — no other type uploads a                      batch of independent files",
+                ));
+            }
 
             if kind != DebugFileType::Proguard && icon.is_some() {
                 return Err(config_invalid(
@@ -1401,8 +1416,21 @@ async fn upload_one_sourcemap(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("bundle.js.map");
-    let entries = vec![ZipEntry::compressed(entry_name, map_path)];
-    let zip_size = compress::pack_entries(&entries, &zip_path, ctx.strategy)?;
+    // zstd-11 over a source map is real CPU work (~6 ms for a typical map, ~22 ms for a 1.6 MB
+    // one). All these futures are polled by ONE task, so packing inline would serialise across
+    // concurrent uploads and stall the in-flight requests' I/O while it ran.
+    let (entry_name, map_owned, zip_owned, strategy) = (
+        entry_name.to_string(),
+        map_path.to_path_buf(),
+        zip_path.clone(),
+        ctx.strategy,
+    );
+    let zip_size = tokio::task::spawn_blocking(move || {
+        let entries = vec![ZipEntry::compressed(&entry_name, &map_owned)];
+        compress::pack_entries(&entries, &zip_owned, strategy)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("packing {} failed to run: {e}", map_path.display()))??;
     tracing::info!(path = %map_path.display(), zip_size, strategy = ?ctx.strategy, "packed");
 
     if dry_run {
@@ -1596,43 +1624,55 @@ async fn run_sourcemap_upload(
     // matters (it is sorted, and it fails before anything is uploaded), not here.
     // `buffer_unordered` never opens more than there are maps, so this is a ceiling: the actual
     // width is `min(ceiling, planned.len())`.
-    let ceiling = concurrency.unwrap_or_else(|| default_upload_concurrency(planned.len()));
+    let ceiling = if uuid_override.is_some() {
+        // `--uuid` keys every map in the scan under the SAME id, so these uploads are not
+        // independent: concurrent registrations of one id race each other (the server dedups among
+        // READY records, so a POST arriving while the first is still uploading can leave a second
+        // record). Sequential, whatever the ceiling says.
+        1
+    } else {
+        concurrency.unwrap_or_else(|| default_upload_concurrency(planned.len()))
+    };
     tracing::info!(
         maps = planned.len(),
         concurrency = ceiling.min(planned.len()),
         "uploading"
     );
-    let uploads: Vec<anyhow::Result<Option<presigned::Outcome>>> =
-        futures_util::stream::iter(planned)
-            .map(|(map_path, identity, resolved_id)| {
-                let client = client.clone();
-                async move {
-                    upload_one_sourcemap(
-                        client.as_ref(),
-                        SourcemapUploadCtx {
-                            endpoint,
-                            app_token,
-                            version,
-                            build,
-                            strategy,
-                            force,
-                        },
-                        &map_path,
-                        &identity,
-                        &resolved_id,
-                        dry_run,
-                    )
-                    .await
-                }
+    let uploads: Vec<Option<presigned::Outcome>> = futures_util::stream::iter(planned)
+        // `Ok(async move { … })` makes this a stream of fallible futures, which is what
+        // `try_buffer_unordered` consumes.
+        .map(|(map_path, identity, resolved_id)| {
+            let client = client.clone();
+            Ok(async move {
+                upload_one_sourcemap(
+                    client.as_ref(),
+                    SourcemapUploadCtx {
+                        endpoint,
+                        app_token,
+                        version,
+                        build,
+                        strategy,
+                        force,
+                    },
+                    &map_path,
+                    &identity,
+                    &resolved_id,
+                    dry_run,
+                )
+                .await
             })
-            .buffer_unordered(ceiling)
-            .collect()
-            .await;
+        })
+        // `try_buffer_unordered`, not `buffer_unordered`: the first failure stops the batch rather
+        // than letting every remaining map pack, register and PUT into a server that has already
+        // said no. The serial loop this replaced stopped at the first error too.
+        .try_buffer_unordered(ceiling)
+        .try_collect()
+        .await?;
 
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
     for outcome in uploads {
-        match outcome? {
+        match outcome {
             Some(presigned::Outcome::Uploaded) => uploaded += 1,
             Some(presigned::Outcome::AlreadyExists) => already_existed += 1,
             None => {} // dry run: packed, not sent
@@ -2128,11 +2168,16 @@ mod sourcemap_upload_tests {
             .count()
     }
 
+    /// Sequential on purpose: several of these tests assert the POST order, which is only
+    /// meaningful when the uploads are not racing. Concurrency has its own tests.
     async fn upload_dir(dir: &std::path::Path, endpoint: &str) -> anyhow::Result<()> {
         upload_paths(
             &[dir.to_path_buf()],
             endpoint,
-            SourcemapUploadTweak::default(),
+            SourcemapUploadTweak {
+                concurrency: Some(1),
+                ..SourcemapUploadTweak::default()
+            },
         )
         .await
     }
@@ -2575,7 +2620,7 @@ mod sourcemap_upload_tests {
         assert_eq!(puts(&server).await, 1);
     }
 
-    /// The ceiling scales with how much there is to send, floor 4, cap 12.
+    /// The ceiling scales with how much there is to send, floor 4, cap 8.
     #[test]
     fn the_default_ceiling_scales_with_the_number_of_maps() {
         // A small build is bounded by its own map count anyway, so the floor is what applies.
@@ -2659,15 +2704,14 @@ mod sourcemap_upload_tests {
             "the default ceiling should be the ramp's floor of 4 ({defaulted:?})"
         );
 
+        // Exactly 4 — the same reasoning as the None case above. A band ("more than one, no more
+        // than four") would also be satisfied by an implementation that silently capped an
+        // explicit ceiling at 2.
         let parallel = arrivals(Some(4)).await;
-        let first_put = parallel.iter().position(|k| *k == "PUT").expect("no PUT");
-        assert!(
-            first_put > 1,
-            "uploads never overlapped: only {first_put} POST(s) before the first PUT ({parallel:?})"
-        );
-        assert!(
-            first_put <= 4,
-            "more uploads in flight than asked for ({parallel:?})"
+        assert_eq!(
+            parallel.iter().position(|k| *k == "PUT"),
+            Some(4),
+            "an explicit ceiling of 4 must put exactly 4 POSTs on the wire first ({parallel:?})"
         );
 
         let sequential = arrivals(Some(1)).await;
@@ -2721,6 +2765,129 @@ mod sourcemap_upload_tests {
             crate::error::classify(&err),
             crate::exit_code::ExitCode::UploadServer
         );
+    }
+
+    /// `--uuid` keys EVERY map in the scan under the same id, so those uploads are not
+    /// independent any more: concurrent registrations of one id race each other (the server dedups
+    /// among READY records — see `presigned::upload` — so a second POST arriving while the first is
+    /// still uploading can leave a second record, and with `--force` the winner decides what ends
+    /// up under that id). The override therefore forces sequential uploads, whatever the ceiling.
+    #[tokio::test]
+    async fn a_uuid_override_uploads_sequentially_however_high_the_ceiling() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..4 {
+            write(
+                tmp.path(),
+                &format!("c{i}.js.map"),
+                br#"{"version":3,"mappings":""}"#,
+            );
+            let _ = i;
+        }
+        let server = MockServer::start().await;
+        let log = ArrivalLog::new();
+        let put_url = format!("{}/sourcemap-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(RecordArrival {
+                log: log.clone(),
+                kind: "POST",
+                response: ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "code": 0, "endpoint": put_url }))
+                    .set_delay(std::time::Duration::from_millis(80)),
+            })
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/sourcemap-put"))
+            .respond_with(RecordArrival {
+                log: log.clone(),
+                kind: "PUT",
+                response: ResponseTemplate::new(200),
+            })
+            .mount(&server)
+            .await;
+
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            Some(Uuid::parse_str("11111111-2222-3333-4444-555555555555").unwrap()),
+            Strategy::Zstd(11),
+            false,
+            Some(8),
+            false,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            log.snapshot(),
+            vec!["POST", "PUT", "POST", "PUT", "POST", "PUT", "POST", "PUT"],
+            "an explicit --uuid must not race registrations of the same id"
+        );
+    }
+
+    /// A failure must STOP the batch, not merely fail the exit code at the end of it. The serial
+    /// loop this replaced stopped at the first error; a `buffer_unordered` that collects every
+    /// result would keep packing and sending every remaining map — 200 doomed round-trips on a
+    /// rejected token — and would discard every error but the first to complete.
+    #[tokio::test]
+    async fn a_failing_upload_stops_the_batch() {
+        let tmp = tempfile::tempdir().unwrap();
+        for i in 0..6 {
+            write(
+                tmp.path(),
+                &format!("c{i}.js.map"),
+                format!(r#"{{"version":3,"debug_id":"did-{i}","mappings":""}}"#).as_bytes(),
+            );
+        }
+        let server = MockServer::start().await;
+        // The maps are identified in sorted order, so `did-1` is the second upload.
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .and(wiremock::matchers::body_partial_json(
+                serde_json::json!({ "uuid": "did-1" }),
+            ))
+            .respond_with(ResponseTemplate::new(500).set_body_string("boom"))
+            .with_priority(1)
+            .mount(&server)
+            .await;
+        let put_url = format!("{}/sourcemap-put", server.uri());
+        Mock::given(method("POST"))
+            .and(wm_path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "code": 0, "endpoint": put_url
+            })))
+            .with_priority(5)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(wm_path("/sourcemap-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let err = upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                concurrency: Some(1),
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::UploadServer
+        );
+        // Sequentially that is exactly what the old loop did: register c0, PUT it, register c1,
+        // fail — c2..c5 are never touched.
+        assert_eq!(posted_ids(&server).await, vec!["did-0", "did-1"]);
+        assert_eq!(puts(&server).await, 1);
     }
 
     /// A build step that legitimately produces no maps — a monorepo package built without them, a
