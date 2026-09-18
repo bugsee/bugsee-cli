@@ -449,6 +449,36 @@ def main():
                                                     os.path.join(fix, "mapping.txt")] + v)
     results["sourcemaps_upload"] = run(binpath, "sourcemaps", ["debug-files", "upload", "--type", "sourcemaps",
                                        os.path.join(fix, "dist", "app.js.map")] + v)
+
+    # --strip-sources-content: the uploaded copy must not carry the source, and the file on disk
+    # must be untouched — it is the user's build output.
+    sc_map = os.path.join(fix, "with-sources", "app.js.map")
+    os.makedirs(os.path.dirname(sc_map), exist_ok=True)
+    with open(sc_map, "w") as f:
+        json.dump({"version": 3, "debug_id": "77777777-7777-7777-7777-777777777777",
+                   "sources": ["app.ts"], "sourcesContent": ["const secret = 1;"],
+                   "names": [], "mappings": "AAAA"}, f)
+    before = open(sc_map, "rb").read()
+    results["sourcemaps_strip_sources_content"] = run(
+        binpath, "sourcemaps_strip",
+        ["debug-files", "upload", "--type", "sourcemaps", "--strip-sources-content", sc_map] + v)
+    try:
+        import zipfile as _zf
+        uploaded = None
+        for name in os.listdir(STATE["cap"]):
+            if name.startswith("sourcemaps_strip__") and name.endswith(".bin"):
+                with _zf.ZipFile(os.path.join(STATE["cap"], name)) as z:
+                    uploaded = json.loads(z.read(z.namelist()[0]))
+        results["sourcemaps_strip_uploads_no_source"] = (
+            uploaded is not None
+            and "sourcesContent" not in uploaded
+            and uploaded.get("mappings") == "AAAA"
+            and open(sc_map, "rb").read() == before)
+        if not results["sourcemaps_strip_uploads_no_source"]:
+            print(f"  [warn] uploaded={uploaded!r}")
+    except Exception as e:
+        print("  [warn] could not verify the strip flow:", e)
+        results["sourcemaps_strip_uploads_no_source"] = False
     results["elf"] = run(binpath, "elf", ["debug-files", "upload", "--type", "elf",
                                           os.path.join(fix, "native-debug-symbols.zip"),
                                           "--uuid", "11111111-2222-3333-4444-555555555555"] + v)

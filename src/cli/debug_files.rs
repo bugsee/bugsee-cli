@@ -117,6 +117,15 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         allow_empty: bool,
 
+        /// Upload source maps WITHOUT their embedded original source. `--type sourcemaps` only.
+        ///
+        /// A map's `sourcesContent` carries your source verbatim, which is how a symbolicated crash
+        /// shows source lines. Stripping it keeps file/line/column symbolication and drops the
+        /// snippet, for teams who would rather their code did not leave the build machine. The map
+        /// on disk is NOT modified — only the copy that is uploaded.
+        #[arg(long)]
+        strip_sources_content: bool,
+
         /// Dry-run — discover and pack files but skip the HTTP upload.
         #[arg(long)]
         dry_run: bool,
@@ -210,6 +219,7 @@ pub async fn dispatch(
             force,
             concurrency,
             allow_empty,
+            strip_sources_content,
             dry_run,
         } => {
             let kind = r#type.unwrap_or(DebugFileType::Proguard);
@@ -258,6 +268,11 @@ pub async fn dispatch(
             if kind != DebugFileType::Sourcemaps && allow_empty {
                 return Err(config_invalid(
                     "--allow-empty is only valid for --type sourcemaps — every other type treats an empty input as a configuration mistake",
+                ));
+            }
+            if kind != DebugFileType::Sourcemaps && strip_sources_content {
+                return Err(config_invalid(
+                    "--strip-sources-content is only valid for --type sourcemaps — no other symbol format embeds source",
                 ));
             }
             if kind != DebugFileType::Sourcemaps && concurrency.is_some() {
@@ -370,6 +385,7 @@ pub async fn dispatch(
                     concurrency.map(usize::from),
                     allow_empty,
                     dry_run,
+                    strip_sources_content,
                 )
                 .await;
             }
@@ -1399,6 +1415,9 @@ struct SourcemapUploadCtx<'a> {
     build: &'a str,
     strategy: Strategy,
     force: bool,
+    /// Drop `sourcesContent` from the COPY that is uploaded. The file on disk is the caller's build
+    /// output and is never rewritten.
+    strip_sources_content: bool,
 }
 
 /// Pack ONE `.map` and register + PUT it. `None` when this was a dry run (packed, never sent).
@@ -1420,6 +1439,15 @@ async fn upload_one_sourcemap(
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("bundle.js.map");
+
+    // `--strip-sources-content`: pack a COPY without the embedded original source. The file on disk
+    // is the caller's build output — rewriting it would take away their own debugging, and the
+    // bundler plugins delete these maps after a successful upload anyway.
+    let stripped = stripped_copy_without_sources(map_path, tmpdir.path(), ctx)?;
+    let (map_path, identity) = match stripped.as_ref() {
+        Some((path, id)) => (path.as_path(), id),
+        None => (map_path, identity),
+    };
     // zstd-11 over a source map is real CPU work (~6 ms for a typical map, ~22 ms for a 1.6 MB
     // one). All these futures are polled by ONE task, so packing inline would serialise across
     // concurrent uploads and stall the in-flight requests' I/O while it ran.
@@ -1508,6 +1536,7 @@ async fn run_sourcemap_upload(
     concurrency: Option<usize>,
     allow_empty: bool,
     dry_run: bool,
+    strip_sources_content: bool,
 ) -> anyhow::Result<()> {
     // A path that does not exist is a typo, not an empty build: it must not be swallowed by
     // `--allow-empty`, and naming it beats the "no .map files found under …" it used to produce.
@@ -1686,6 +1715,7 @@ async fn run_sourcemap_upload(
                         build,
                         strategy,
                         force,
+                        strip_sources_content,
                     },
                     &map_path,
                     &identity,
@@ -1737,6 +1767,53 @@ fn is_stylesheet_or_declaration_map(path: &Path) -> bool {
     [".css.map", ".d.ts.map", ".d.mts.map", ".d.cts.map"]
         .iter()
         .any(|suffix| name.ends_with(suffix))
+}
+
+/// A copy of `map_path` with `sourcesContent` removed, plus its recomputed identity — or `None`
+/// when nothing needs stripping (flag off, no `sourcesContent`, or the map is not the JSON object we
+/// expect, which is a privacy preference's business to ignore rather than to fail over).
+///
+/// The identity is recomputed because the declared `hash` must describe what is UPLOADED. The
+/// debug-id is carried over untouched: it is the key, and re-deriving it here would break the pair
+/// with the bundle that `sourcemaps inject` stamped.
+fn stripped_copy_without_sources(
+    map_path: &Path,
+    tmpdir: &Path,
+    ctx: SourcemapUploadCtx<'_>,
+) -> anyhow::Result<Option<(PathBuf, sourcemap::SourcemapIdentity)>> {
+    if !ctx.strip_sources_content {
+        return Ok(None);
+    }
+    let bytes = std::fs::read(map_path)?;
+    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice(&bytes) else {
+        return Ok(None);
+    };
+    if map.remove("sourcesContent").is_none() {
+        return Ok(None);
+    }
+    let stripped = serde_json::to_vec(&map)?;
+    let name = map_path
+        .file_name()
+        .map(Path::new)
+        .unwrap_or_else(|| Path::new("bundle.js.map"));
+    let out = tmpdir.join(name);
+    std::fs::write(&out, &stripped)?;
+    tracing::info!(
+        path = %map_path.display(),
+        before_bytes = bytes.len(),
+        after_bytes = stripped.len(),
+        "stripped sourcesContent from the uploaded copy"
+    );
+    let identity = sourcemap::SourcemapIdentity {
+        debug_id: crate::inject::read_debug_id(&out)?,
+        content_sha1_hex: {
+            use sha1::Digest;
+            let digest: [u8; 20] = sha1::Sha1::digest(&stripped).into();
+            hex::encode(digest)
+        },
+        size_bytes: stripped.len() as u64,
+    };
+    Ok(Some((out, identity)))
 }
 
 /// Pack a `.dSYM` bundle's entries into a temp zip with the chosen strategy.
@@ -2015,6 +2092,7 @@ mod sourcemap_upload_tests {
             None,
             false,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -2102,6 +2180,7 @@ mod sourcemap_upload_tests {
             None,
             false,
             false,
+            false,
         )
         .await
         .unwrap_err();
@@ -2133,6 +2212,7 @@ mod sourcemap_upload_tests {
             None,
             false,
             true,
+            false,
         )
         .await
         .unwrap();
@@ -2223,6 +2303,7 @@ mod sourcemap_upload_tests {
         concurrency: Option<usize>,
         allow_empty: bool,
         dry_run: bool,
+        strip_sources_content: bool,
     }
 
     async fn upload_paths(
@@ -2242,6 +2323,7 @@ mod sourcemap_upload_tests {
             tweak.concurrency,
             tweak.allow_empty,
             tweak.dry_run,
+            tweak.strip_sources_content,
         )
         .await
     }
@@ -2378,6 +2460,7 @@ mod sourcemap_upload_tests {
             None,
             false,
             false,
+            false,
         )
         .await
         .unwrap_err();
@@ -2414,6 +2497,7 @@ mod sourcemap_upload_tests {
                 None,
                 false,
                 dry_run,
+                false,
             )
             .await
             .unwrap_err();
@@ -2603,6 +2687,7 @@ mod sourcemap_upload_tests {
                 None,
                 false,
                 false,
+                false,
             )
             .await
             .unwrap();
@@ -2641,6 +2726,7 @@ mod sourcemap_upload_tests {
             Strategy::Zstd(11),
             false,
             None,
+            false,
             false,
             false,
         )
@@ -2852,6 +2938,7 @@ mod sourcemap_upload_tests {
             Some(8),
             false,
             false,
+            false,
         )
         .await
         .unwrap();
@@ -3019,9 +3106,189 @@ mod sourcemap_upload_tests {
             None,
             false,
             true,
+            false,
         )
         .await
         .unwrap();
+    }
+
+    /// What we actually PUT: the single `.map` entry, decompressed out of the uploaded zip. The
+    /// only way to assert on the bytes that leave the machine rather than on the ones on disk.
+    async fn uploaded_map_bytes(server: &MockServer) -> Vec<u8> {
+        let requests = server.received_requests().await.unwrap();
+        let put = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .expect("no PUT");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(put.body.clone())).expect("not a zip");
+        assert_eq!(archive.len(), 1, "one entry: just the map");
+        let mut entry = archive.by_index(0).unwrap();
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+        body
+    }
+
+    async fn uploaded_map_json(server: &MockServer) -> serde_json::Value {
+        let requests = server.received_requests().await.unwrap();
+        let put = requests
+            .iter()
+            .find(|r| r.method.as_str() == "PUT")
+            .expect("no PUT");
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(put.body.clone())).expect("not a zip");
+        assert_eq!(archive.len(), 1, "one entry: just the map");
+        let mut entry = archive.by_index(0).unwrap();
+        let mut body = String::new();
+        std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
+        serde_json::from_str(&body).expect("uploaded map is not JSON")
+    }
+
+    /// `sourcesContent` embeds the ORIGINAL SOURCE in the map, which is how symbolication shows
+    /// source lines — and also means the upload ships the customer's code to the backend. Teams who
+    /// would rather it did not can strip it; they keep file/line/column symbolication and lose the
+    /// source snippet.
+    #[tokio::test]
+    async fn strip_sources_content_removes_the_source_from_what_is_uploaded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let original = br#"{"version":3,"file":"app.js","debug_id":"11111111-1111-1111-1111-111111111111","sources":["src/app.ts"],"sourcesContent":["const secret = 'hunter2';\n"],"names":[],"mappings":"AAAA"}"#;
+        write(tmp.path(), "app.js.map", original);
+        let server = collector(&[]).await;
+
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let uploaded = uploaded_map_json(&server).await;
+        assert!(
+            uploaded.get("sourcesContent").is_none(),
+            "sourcesContent must not leave the machine: {uploaded}"
+        );
+        // Everything symbolication needs is still there.
+        assert_eq!(uploaded["mappings"], "AAAA");
+        assert_eq!(uploaded["sources"], serde_json::json!(["src/app.ts"]));
+        assert_eq!(uploaded["debug_id"], "11111111-1111-1111-1111-111111111111");
+
+        // The user's own file is untouched — it is their build output, and their local debugging.
+        let on_disk = std::fs::read(tmp.path().join("app.js.map")).unwrap();
+        assert_eq!(on_disk, original, "the map on disk must not be rewritten");
+    }
+
+    /// The declared `hash` must describe what was UPLOADED, not the file we read.
+    #[tokio::test]
+    async fn stripping_updates_the_declared_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "app.js.map",
+            br#"{"version":3,"debug_id":"22222222-2222-2222-2222-222222222222","sources":["a.ts"],"sourcesContent":["x"],"names":[],"mappings":"AAAA"}"#,
+        );
+        let server = collector(&[]).await;
+
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        let requests = server.received_requests().await.unwrap();
+        let post: serde_json::Value = serde_json::from_slice(
+            &requests
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .unwrap()
+                .body,
+        )
+        .unwrap();
+        let uploaded = uploaded_map_json(&server).await;
+        let expected = {
+            use sha1::Digest;
+            let digest: [u8; 20] =
+                sha1::Sha1::digest(serde_json::to_vec(&uploaded).unwrap()).into();
+            hex::encode(digest)
+        };
+        assert_eq!(post["hash"].as_str().unwrap(), expected);
+    }
+
+    /// Without the flag, the source rides along exactly as before — that is what makes the
+    /// symbolicated frame show a source line.
+    #[tokio::test]
+    async fn sources_content_is_kept_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "app.js.map",
+            br#"{"version":3,"debug_id":"33333333-3333-3333-3333-333333333333","sources":["a.ts"],"sourcesContent":["const x = 1;"],"names":[],"mappings":"AAAA"}"#,
+        );
+        let server = collector(&[]).await;
+
+        upload_dir(tmp.path(), &server.uri()).await.unwrap();
+
+        assert_eq!(
+            uploaded_map_json(&server).await["sourcesContent"],
+            serde_json::json!(["const x = 1;"])
+        );
+    }
+
+    /// A map that carries no `sourcesContent` — or is not the JSON we expect — uploads unchanged
+    /// rather than failing: the flag is a privacy preference, not a validator.
+    #[tokio::test]
+    async fn stripping_a_map_with_no_sources_content_changes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "app.js.map",
+            br#"{"version":3,"debug_id":"44444444-4444-4444-4444-444444444444","sources":["a.ts"],"names":[],"mappings":"AAAA"}"#,
+        );
+        let server = collector(&[]).await;
+
+        run_sourcemap_upload(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            "TKN",
+            "1.0",
+            "1",
+            None,
+            Strategy::Zstd(11),
+            false,
+            None,
+            false,
+            false,
+            true,
+        )
+        .await
+        .unwrap();
+
+        // BYTE-identical: with nothing to strip there is no reason to re-serialize the map, and
+        // doing so would change the bytes (and the hash) of a file we were asked to leave alone.
+        assert_eq!(
+            uploaded_map_bytes(&server).await,
+            std::fs::read(tmp.path().join("app.js.map")).unwrap()
+        );
     }
 
     /// A build step that legitimately produces no maps — a monorepo package built without them, a
@@ -3135,6 +3402,7 @@ mod sourcemap_upload_tests {
             None,
             false,
             true,
+            false,
         )
         .await
         .unwrap_err();
