@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.11] - 2026-09-18
+
 ### Added
 - **`sourcemaps inject` refuses a build that pins its own script hashes** (Subresource Integrity),
   exit 20. Injecting appends bytes to every `.js`, so a hash the HTML already carries stops matching
@@ -34,7 +36,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   parent (the usual layout is `dist/index.html` beside `dist/assets/*.js`). `--dry-run` refuses too:
   the preview of a run that would refuse is a refusal, and it says why.
 
-  It cannot see SRI that never reaches the emitted HTML — a manifest consumed by a server template,
+  See [#49]. It cannot see SRI that never reaches the emitted HTML — a manifest consumed by a server template,
   a page rendered at request time (Next.js `experimental.sri`), or HTML written outside the directory
   it was pointed at.
 
@@ -47,7 +49,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `dist/vendor/**`, `vendor/**` and an absolute path all work whether the root is passed as `dist`,
   `./dist` or absolute. `*` crosses `/` (globset's default). An unparseable OR EMPTY pattern is a configuration error
   (exit 20), never a silent "matches nothing" that would rewrite the files you meant to protect.
-  `js_excluded` is reported in the completion log.
+  `js_excluded` is reported in the completion log. See [#45].
 
   Stamping a bundle that has NO map stays the default and is deliberate: the backend marks a crash
   carrying an unresolvable debug-id `missing_sym`, which is what prompts an upload — an unstamped
@@ -66,7 +68,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the source while reporting success. Rejected (exit 20) for every other `--type`, since no
   other symbol format embeds source.
 
-  Measured on a real esbuild bundle: 253 → 181 bytes uploaded, local map untouched.
+  Measured on a real esbuild bundle: 253 → 181 bytes uploaded, local map untouched. See [#48].
 
 ### Fixed
 - **`debug-files upload --type sourcemaps --dry-run` no longer fails on a map that has no
@@ -81,6 +83,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   log) instead. A build where NOTHING is keyed completes as a success saying so, rather than falling
   into the "all 0 source maps are stylesheet maps" branch, which was plainly wrong there. A real run
   still exits 11 on the first un-keyed map, and `--uuid` still keys a map on a dry run as usual.
+  See [#47].
+
+### Changed
+- **The test suite now runs on Windows** — both x64 and the native ARM64 runner, not just a release
+  build. It had never executed there, and the first run found three real defects: `cargo test` did
+  not compile at all (a helper used only by `#[cfg(unix)]` tests is dead code, which `-D warnings`
+  makes fatal); `env_clear()` in the integration tests strips `SystemRoot`, without which WinSock
+  cannot initialise, so every request from the child failed with "error sending request"; and the
+  updater's e2e harness only ever built the Unix release artifact, so the Windows run asked its own
+  mock for a file it had never mounted. All three were in the tests, not the product. See [#50].
+
+[#45]: https://github.com/bugsee/bugsee-cli/pull/45
+[#47]: https://github.com/bugsee/bugsee-cli/pull/47
+[#48]: https://github.com/bugsee/bugsee-cli/pull/48
+[#49]: https://github.com/bugsee/bugsee-cli/pull/49
+[#50]: https://github.com/bugsee/bugsee-cli/pull/50
 
 ## [0.7.10] - 2026-09-18
 
