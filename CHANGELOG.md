@@ -6,13 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.10] - 2026-09-18
+
 ### Added
 - **`debug-files upload --type sourcemaps` uploads several maps at a time.**
   Each map is an independent metadata POST + presigned PUT pair and the loop was
   strictly sequential, so a web build with one map per chunk spent its upload
   time waiting on round-trips. Measured against a mock with 50 ms of injected
   latency: 60 maps **7.09 s → 1.31 s**, 200 maps **23.58 s → 4.10 s**. A
-  few-hundred-chunk app on a CI runner paid the serial floor every build.
+  few-hundred-chunk app on a CI runner paid the serial floor every build. See [#42].
 
   `--concurrency N` (1..=32) sets a **ceiling**, not a fixed width — no more
   uploads run than there are maps. Left unset it scales with the batch: one
@@ -32,6 +34,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `xcode upload-dsyms` already treats nothing-to-upload as success by design.
   A path that does not exist is an error regardless (`path does not exist: …`),
   so a typo'd output directory is not swallowed by the flag — see Changed.
+
+[#42]: https://github.com/bugsee/bugsee-cli/pull/42
 
 ### Changed
 - **A path that does not exist is now an error, even when other paths hold maps.**
