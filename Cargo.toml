@@ -133,7 +133,7 @@ plist = "1"
 # symbolic-il2cpp = "13"  # experimental, for the Unity gap
 
 # Compression — zstd is the wire format (level 9–11 typical); zip writes archives with Z_STANDARD entries
-zstd = { version = "0.13", features = ["zstdmt"] }
+zstd = { version = "0.14", features = ["zstdmt"] }
 zip = { version = "8", default-features = false, features = ["zstd", "deflate"] }
 
 # gzip — `.xcactivitylog` build logs are gzip of an SLF0 token stream. Already
