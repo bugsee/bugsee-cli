@@ -1816,20 +1816,28 @@ fn stripped_copy_without_sources(
     if !strip {
         return Ok(None);
     }
-    let bytes = std::fs::read(map_path)?;
+    // Typed, not a bare `?` into anyhow: an I/O failure on the map must classify the way
+    // `sourcemap::identify` classifies one on the SAME file moments earlier — exit 10, which
+    // integrators are documented not to fall back on — rather than exit 1 ("unexpected").
+    let bytes = std::fs::read(map_path).map_err(crate::error::Error::Io)?;
     let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice(&bytes) else {
         return Ok(None);
     };
     if !remove_sources_content(&mut map) {
         return Ok(None);
     }
-    let stripped = serde_json::to_vec(&map)?;
+    let stripped = serde_json::to_vec(&map).map_err(|e| {
+        input_invalid(format!(
+            "{}: could not re-serialize the map without its sources: {e}",
+            map_path.display()
+        ))
+    })?;
     let name = map_path
         .file_name()
         .map(Path::new)
         .unwrap_or_else(|| Path::new("bundle.js.map"));
     let out = tmpdir.join(name);
-    std::fs::write(&out, &stripped)?;
+    std::fs::write(&out, &stripped).map_err(crate::error::Error::Io)?;
     tracing::info!(
         path = %map_path.display(),
         before_bytes = bytes.len(),
@@ -3332,6 +3340,64 @@ mod sourcemap_upload_tests {
         assert_eq!(uploaded["sections"][1]["offset"]["line"], 9);
         assert_eq!(uploaded["sections"][0]["map"]["mappings"], "AAAA");
         assert_eq!(uploaded["debug_id"], "55555555-5555-5555-5555-555555555555");
+    }
+
+    /// The exit code is an integrator contract: 10 means "input not found, do not fall back", 1
+    /// means "unexpected, you may fall back". Reading the map through a bare `?` into `anyhow`
+    /// classified an I/O failure as 1, unlike `sourcemap::identify` reading the very same file
+    /// moments earlier. Driven at the function, because `run_sourcemap_upload` reads the map through
+    /// `identify` FIRST — which is exactly why the misclassification could sit here unnoticed.
+    #[test]
+    fn a_strip_that_cannot_read_or_write_is_input_not_found() {
+        // As root, chmod 000 does not stop a read; there is nothing to assert.
+        if std::env::var_os("USER").is_some_and(|u| u == "root") {
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+
+        // 1. The map vanished between `identify` and here (the TOCTOU window).
+        let missing = tmp.path().join("gone.js.map");
+        let err = stripped_copy_without_sources(&missing, tmp.path(), true).unwrap_err();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputNotFound,
+            "{err:#}"
+        );
+
+        // 2. …or is unreadable.
+        let locked = tmp.path().join("locked.js.map");
+        std::fs::write(
+            &locked,
+            br#"{"version":3,"sourcesContent":["x"],"mappings":""}"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let err = stripped_copy_without_sources(&locked, tmp.path(), true).unwrap_err();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputNotFound,
+            "{err:#}"
+        );
+
+        // 3. …or the copy cannot be written.
+        let readable = tmp.path().join("ok.js.map");
+        std::fs::write(
+            &readable,
+            br#"{"version":3,"sourcesContent":["x"],"mappings":""}"#,
+        )
+        .unwrap();
+        let out_dir = tmp.path().join("readonly");
+        std::fs::create_dir(&out_dir).unwrap();
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let err = stripped_copy_without_sources(&readable, &out_dir, true).unwrap_err();
+        std::fs::set_permissions(&out_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(
+            crate::error::classify(&err),
+            crate::exit_code::ExitCode::InputNotFound,
+            "{err:#}"
+        );
     }
 
     /// A map that carries no `sourcesContent` — or is not the JSON we expect — uploads unchanged
