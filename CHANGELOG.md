@@ -16,17 +16,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   carry their own copy of this guard, but they only cover vite and rollup.
 
   Detected: `<script integrity src=…>` and `<link rel=modulepreload|preload integrity href=…>` in
-  any `.html` under the given paths. Deliberately NOT flagged: a CDN script, a non-JS target, a path
-  outside the output directory, an empty `integrity`, `data-integrity`/`data-src`, a commented-out
-  tag, and `rel=prefetch` (a failed prefetch is discarded, not fatal). `--exclude`d files do not
-  count either — a file we will not touch cannot have its hash invalidated.
+  any `.html`/`.htm`/`.xhtml` under the given paths. The URL is resolved literally first and then by
+  file name, so a `publicPath` — a CDN origin, `/static/`, `/_next/` — still resolves to the local
+  bytes it names; that is the canonical SRI deployment (hash locally, serve from a CDN) and treating
+  every absolute URL as somebody else's file would have missed it entirely.
+
+  The guard refuses only over a file this run would really stamp, sharing one list with the walk
+  that does the stamping: an `--exclude`d file, a stale page pinning a deleted bundle, a pin on
+  something outside the output, and a file argument naming an unpinned bundle all proceed. Also not
+  flagged: a genuine third-party CDN script, a non-JS target, an empty `integrity`,
+  `data-integrity`/`data-src`, an inline script, a commented-out tag, and `rel=prefetch` (a failed
+  prefetch is discarded, not fatal).
+
+  It cannot see SRI that never reaches the emitted HTML — a manifest consumed by a server template,
+  a page rendered at request time (Next.js `experimental.sri`), or HTML written outside the directory
+  it was pointed at.
 
   `--allow-sri` proceeds anyway, for a build that recomputes its hashes afterwards.
 - **`sourcemaps inject --exclude <glob>`** (repeatable) — leave part of a build output alone. A
   stock `next build` with browser source maps on has 39 JS files and 12 maps, and a Nuxt
   `.output/server/node_modules` holds 22 vendored `.mjs`; `--exclude '**/node_modules/**'` keeps
   `inject` out of third-party code inside the build output. Matched against the path relative to
-  each walked root and against the full path. An unparseable pattern is a configuration error
+  the absolute path, the path relative to the current directory, and the path relative to each
+  walked root, so `dist/vendor/**`, `vendor/**` and an absolute path all work whether the root is
+  passed as `dist`, `./dist` or absolute. An unparseable OR EMPTY pattern is a configuration error
   (exit 20), never a silent "matches nothing" that would rewrite the files you meant to protect.
   `js_excluded` is reported in the completion log.
 
