@@ -7,6 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- **`sourcemaps inject` refuses a build that pins its own script hashes** (Subresource Integrity),
+  exit 20. Injecting appends bytes to every `.js`, so a hash the HTML already carries stops matching
+  and the browser refuses to run the script: measured on a real webpack +
+  `webpack-subresource-integrity` build in Chromium 151, the page loaded and executed **nothing**
+  after injecting, where before it ran clean. Angular's `subresourceIntegrity: true` is the same
+  mechanism, and Angular/esbuild/Deno users drive this binary directly — the JS bundler plugins
+  carry their own copy of this guard, but they only cover vite and rollup.
+
+  Detected: `<script integrity src=…>` and `<link rel=modulepreload|preload integrity href=…>` in
+  any `.html` under the given paths. Deliberately NOT flagged: a CDN script, a non-JS target, a path
+  outside the output directory, an empty `integrity`, `data-integrity`/`data-src`, a commented-out
+  tag, and `rel=prefetch` (a failed prefetch is discarded, not fatal). `--exclude`d files do not
+  count either — a file we will not touch cannot have its hash invalidated.
+
+  `--allow-sri` proceeds anyway, for a build that recomputes its hashes afterwards.
 - **`sourcemaps inject --exclude <glob>`** (repeatable) — leave part of a build output alone. A
   stock `next build` with browser source maps on has 39 JS files and 12 maps, and a Nuxt
   `.output/server/node_modules` holds 22 vendored `.mjs`; `--exclude '**/node_modules/**'` keeps
