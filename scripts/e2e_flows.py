@@ -25,6 +25,12 @@ import threading
 TOKEN = "TKN"
 STATE = {"flow": "none", "port": 0, "cap": "", "duplicate_uuids": set(), "puts": {}}
 
+# The server is threaded and the CLI now uploads several source maps at once, so two handler
+# threads can reach the same capture file — and the same `puts` counter — at the same moment.
+# Concurrent appends lost a record on windows-11-arm (7 of 8 POSTs in the .jsonl while all 8 PUTs
+# arrived), which reads exactly like a dropped upload. One lock over every capture write.
+CAPTURE_LOCK = threading.Lock()
+
 
 def cappath(name):
     return os.path.join(STATE["cap"], name)
@@ -60,10 +66,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         body = self._read_body()
         p = self.path
         if p.endswith("/symbols"):
-            with open(cappath(f"{flow}__symbols_post.json"), "wb") as f:
-                f.write(body)
-            with open(cappath(f"{flow}__symbols_posts.jsonl"), "ab") as f:
-                f.write(body + b"\n")
+            with CAPTURE_LOCK:
+                with open(cappath(f"{flow}__symbols_post.json"), "wb") as f:
+                    f.write(body)
+                with open(cappath(f"{flow}__symbols_posts.jsonl"), "ab") as f:
+                    f.write(body + b"\n")
             if json.loads(body).get("uuid") in STATE["duplicate_uuids"]:
                 # The appserver's REAL duplicate answer (code/app.utils.js error()):
                 # HTTP 200, the code nested inside `error`.
@@ -100,9 +107,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
     def do_PUT(self):
         body = self._read_body()
         name = self.path.rsplit("/put/", 1)[-1]
-        STATE["puts"][STATE["flow"]] = STATE["puts"].get(STATE["flow"], 0) + 1
-        with open(cappath(name + ".bin"), "wb") as f:
-            f.write(body)
+        with CAPTURE_LOCK:
+            STATE["puts"][STATE["flow"]] = STATE["puts"].get(STATE["flow"], 0) + 1
+            with open(cappath(name + ".bin"), "wb") as f:
+                f.write(body)
         self.send_response(200)
         self.end_headers()
 
