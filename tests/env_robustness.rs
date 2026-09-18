@@ -4,11 +4,13 @@
 //! may set a variable this CLI has never heard of. Reading the environment is
 //! not allowed to abort the run over one of them.
 
+// Unix-only, both of them: the single test in this file needs a non-UTF-8 environment variable,
+// which is not constructible on Windows (`OsString` is WTF-16 there). `-D warnings` makes an unused
+// helper OR an unused import a hard error, which is how `cargo test` was failing on Windows while
+// every CI job stayed green — no job compiled test code for that platform.
+#[cfg(unix)]
 use assert_cmd::Command;
 
-// Only the Unix-gated tests below use this today (a non-UTF-8 env var is not constructible on
-// Windows, where `OsString` is WTF-16), and `-D warnings` makes an unused helper a hard error —
-// which is how `cargo test` was broken on Windows while every CI job stayed green.
 #[cfg(unix)]
 fn cli() -> Command {
     let mut c = Command::cargo_bin("bugsee-cli").expect("compiled bugsee-cli binary");
