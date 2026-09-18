@@ -459,9 +459,14 @@ def main():
                    "sources": ["app.ts"], "sourcesContent": ["const secret = 1;"],
                    "names": [], "mappings": "AAAA"}, f)
     before = open(sc_map, "rb").read()
+    # `--no-zstd` for THIS flow only: the assertion below reads the uploaded zip with Python's
+    # `zipfile`, which cannot decompress zstd (method 93) before Python 3.14 — the macOS runner has
+    # it, ubuntu and windows do not. The flow is about `sourcesContent`, not about compression, and
+    # `sourcemaps_upload` already covers the zstd path.
     results["sourcemaps_strip_sources_content"] = run(
         binpath, "sourcemaps_strip",
-        ["debug-files", "upload", "--type", "sourcemaps", "--strip-sources-content", sc_map] + v)
+        ["debug-files", "upload", "--type", "sourcemaps", "--strip-sources-content", "--no-zstd",
+         sc_map] + v)
     try:
         import zipfile as _zf
         uploaded = None
@@ -477,7 +482,8 @@ def main():
         if not results["sourcemaps_strip_uploads_no_source"]:
             print(f"  [warn] uploaded={uploaded!r}")
     except Exception as e:
-        print("  [warn] could not verify the strip flow:", e)
+        # Not swallowed: a check that cannot run is a check that failed.
+        print("  [FAIL] could not verify the strip flow:", e)
         results["sourcemaps_strip_uploads_no_source"] = False
     results["elf"] = run(binpath, "elf", ["debug-files", "upload", "--type", "elf",
                                           os.path.join(fix, "native-debug-symbols.zip"),
