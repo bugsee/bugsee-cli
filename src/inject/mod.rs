@@ -106,10 +106,33 @@ pub struct InjectStats {
     /// JS files carrying a debug-id another tool wrote, given our runtime
     /// registration under that id.
     pub js_registered: u32,
+    /// JS files left untouched because they matched an `--exclude` pattern.
+    pub js_excluded: u32,
 }
 
-/// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`.
-pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
+/// Build the `--exclude` matcher. An unparseable pattern is a CONFIGURATION error: treating it as
+/// "matches nothing" would rewrite exactly the files the user asked to protect.
+fn exclude_matcher(patterns: &[String]) -> Result<Option<globset::GlobSet>> {
+    if patterns.is_empty() {
+        return Ok(None);
+    }
+    let mut builder = globset::GlobSetBuilder::new();
+    for pattern in patterns {
+        let glob = globset::Glob::new(pattern)
+            .map_err(|e| Error::ConfigInvalid(format!("--exclude {pattern:?}: {e}")))?;
+        builder.add(glob);
+    }
+    let set = builder
+        .build()
+        .map_err(|e| Error::ConfigInvalid(format!("--exclude: {e}")))?;
+    Ok(Some(set))
+}
+
+/// Inject debug-ids across all `.js`/`.cjs`/`.mjs` under `paths`, skipping any file matching one of
+/// `exclude` (globs, matched against the path relative to the walked root AND against the full
+/// path, so both `node_modules/**` and an absolute pattern work).
+pub fn inject_paths(paths: &[PathBuf], exclude: &[String], dry_run: bool) -> Result<InjectStats> {
+    let matcher = exclude_matcher(exclude)?;
     let mut stats = InjectStats::default();
     for root in paths {
         // Sorted, so a run is the same on every file system (it decides, e.g.,
@@ -128,6 +151,15 @@ pub fn inject_paths(paths: &[PathBuf], dry_run: bool) -> Result<InjectStats> {
                 Some("js") | Some("cjs") | Some("mjs")
             );
             if is_js {
+                let relative = p.strip_prefix(root).unwrap_or(p);
+                let excluded = matcher
+                    .as_ref()
+                    .is_some_and(|m| m.is_match(relative) || m.is_match(p));
+                if excluded {
+                    stats.js_excluded += 1;
+                    tracing::info!(path = %p.display(), "excluded");
+                    continue;
+                }
                 inject_one(p, dry_run, &mut stats)?;
             }
         }
@@ -420,6 +452,121 @@ mod tests {
         assert!(!is_contained_relative("/etc/passwd"));
     }
 
+    /// `--exclude` keeps `inject` out of parts of a build output it should not rewrite. Measured
+    /// need: a stock `next build` with browser source maps on has 39 JS files and 12 maps, and a
+    /// Nuxt `.output/server/node_modules` holds 22 `.mjs` — vendored third-party code inside the
+    /// build output that a team may not want modified at all. (Stamping a bundle that has NO map
+    /// is deliberate and stays the default: the worker marks such a crash `missing_sym`, which is
+    /// what prompts the user to upload the maps. Skipping it would make that crash silently
+    /// unsymbolicated instead — see docs.)
+    #[test]
+    fn exclude_keeps_inject_out_of_matching_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("node_modules/lib")).unwrap();
+        std::fs::create_dir_all(dir.path().join("chunks")).unwrap();
+        for (rel, body) in [
+            ("app.js", "console.log('app')\n"),
+            ("chunks/vendor.js", "console.log('vendor')\n"),
+            ("node_modules/lib/index.js", "console.log('lib')\n"),
+        ] {
+            std::fs::write(dir.path().join(rel), body).unwrap();
+        }
+
+        let stats = inject_paths(
+            &[dir.path().to_path_buf()],
+            &["**/node_modules/**".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.js_injected, 2, "only the two non-excluded bundles");
+        assert_eq!(stats.js_excluded, 1);
+        let stamped = |rel: &str| {
+            std::fs::read_to_string(dir.path().join(rel))
+                .unwrap()
+                .contains("debugId=")
+        };
+        assert!(stamped("app.js"));
+        assert!(stamped("chunks/vendor.js"));
+        assert!(
+            !stamped("node_modules/lib/index.js"),
+            "an excluded file must be left byte-identical"
+        );
+    }
+
+    /// Several patterns, and one that matches a bare file name rather than a directory.
+    #[test]
+    fn exclude_accepts_several_patterns_and_matches_relative_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("static")).unwrap();
+        for rel in ["polyfills.js", "static/app.js", "static/legacy-abc.js"] {
+            std::fs::write(dir.path().join(rel), "console.log(1)\n").unwrap();
+        }
+
+        let stats = inject_paths(
+            &[dir.path().to_path_buf()],
+            &["polyfills.js".to_string(), "**/legacy-*.js".to_string()],
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(stats.js_injected, 1);
+        assert_eq!(stats.js_excluded, 2);
+        assert!(std::fs::read_to_string(dir.path().join("static/app.js"))
+            .unwrap()
+            .contains("debugId="));
+    }
+
+    /// A pattern that matches nothing changes nothing — and an INVALID pattern is a configuration
+    /// error, not a silent "matches nothing" that quietly rewrites the files the user meant to
+    /// protect.
+    #[test]
+    fn an_unmatched_exclude_is_a_no_op_and_a_bad_pattern_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(1)\n").unwrap();
+
+        let stats = inject_paths(
+            &[dir.path().to_path_buf()],
+            &["nothing/**".to_string()],
+            false,
+        )
+        .unwrap();
+        assert_eq!(stats.js_injected, 1);
+        assert_eq!(stats.js_excluded, 0);
+
+        let err = inject_paths(
+            &[dir.path().to_path_buf()],
+            &["[unclosed".to_string()],
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").contains("--exclude"),
+            "the message must name the flag: {err:#}"
+        );
+    }
+
+    /// The dry run reports what it WOULD skip without writing anything.
+    #[test]
+    fn exclude_is_reported_on_a_dry_run_too() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("vendor")).unwrap();
+        std::fs::write(dir.path().join("app.js"), "console.log(1)\n").unwrap();
+        std::fs::write(dir.path().join("vendor/v.js"), "console.log(2)\n").unwrap();
+
+        let stats = inject_paths(
+            &[dir.path().to_path_buf()],
+            &["vendor/**".to_string()],
+            true,
+        )
+        .unwrap();
+
+        assert_eq!((stats.js_injected, stats.js_excluded), (1, 1));
+        assert!(!std::fs::read_to_string(dir.path().join("app.js"))
+            .unwrap()
+            .contains("debugId="));
+    }
+
     #[test]
     fn debug_id_is_deterministic_and_content_derived() {
         let a = compute_debug_id(b"console.log(1)");
@@ -440,7 +587,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("app.js"), "console.log(1)\n").unwrap();
             std::fs::write(dir.path().join("app.js.map"), map).unwrap();
-            inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
             read_debug_id(&dir.path().join("app.js.map"))
                 .unwrap()
                 .unwrap()
@@ -486,11 +633,11 @@ mod tests {
             r#"{"version":3,"sources":["a.ts"],"mappings":"AAAA"}"#,
         )
         .unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
 
         // The bundler re-emits the JS (no stub) but leaves the stamped map.
         std::fs::write(&js, "console.log(1)\n").unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
 
         let bundle_id = existing_debug_id(&std::fs::read_to_string(&js).unwrap()).unwrap();
         let map_json: serde_json::Value =
@@ -517,7 +664,7 @@ mod tests {
             eprintln!("skipping: running with permission to read a 000 file");
             return;
         }
-        let result = inject_paths(&[dir.path().to_path_buf()], false);
+        let result = inject_paths(&[dir.path().to_path_buf()], &[], false);
         std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o644)).unwrap();
         assert!(result.is_err());
         assert_eq!(std::fs::read_to_string(&js).unwrap(), "console.log(1)\n");
@@ -574,13 +721,13 @@ mod tests {
         )
         .unwrap();
 
-        let first = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let first = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let map_json: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&map).unwrap()).unwrap();
         assert_eq!(first.maps_updated, 1);
         assert_eq!(map_json["debug_id"], id);
         assert_eq!(map_json["debugId"], id);
-        let second = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let second = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(second.maps_updated, 0);
     }
 
@@ -599,10 +746,10 @@ mod tests {
         let map = dir.path().join("shared.map");
         std::fs::write(&map, r#"{"version":3,"mappings":""}"#).unwrap();
 
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let after_first = std::fs::read(&map).unwrap();
         for _ in 0..2 {
-            let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
             assert_eq!(stats.maps_updated, 0);
             assert_eq!(std::fs::read(&map).unwrap(), after_first);
         }
@@ -625,13 +772,13 @@ mod tests {
             r#"{"version":3,"sources":["a.ts"],"mappings":"AAEA"}"#,
         )
         .unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let first = read_debug_id(&map).unwrap().unwrap();
 
         // Rebuild: JS untouched on disk, map re-emitted with shifted mappings and no id.
         let moved = r#"{"version":3,"sources":["a.ts"],"mappings":"AAKA"}"#;
         std::fs::write(&map, moved).unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
 
         let expected =
             compute_debug_id_with_map(bundle.as_bytes(), Some(moved.as_bytes())).to_string();
@@ -644,7 +791,7 @@ mod tests {
         assert_eq!(stats.maps_updated, 1);
 
         // And it settles: nothing changes on the next run.
-        let again = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let again = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!((again.js_restamped, again.maps_updated), (0, 0));
         assert_eq!(std::fs::read_to_string(&js).unwrap(), js_after);
     }
@@ -658,12 +805,12 @@ mod tests {
         let original_map = r#"{"version":3,"sources":["a.ts"],"mappings":"AAEA"}"#;
         std::fs::write(&js, "console.log(1)\n").unwrap();
         std::fs::write(&map, original_map).unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let js_stamped = std::fs::read_to_string(&js).unwrap();
         let id = read_debug_id(&map).unwrap().unwrap();
 
         std::fs::write(&map, original_map).unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(stats.js_restamped, 0);
         assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
         assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
@@ -684,7 +831,7 @@ mod tests {
             r#"{"version":3,"mappings":"AAKA"}"#,
         )
         .unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(stats.js_restamped, 0);
         // Never re-keyed: the id stays; only our runtime registration is added.
         assert_eq!(
@@ -706,11 +853,11 @@ mod tests {
         let map = dir.path().join("app.js.map");
         std::fs::write(&js, "console.log(1)\n").unwrap();
         std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let js_stamped = std::fs::read_to_string(&js).unwrap();
 
         std::fs::write(&map, "not json").unwrap();
-        assert!(inject_paths(&[dir.path().to_path_buf()], false).is_err());
+        assert!(inject_paths(&[dir.path().to_path_buf()], &[], false).is_err());
         assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
     }
 
@@ -724,7 +871,7 @@ mod tests {
         let map = dir.path().join("app.js.map");
         std::fs::write(&js, "console.log(1)\n").unwrap();
         std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let js_stamped = std::fs::read_to_string(&js).unwrap();
         let id = read_debug_id(&map).unwrap().unwrap();
 
@@ -733,7 +880,7 @@ mod tests {
             format!(r#"{{"version":3,"mappings":"AAEA","debugId":"{id}"}}"#),
         )
         .unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(stats.js_restamped, 0);
         assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
         assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
@@ -746,11 +893,11 @@ mod tests {
         let map = dir.path().join("app.js.map");
         std::fs::write(&js, "console.log(1)\n").unwrap();
         std::fs::write(&map, r#"{"version":3,"mappings":"AAEA"}"#).unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let js_stamped = std::fs::read_to_string(&js).unwrap();
         std::fs::write(&map, r#"{"version":3,"mappings":"AAKA"}"#).unwrap();
 
-        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], true).unwrap();
         assert_eq!((stats.js_restamped, stats.maps_updated), (1, 1));
         assert_eq!(std::fs::read_to_string(&js).unwrap(), js_stamped);
         assert_eq!(read_debug_id(&map).unwrap(), None);
@@ -770,7 +917,7 @@ mod tests {
             r#"{"version":3,"mappings":"","debug_id":"11111111-1111-5111-8111-111111111111","debugId":"11111111-1111-5111-8111-111111111111"}"#,
         )
         .unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], true).unwrap();
         assert_eq!((stats.js_injected, stats.maps_updated), (1, 1));
     }
 
@@ -789,7 +936,7 @@ mod tests {
         }
         let map = dir.path().join("shared.map");
         std::fs::write(&map, r#"{"version":3,"mappings":""}"#).unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let z =
             existing_debug_id(&std::fs::read_to_string(dir.path().join("z.js")).unwrap()).unwrap();
         assert_eq!(read_debug_id(&map).unwrap().unwrap(), z);
@@ -828,7 +975,7 @@ mod tests {
         let (js, map, id) = rollup_bundle(dir.path());
         let before = std::fs::read_to_string(&js).unwrap();
 
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
 
         let after = std::fs::read_to_string(&js).unwrap();
         assert_eq!(after, format!("{before}{}", runtime_registration(&id)));
@@ -846,7 +993,7 @@ mod tests {
         );
 
         // Idempotent: the registration is found, nothing is appended again.
-        let again = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let again = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(std::fs::read_to_string(&js).unwrap(), after);
         assert_eq!(
             (again.js_registered, again.js_already, again.maps_updated),
@@ -859,7 +1006,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let (js, _map, _id) = rollup_bundle(dir.path());
         let before = std::fs::read_to_string(&js).unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], true).unwrap();
         assert_eq!(stats.js_registered, 1);
         assert_eq!(std::fs::read_to_string(&js).unwrap(), before);
     }
@@ -871,10 +1018,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let js = dir.path().join("app.js");
         std::fs::write(&js, "console.log(1)\n").unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let stamped = std::fs::read_to_string(&js).unwrap();
         for _ in 0..2 {
-            let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+            let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
             assert_eq!(stats.js_registered, 0);
         }
         assert_eq!(std::fs::read_to_string(&js).unwrap(), stamped);
@@ -887,11 +1034,11 @@ mod tests {
     fn a_registered_foreign_id_is_not_rekeyed_when_its_map_comes_back_without_one() {
         let dir = tempfile::tempdir().unwrap();
         let (js, map, id) = rollup_bundle(dir.path());
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let registered = std::fs::read_to_string(&js).unwrap();
 
         std::fs::write(&map, r#"{"version":3,"mappings":"AAKA"}"#).unwrap();
-        let stats = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!((stats.js_restamped, stats.js_registered), (0, 0));
         assert_eq!(std::fs::read_to_string(&js).unwrap(), registered);
         assert_eq!(read_debug_id(&map).unwrap().unwrap(), id);
@@ -926,7 +1073,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let js = dir.path().join("app.js");
         std::fs::write(&js, "console.log(1)\n").unwrap();
-        inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         let injected = std::fs::read_to_string(&js).unwrap();
         assert_eq!(
             existing_debug_id(&injected).unwrap(),
@@ -961,7 +1108,7 @@ mod tests {
         std::fs::write(&js, "console.log('hi')\n//# sourceMappingURL=app.js.map\n").unwrap();
         std::fs::write(&map, r#"{"version":3,"sources":[],"mappings":""}"#).unwrap();
 
-        let s1 = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let s1 = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(s1.js_injected, 1);
         assert_eq!(s1.maps_updated, 1);
 
@@ -982,7 +1129,7 @@ mod tests {
         );
 
         // Re-running is a no-op (idempotent).
-        let s2 = inject_paths(&[dir.path().to_path_buf()], false).unwrap();
+        let s2 = inject_paths(&[dir.path().to_path_buf()], &[], false).unwrap();
         assert_eq!(s2.js_injected, 0, "already injected");
         assert_eq!(s2.js_already, 1);
         assert_eq!(
@@ -1009,7 +1156,7 @@ mod tests {
         let js_before = std::fs::read_to_string(&js).unwrap();
         let map_before = std::fs::read_to_string(&map).unwrap();
 
-        let s = inject_paths(&[dir.path().to_path_buf()], true).unwrap();
+        let s = inject_paths(&[dir.path().to_path_buf()], &[], true).unwrap();
         assert_eq!(s.js_injected, 1);
         // The map WOULD have changed (no debug_id yet), so the intent is tallied
         // even though nothing is written to disk in dry-run.

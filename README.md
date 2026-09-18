@@ -226,8 +226,21 @@ never ran cannot half-upload a build's symbols.
 Both flags apply to `--type sourcemaps` only, and are rejected (exit 20) for any
 other type rather than accepted and ignored.
 
+`--exclude <glob>` (repeatable) keeps `inject` out of part of a build output — `--exclude
+'**/node_modules/**'` leaves vendored third-party code inside a server bundle untouched, `--exclude
+'polyfills*.js'` skips one file by name. Globs are matched against the path relative to each walked
+root and against the full path; an unparseable pattern is a configuration error (exit 20) rather
+than a silent "matches nothing", which would rewrite exactly the files you meant to protect.
+
+**A bundle with no source map is still stamped, on purpose.** It looks like waste — the id cannot
+resolve to a symbol — but a crash frame carrying a debug-id whose map was never uploaded marks the
+report `missing_sym`, which is what prompts you to upload it. An unstamped bundle is silently
+unsymbolicated instead. Measured on a stock `next build` with browser source maps on: 39 JS files,
+12 maps, so 27 bundles are stamped without one; that is the case that produces the prompt. Use
+`--exclude` when you would rather those files were not touched at all.
+
 ```
-bugsee-cli sourcemaps inject <paths>... [--dry-run]
+bugsee-cli sourcemaps inject <paths>... [--exclude <glob>]... [--dry-run]
 bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b> \
     [--concurrency N] [--allow-empty]
 ```

@@ -6,6 +6,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`sourcemaps inject --exclude <glob>`** (repeatable) — leave part of a build output alone. A
+  stock `next build` with browser source maps on has 39 JS files and 12 maps, and a Nuxt
+  `.output/server/node_modules` holds 22 vendored `.mjs`; `--exclude '**/node_modules/**'` keeps
+  `inject` out of third-party code inside the build output. Matched against the path relative to
+  each walked root and against the full path. An unparseable pattern is a configuration error
+  (exit 20), never a silent "matches nothing" that would rewrite the files you meant to protect.
+  `js_excluded` is reported in the completion log.
+
+  Stamping a bundle that has NO map stays the default and is deliberate: the backend marks a crash
+  carrying an unresolvable debug-id `missing_sym`, which is what prompts an upload — an unstamped
+  bundle is silently unsymbolicated instead.
+
 ## [0.7.10] - 2026-09-18
 
 ### Added
