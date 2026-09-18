@@ -143,3 +143,46 @@ fn rust_with_no_symbols_reports_the_build_settings_to_fix() {
         .stderr(contains("split-debuginfo"))
         .stderr(contains("--build-id"));
 }
+
+/// `--concurrency` and `--allow-empty` only mean something for `--type sourcemaps`: only that path
+/// uploads a batch of independent files, and only it can legitimately find nothing. Accepting them
+/// elsewhere and ignoring them is the silent-ignore failure this file exists to prevent — a caller
+/// who passed `--allow-empty` to keep a build green still gets exit 10.
+#[test]
+fn sourcemap_only_flags_are_rejected_for_other_types() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    for kind in ["proguard", "elf", "dsym", "pdb", "rust", "il2cpp-linemap"] {
+        upload(kind, &["--allow-empty", tmp.path().to_str().unwrap()])
+            .assert()
+            .code(CONFIG_INVALID)
+            .stderr(contains(
+                "--allow-empty is only valid for --type sourcemaps",
+            ));
+
+        upload(kind, &["--concurrency", "4", tmp.path().to_str().unwrap()])
+            .assert()
+            .code(CONFIG_INVALID)
+            .stderr(contains(
+                "--concurrency is only valid for --type sourcemaps",
+            ));
+    }
+}
+
+/// … and are of course still accepted for sourcemaps.
+#[test]
+fn sourcemap_only_flags_are_accepted_for_sourcemaps() {
+    let tmp = tempfile::tempdir().unwrap();
+
+    upload(
+        "sourcemaps",
+        &[
+            "--allow-empty",
+            "--concurrency",
+            "4",
+            tmp.path().to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .success();
+}
