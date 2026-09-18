@@ -48,6 +48,8 @@ bugsee-cli debug-files upload <paths>... \
     [--icon <PATH>]   # attach launcher icon to the symbol zip \
     [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
     [--force]         # re-upload even if the server already has it (dsym/pdb/rust/il2cpp-linemap/sourcemaps)
+    [--concurrency N] # sourcemaps only: max uploads in flight, 1..=32, default 6
+    [--allow-empty]   # sourcemaps only: "nothing to upload" is success, not exit 10
     [--dry-run]
 ```
 
@@ -184,13 +186,26 @@ When the upload scans a directory, maps named as stylesheet or type-declaration
 maps (`.css.map`, `.d.ts.map`, `.d.mts.map`, `.d.cts.map`) are skipped: they
 never carry a debug-id. Any other map without one fails the run before anything
 is uploaded — inject did not stamp that bundle — and so does a scan that leaves
-nothing to upload. A map the server already has is skipped and the batch
-continues, so rebuilding an app with unchanged chunks uploads only the changed
-ones; `--force` re-uploads it anyway.
+nothing to upload, unless `--allow-empty` says otherwise. A map the server
+already has is skipped and the batch continues, so rebuilding an app with
+unchanged chunks uploads only the changed ones; `--force` re-uploads it anyway.
+
+Maps upload **several at a time** (`--concurrency`, default 6). Each map is an
+independent register + PUT pair, so a build with one map per chunk used to spend
+its upload time waiting on round-trips: 60 maps against a mock with 50 ms of
+latency took 7.01 s serially and 1.49 s at the default concurrency (0.86 s
+at 12). Pass
+`--concurrency 1` for strictly sequential uploads.
+
+`--allow-empty` turns "nothing to upload" into success (exit 0) instead of
+exit 10 — a monorepo package built without maps, or a framework whose server
+output has none, is a legitimate no-op rather than a reason to fail the build.
+A path that does not exist is still an error, so a typo is not swallowed.
 
 ```
 bugsee-cli sourcemaps inject <paths>... [--dry-run]
-bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b>
+bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build <b> \
+    [--concurrency N] [--allow-empty]
 ```
 
 ### `xcode upload-dsyms`

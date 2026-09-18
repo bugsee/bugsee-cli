@@ -6,6 +6,24 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`debug-files upload --type sourcemaps` uploads several maps at a time**
+  (`--concurrency N`, 1..=32, default 6). Each map is an independent metadata
+  POST + presigned PUT pair and the loop was strictly sequential, so a web build
+  with one map per chunk spent its upload time waiting on round-trips: 60 maps
+  against a mock with 50 ms of injected latency took **7.01 s** serially and
+  **1.49 s** at the default (0.86 s at `--concurrency 12`). A few-hundred-chunk app on a CI runner paid that
+  every build. `--concurrency 1` restores the old sequential behaviour; the
+  identification pass stays sorted and still fails before anything is uploaded.
+- **`debug-files upload --allow-empty`** treats "nothing to upload" as success
+  instead of exit 10 (`--type sourcemaps`). A monorepo package built without
+  maps, or a framework whose server output has none, is a legitimate no-op — but
+  it failed the caller's build, or (with the plugin's default) warned while the
+  maps that DID exist elsewhere went unuploaded, because the pass had aborted.
+  `xcode upload-dsyms` already treats nothing-to-upload as success by design.
+  A path that does not exist is still an error (`path does not exist: …`), so a
+  typo'd output directory is not swallowed by the flag.
+
 ## [0.7.9] - 2026-09-17
 
 ### Fixed
