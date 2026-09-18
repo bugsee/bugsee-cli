@@ -64,7 +64,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       # Build only: the `test` job above covers behaviour, and this job exists
       # to prove the target still compiles — ring/zstd-sys/zip/flate2 included.
-      - run: cargo build --release --target aarch64-pc-windows-msvc
+      #
+      # `--all-targets` so the TEST code compiles here too. Without it a test using a
+      # Unix-only API (`std::os::unix::fs::PermissionsExt`) without a `#[cfg(unix)]` guard
+      # passes every job and breaks anyone running `cargo test` on Windows — which happened,
+      # and which no job could have caught: the test matrix is ubuntu + macOS, and this job
+      # built only the binary. Compiling is not running; the matrix above still owns behaviour.
+      - run: cargo build --release --all-targets --target aarch64-pc-windows-msvc
       # One command per step ON PURPOSE. The default shell here is pwsh, where a
       # NATIVE command's non-zero exit does not abort the script — GitHub only
       # inspects $LASTEXITCODE after the whole thing runs. Both commands in one

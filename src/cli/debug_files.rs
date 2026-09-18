@@ -3347,6 +3347,10 @@ mod sourcemap_upload_tests {
     /// classified an I/O failure as 1, unlike `sourcemap::identify` reading the very same file
     /// moments earlier. Driven at the function, because `run_sourcemap_upload` reads the map through
     /// `identify` FIRST — which is exactly why the misclassification could sit here unnoticed.
+    ///
+    /// Unix-only, like `an_unreadable_map_fails_before_the_bundle_is_modified`: the permission
+    /// technique has no Windows equivalent, and `PermissionsExt` does not exist there.
+    #[cfg(unix)]
     #[test]
     fn a_strip_that_cannot_read_or_write_is_input_not_found() {
         // As root, chmod 000 does not stop a read; there is nothing to assert.
