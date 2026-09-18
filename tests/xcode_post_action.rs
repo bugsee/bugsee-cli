@@ -30,6 +30,8 @@ use serde_json::json;
 use wiremock::matchers::{method, path as wm_path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
+mod common;
+
 /// Every flag added to `xcode post-action`. Used to pin the `--help` surface.
 const NEW_FLAGS: &[&str] = &[
     "--enable-build-info",
@@ -59,9 +61,7 @@ const NEW_FLAGS: &[&str] = &[
 /// any in — each test then sets EXACTLY the vars it needs. The gate-out and
 /// token-missing code paths never shell out, so an otherwise-empty env is fine.
 fn cli() -> Command {
-    let mut c = Command::cargo_bin("bugsee-cli").expect("compiled bugsee-cli binary");
-    c.env_clear();
-    c
+    common::cli()
 }
 
 #[test]
