@@ -7,14 +7,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
-- **`debug-files upload --type sourcemaps` uploads several maps at a time**
-  (`--concurrency N`, 1..=32, default 6). Each map is an independent metadata
-  POST + presigned PUT pair and the loop was strictly sequential, so a web build
-  with one map per chunk spent its upload time waiting on round-trips: 60 maps
-  against a mock with 50 ms of injected latency took **7.01 s** serially and
-  **1.49 s** at the default (0.86 s at `--concurrency 12`). A few-hundred-chunk app on a CI runner paid that
-  every build. `--concurrency 1` restores the old sequential behaviour; the
-  identification pass stays sorted and still fails before anything is uploaded.
+- **`debug-files upload --type sourcemaps` uploads several maps at a time.**
+  Each map is an independent metadata POST + presigned PUT pair and the loop was
+  strictly sequential, so a web build with one map per chunk spent its upload
+  time waiting on round-trips. Measured against a mock with 50 ms of injected
+  latency: 60 maps **7.09 s → 1.31 s**, 200 maps **23.58 s → 4.10 s**. A
+  few-hundred-chunk app on a CI runner paid the serial floor every build.
+
+  `--concurrency N` (1..=32) sets a **ceiling**, not a fixed width — no more
+  uploads run than there are maps. Left unset it scales with the batch: one
+  upload per 8 maps, at least 4, at most 8. The cap sits below the fastest value
+  measured here (200 maps run in 2.75 s at `--concurrency 16`) on purpose: the
+  machine that suffers most from serial uploads is a CI box on a thin uplink,
+  where the transfer is bandwidth-bound and more streams only add latency.
+  `--concurrency 1` restores the old sequential behaviour; the identification
+  pass stays sorted and still fails before anything is uploaded.
 - **`debug-files upload --allow-empty`** treats "nothing to upload" as success
   instead of exit 10 (`--type sourcemaps`). A monorepo package built without
   maps, or a framework whose server output has none, is a legitimate no-op — but
@@ -23,6 +30,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   `xcode upload-dsyms` already treats nothing-to-upload as success by design.
   A path that does not exist is still an error (`path does not exist: …`), so a
   typo'd output directory is not swallowed by the flag.
+
+### Fixed
+- **A 429 no longer fails a non-idempotent upload request.** The symbol metadata
+  POST and the build registration POST are sent with status-retries disabled,
+  because a 5xx may mean the server processed the request and only the response
+  was lost. A 429 carries no such ambiguity — the request was rejected without
+  being processed — so it is now retried with the usual backoff even for those
+  requests. They are also the first thing a server throttles when several
+  uploads run at once, which concurrent source-map uploads make likelier.
 
 ## [0.7.9] - 2026-09-17
 
