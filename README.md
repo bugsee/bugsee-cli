@@ -216,6 +216,11 @@ sequential uploads whatever the ceiling says — those registrations must not ra
 each other. A failed upload stops the batch rather than letting the rest run
 into a server that has already refused one.
 
+A `--dry-run` discovers and packs but sends nothing, so a map that carries no debug-id is reported
+rather than fatal there (`unkeyed` in the completion log) — the whole flow can be previewed on a
+freshly built directory, where `sourcemaps inject --dry-run` has deliberately written nothing yet.
+A REAL run still refuses such a map (exit 11): uploading it would register a symbol nothing can find.
+
 `--allow-empty` turns "nothing to upload" into success (exit 0) instead of
 exit 10 — a monorepo package built without maps, or a framework whose server
 output has none, is a legitimate no-op rather than a reason to fail the build.
