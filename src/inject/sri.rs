@@ -132,6 +132,41 @@ pub fn lexical_normalize(path: &Path) -> PathBuf {
     out
 }
 
+/// Pages sitting DIRECTLY in `dir` (not recursive, and bounded).
+///
+/// Only consulted when the path we were given holds no pages of its own: the standard Vite/webpack
+/// layout is `dist/index.html` + `dist/assets/*.js`, so `inject dist/assets` (or one bundle by path)
+/// would otherwise stamp a file whose hash the page one level up pins. The bound matters because
+/// that parent can be a directory nobody meant us to read — `/tmp` with a hundred thousand entries.
+fn pages_directly_in(dir: Option<&Path>) -> Vec<PathBuf> {
+    const MAX_ENTRIES: usize = 2_000;
+    let Some(dir) = dir else {
+        return Vec::new();
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut pages: Vec<PathBuf> = entries
+        .take(MAX_ENTRIES)
+        .filter_map(Result::ok)
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_file()) && is_html(&e.path()))
+        .map(|e| e.path())
+        .collect();
+    pages.sort();
+    pages
+}
+
+/// A file name a browser would load as a page.
+fn is_html(path: &Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_ascii_lowercase)
+            .as_deref(),
+        Some("html") | Some("htm") | Some("xhtml")
+    )
+}
+
 /// Every file this run would stamp whose hash an HTML page under `roots` pins.
 ///
 /// Empty means stamping is safe as far as SRI is concerned. Never fails on a path problem: that is
@@ -148,28 +183,27 @@ pub fn find_pinned_scripts(roots: &[PathBuf], targets: &BTreeSet<PathBuf>) -> Ve
         } else {
             root.clone()
         };
-        // No directory filter and no depth cap: the WALK has none either, so a page under
-        // `.vitepress/dist` or `node_modules` pins a file we really are going to stamp. (Skipping
-        // them was a false negative the first draft shipped — it stamped what such a page pinned.)
-        for entry in walkdir::WalkDir::new(&base)
+        // Everything under the root, plus the pages sitting DIRECTLY in its parent. The standard
+        // Vite/webpack layout is `dist/index.html` + `dist/assets/*.js`, so `inject dist/assets`
+        // (or a single bundle by path) would otherwise stamp a file whose hash the page one level
+        // up pins — a build we break while reporting success. One level, not recursive: enough for
+        // that layout without wandering off into a parent tree we were not pointed at.
+        //
+        // No directory filter and no depth cap below the root: the WALK has none either, so a page
+        // under `.vitepress/dist` or `node_modules` pins a file we really are going to stamp.
+        // (Skipping those was a false negative the first draft shipped.)
+        let mut pages: Vec<PathBuf> = walkdir::WalkDir::new(&base)
             .sort_by_file_name()
             .into_iter()
             .filter_map(Result::ok)
-        {
-            let page = entry.path();
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let is_html = matches!(
-                page.extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("html") | Some("htm") | Some("xhtml")
-            );
-            if !is_html {
-                continue;
-            }
+            .filter(|e| e.file_type().is_file() && is_html(e.path()))
+            .map(|e| e.path().to_path_buf())
+            .collect();
+        if pages.is_empty() {
+            pages = pages_directly_in(base.parent());
+        }
+        for page in pages {
+            let page = page.as_path();
             let Ok(source) = std::fs::read_to_string(page) else {
                 continue; // a page we cannot read is not ours to fail the run over
             };
@@ -417,6 +451,38 @@ mod tests {
                 "page at {nested} was not seen"
             );
         }
+    }
+
+    /// The standard Vite/webpack layout keeps the page one level ABOVE the bundles
+    /// (`dist/index.html` + `dist/assets/*.js`), so pointing `inject` at the assets directory — or
+    /// at one bundle by path — used to miss the pin entirely and stamp the file anyway.
+    #[test]
+    fn a_page_one_level_above_the_given_path_still_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "assets/main.abc.js", "1");
+        write(
+            dir.path(),
+            "index.html",
+            r#"<script src="/assets/main.abc.js" integrity="sha384-V"></script>"#,
+        );
+
+        let assets = dir.path().join("assets");
+        let targets = targets_of(&[&assets]);
+        assert_eq!(
+            find_pinned_scripts(std::slice::from_ref(&assets), &targets)
+                .into_iter()
+                .map(|p| p.script)
+                .collect::<Vec<_>>(),
+            vec![dir.path().join("assets/main.abc.js")],
+            "a page in the parent directory pins a file we would stamp"
+        );
+
+        // …and the same when a single bundle is named by path.
+        let one = dir.path().join("assets/main.abc.js");
+        assert_eq!(
+            find_pinned_scripts(std::slice::from_ref(&one), &targets).len(),
+            1
+        );
     }
 
     /// `output.publicPath` pointing at a CDN is the CANONICAL SRI deployment — hash the local bytes,

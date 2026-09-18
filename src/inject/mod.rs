@@ -196,7 +196,12 @@ pub fn inject_paths(
 
     if !allow_sri {
         let index: std::collections::BTreeSet<PathBuf> = targets.iter().cloned().collect();
-        let pinned = sri::find_pinned_scripts(&roots, &index);
+        let pinned: Vec<_> = sri::find_pinned_scripts(&roots, &index)
+            .into_iter()
+            // A bundle this run would leave byte-identical cannot invalidate the hash that pins it.
+            // An unreadable one is reported as at-risk; `inject_one` is about to fail on it anyway.
+            .filter(|p| would_rewrite(&p.script).unwrap_or(true))
+            .collect();
         if let Some(first) = pinned.first() {
             let more = if pinned.len() > 1 {
                 format!(" (and {} more)", pinned.len() - 1)
@@ -281,6 +286,27 @@ fn collect_targets(
         }
     }
     targets
+}
+
+/// Would [`inject_one`] rewrite this bundle's BYTES?
+///
+/// The SRI guard refuses only over files this answers `true` for: a run that changes nothing cannot
+/// invalidate a hash, and re-running `inject` is documented as a no-op — including on a build that
+/// pins its hashes and was stamped once with `--allow-sri`.
+///
+/// Mirrors `inject_one`'s decision, and `would_rewrite_agrees_with_what_inject_actually_writes`
+/// pins the two together so they cannot drift.
+fn would_rewrite(js_path: &Path) -> Result<bool> {
+    let content = std::fs::read_to_string(js_path)?;
+    let map_path = paired_map(js_path, &content);
+    Ok(match existing_debug_id(&content) {
+        // A regenerated map re-keys the bundle; a foreign id still needs our runtime registration.
+        Some(id) => {
+            restamp_id(&content, &id, map_path.as_deref())?.is_some()
+                || !content.contains(&runtime_registration(&id))
+        }
+        None => true,
+    })
 }
 
 fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {
@@ -660,7 +686,126 @@ mod tests {
         )
         .unwrap();
 
-        assert!(inject_paths(&[dir.path().to_path_buf()], &[], false, true).is_err());
+        let err = inject_paths(&[dir.path().to_path_buf()], &[], false, true).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Subresource Integrity"),
+            "{err:#}"
+        );
+        assert_eq!(
+            crate::error::classify(&anyhow::Error::new(err)),
+            crate::exit_code::ExitCode::ConfigInvalid
+        );
+        // A preview of a run that would refuse IS a refusal — and nothing is written either way.
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("main.js")).unwrap(),
+            "console.log(1)\n"
+        );
+    }
+
+    /// Re-running `inject` is documented as a no-op, and that has to stay true on a build that
+    /// pins its hashes: the supported workflow for such a build is `--allow-sri` once (the build
+    /// then recomputes them), and any later run — a second CI job, an upload step that re-injects,
+    /// a retry — must not start failing. The guard refuses only over a bundle it would REWRITE.
+    #[test]
+    fn a_second_run_over_an_already_stamped_pinned_build_is_still_a_no_op() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.js"), "console.log(1)\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.js.map"),
+            br#"{"version":3,"sources":["a.ts"],"names":[],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<script src="main.js" integrity="sha384-P"></script>"#,
+        )
+        .unwrap();
+
+        // First run: the caller accepts the breakage and recomputes hashes afterwards.
+        let first = inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+        assert_eq!(first.js_injected, 1);
+        let after_first = std::fs::read(dir.path().join("main.js")).unwrap();
+
+        // Second run, WITHOUT --allow-sri: nothing to rewrite, so nothing to break.
+        let second = inject_paths(&[dir.path().to_path_buf()], &[], false, false).unwrap();
+        assert_eq!((second.js_injected, second.js_already), (0, 1));
+        assert_eq!(
+            std::fs::read(dir.path().join("main.js")).unwrap(),
+            after_first,
+            "a no-op run must not touch the bundle"
+        );
+    }
+
+    /// …and it still refuses when the re-run WOULD rewrite: a regenerated map re-keys the bundle,
+    /// which changes its bytes and breaks the pinned hash exactly as a first stamp would.
+    #[test]
+    fn a_re_run_that_would_restamp_is_still_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("main.js"), "console.log(1)\n").unwrap();
+        std::fs::write(
+            dir.path().join("main.js.map"),
+            br#"{"version":3,"sources":["a.ts"],"names":[],"mappings":"AAAA"}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("index.html"),
+            r#"<script src="main.js" integrity="sha384-P"></script>"#,
+        )
+        .unwrap();
+        inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+
+        // The bundler re-emits the map with different content and no id (webpack `[contenthash]`
+        // keeps the JS file it considers unchanged) — the next run re-keys the bundle.
+        std::fs::write(
+            dir.path().join("main.js.map"),
+            br#"{"version":3,"sources":["a.ts"],"names":[],"mappings":"AACA"}"#,
+        )
+        .unwrap();
+
+        let err = inject_paths(&[dir.path().to_path_buf()], &[], false, false).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("Subresource Integrity"),
+            "{err:#}"
+        );
+    }
+
+    /// The guard's "would this be rewritten?" answer must match what `inject_one` actually does, or
+    /// the two drift apart again — which is the whole class of bug this design exists to prevent.
+    #[test]
+    fn would_rewrite_agrees_with_what_inject_actually_writes() {
+        let cases: [(&str, &str, &[u8]); 4] = [
+            ("fresh", "console.log(1)\n", br#"{"version":3,"mappings":"AAAA"}"#),
+            (
+                "foreign id",
+                "console.log(1)\n//# debugId=11111111-1111-1111-1111-111111111111\n",
+                br#"{"version":3,"debug_id":"11111111-1111-1111-1111-111111111111","mappings":"AAAA"}"#,
+            ),
+            ("no map", "console.log(2)\n", b""),
+            ("empty", "", br#"{"version":3,"mappings":"AAAA"}"#),
+        ];
+        for (label, js, map) in cases {
+            for second_pass in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let js_path = dir.path().join("a.js");
+                std::fs::write(&js_path, js).unwrap();
+                if !map.is_empty() {
+                    std::fs::write(dir.path().join("a.js.map"), map).unwrap();
+                }
+                if second_pass {
+                    inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+                }
+
+                let predicted = would_rewrite(&js_path).unwrap();
+                let before = std::fs::read(&js_path).unwrap();
+                inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+                let actually = std::fs::read(&js_path).unwrap() != before;
+
+                assert_eq!(
+                    predicted, actually,
+                    "{label} (second_pass={second_pass}): guard said {predicted}, inject did {actually}"
+                );
+            }
+        }
     }
 
     /// A relative root (`./dist`, `../dist`) must behave exactly like the absolute one. It did not:
@@ -905,6 +1050,12 @@ mod tests {
         assert!(
             format!("{err:#}").contains("--exclude"),
             "the message must name the flag: {err:#}"
+        );
+        // …with the exit code integrators are documented not to fall back on. Asserting only the
+        // message left the contract to chance: the classification is what a CI script reads.
+        assert_eq!(
+            crate::error::classify(&anyhow::Error::new(err)),
+            crate::exit_code::ExitCode::ConfigInvalid
         );
     }
 
