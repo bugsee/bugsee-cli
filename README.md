@@ -257,9 +257,15 @@ stops before writing anything. Angular's `subresourceIntegrity: true` is the sam
 Fix it by stamping BEFORE the hashes are computed, by `--exclude`-ing the pinned files, or — if your
 build recomputes hashes after this runs — with `--allow-sri`.
 
-The guard only ever refuses over a file this run would really stamp, so an excluded file, a stale
-page pinning a bundle that no longer exists, or a page pinning something outside the output does not
-stop it. A URL is matched literally first and then by file name, so a `publicPath` — a CDN origin,
+The guard only ever refuses over a file this run would really REWRITE, so a re-run that changes
+nothing is still a no-op — including on a build stamped once with `--allow-sri` — and an excluded
+file, a stale page pinning a bundle that no longer exists, or a page pinning something outside the
+output does not stop it either.
+
+Pages are read from anywhere under the path you give it, plus any sitting directly in that path's
+parent — the usual layout is `dist/index.html` beside `dist/assets/*.js`, so `inject dist/assets`
+still sees the page that pins those bundles. `--dry-run` refuses too: the preview of a run that
+would refuse is a refusal, and it tells you why. A URL is matched literally first and then by file name, so a `publicPath` — a CDN origin,
 `/static/`, `/_next/` — still resolves to the local bytes it names; the cost of that fallback is that
 a third-party script sharing a file name with one of your bundles would be treated as yours.
 

@@ -20,8 +20,10 @@ pub enum SourcemapsCommand {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Glob of files NOT to touch; repeatable. Matched against the path relative to each
-        /// walked root and against the full path, so `--exclude '**/node_modules/**'` keeps
+        /// Glob of files NOT to touch; repeatable. Matched against the absolute path, the path
+        /// relative to the current directory, and the path relative to each walked root, so
+        /// `dist/vendor/**`, `vendor/**` and an absolute path all work whatever the root looks
+        /// like. `*` crosses `/`. So `--exclude '**/node_modules/**'` keeps
         /// `inject` out of vendored code inside a build output (a Nuxt `.output/server` carries
         /// 22 such `.mjs`), and `--exclude 'polyfills*.js'` skips one file by name.
         ///
