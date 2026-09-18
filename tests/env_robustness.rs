@@ -6,6 +6,10 @@
 
 use assert_cmd::Command;
 
+// Only the Unix-gated tests below use this today (a non-UTF-8 env var is not constructible on
+// Windows, where `OsString` is WTF-16), and `-D warnings` makes an unused helper a hard error —
+// which is how `cargo test` was broken on Windows while every CI job stayed green.
+#[cfg(unix)]
 fn cli() -> Command {
     let mut c = Command::cargo_bin("bugsee-cli").expect("compiled bugsee-cli binary");
     c.env_clear();
