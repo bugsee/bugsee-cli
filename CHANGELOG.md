@@ -6,6 +6,22 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`upload build` can register a build without shipping the artefact's bytes** — omit `--artifact`.
+  That is the normal case on every platform that has not opted into size analysis (Android unless
+  `sizeAnalysis.enabled`, the iOS post-action unless `BUGSEE_SIZE_ANALYSIS_ENABLED`), and it is the
+  only case a **web build** can express, having no single artefact to ship. The mode already existed
+  inside `build::Params` and `xcode post-action` used it; nothing on the command line could reach it,
+  because `--artifact` was required and `request_artifact_upload` was hard-coded `true`.
+
+  `--deps` and `--timings` still travel without an artefact — the build-info bundle is a separate
+  upload. The flags that only describe how artefact bytes move (`--mapping`, `--chunked`, `--out`) are
+  rejected with exit 20 rather than ignored: silently dropping a `--mapping` would cost symbolication,
+  and a caller who passed `--chunked` is saying they expect bytes to move.
+
+  Groundwork for web-build registration — the design and its decisions are in the JS repo,
+  `docs/design/web-build-registration.md`.
+
 ## [0.7.11] - 2026-09-18
 
 ### Added
