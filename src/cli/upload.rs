@@ -6,7 +6,7 @@
 //! through `debug-files upload`.
 
 use clap::Subcommand;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::compress;
 use crate::error::{config_invalid, input_not_found};
@@ -80,8 +80,14 @@ pub enum UploadCommand {
         payload_json: PathBuf,
 
         /// Build artefact (`.aab`/`.apk`/`.ipa`), STORED verbatim in the ZIP.
+        ///
+        /// OPTIONAL. Without it the build is REGISTERED and no bytes are shipped — which is the
+        /// normal case on every platform that does not opt into size analysis, and the only case a
+        /// web build can express (it has no single artefact to ship). The payload still carries the
+        /// producer's `uuid`, `version` and the rest, and `--deps`/`--timings` still travel, because
+        /// the build-info bundle is a separate upload from the artefact.
         #[arg(long)]
-        artifact: PathBuf,
+        artifact: Option<PathBuf>,
 
         /// Optional R8/ProGuard mapping.txt, zstd-packed alongside the artefact.
         #[arg(long)]
@@ -243,14 +249,32 @@ pub async fn dispatch(
                     }
                 }
             }
+            // Flags that only describe how ARTEFACT bytes travel, or what rides inside the
+            // artefact ZIP, are contradictions without one. Rejected rather than ignored: silently
+            // dropping a `--mapping` costs symbolication, and a caller who passed `--chunked` is
+            // telling us they expect bytes to move.
+            if artifact.is_none() {
+                for (flag, present) in [
+                    ("--mapping", mapping.is_some()),
+                    ("--chunked", chunked),
+                    ("--out", out.is_some()),
+                ] {
+                    if present {
+                        return Err(config_invalid(format!(
+                            "{flag} needs --artifact: without an artefact the build is only \
+                             registered and no bytes are packed or sent"
+                        )));
+                    }
+                }
+            }
             let endpoint = endpoint.unwrap_or_else(|| DEFAULT_ENDPOINT.to_string());
             let params = build::Params {
                 endpoint: &endpoint,
                 app_token,
                 payload_json: &payload_json,
-                artifact: &artifact,
-                // `upload build` exists to ship the artefact — always request it.
-                request_artifact_upload: true,
+                // Read only when bytes ship; `build::run` never touches it otherwise.
+                artifact: artifact.as_deref().unwrap_or(Path::new("")),
+                request_artifact_upload: artifact.is_some(),
                 mapping: mapping.as_deref(),
                 deps: deps.as_deref(),
                 timings: timings.as_deref(),

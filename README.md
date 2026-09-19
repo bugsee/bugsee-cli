@@ -294,6 +294,34 @@ bugsee-cli debug-files upload --type sourcemaps <paths>... --version <v> --build
     [--concurrency N] [--allow-empty] [--strip-sources-content]
 ```
 
+### `upload build`
+
+Registers a build record — the thing a symbol upload, a size analysis and a crash all hang off — and,
+optionally, ships the build artefact's bytes.
+
+```
+bugsee-cli upload build --payload-json <path> \
+    [--artifact <.aab|.apk|.ipa>]  # omit to REGISTER ONLY, shipping no bytes \
+    [--mapping <mapping.txt>]      # needs --artifact (it rides inside the ZIP) \
+    [--deps <deps.json>] [--timings <timings.json>] \
+    [--chunked]                    # needs --artifact \
+    [--dry-run [--out <zip>]]      # --out needs --artifact
+```
+
+`--payload-json` is the registration body, written by the producer (the Gradle plugin, the Xcode
+post-action, a bundler plugin) and passed through verbatim apart from two fields the CLI injects:
+`request_artifact_upload`, and `request_build_info_upload` when a sidecar is present.
+
+**Without `--artifact` the build is registered and nothing is packed or sent.** That is the normal
+case wherever size analysis is not enabled — and the only case a web build can express, having no
+single artefact to ship. `--deps`/`--timings` still travel, because the build-info bundle is a
+separate upload from the artefact. The flags that only describe how artefact bytes move (`--mapping`,
+`--chunked`, `--out`) are rejected with exit 20 rather than ignored: dropping a `--mapping` silently
+would cost symbolication.
+
+Dedup is server-side on the payload's `uuid` (replace-then-create), which is why the registration POST
+is retried on a transport error but never on a 5xx.
+
 ### `xcode upload-dsyms`
 
 Uploads dSYMs from an Xcode **Run Script build phase**, with none of the

@@ -14,6 +14,8 @@ use assert_cmd::Command;
 use predicates::str::contains;
 use std::path::PathBuf;
 
+mod common;
+
 const CONFIG_INVALID: i32 = 20;
 
 fn upload(kind: &str, extra: &[&str]) -> Command {
@@ -201,4 +203,129 @@ fn sourcemap_only_flags_are_accepted_for_sourcemaps() {
     )
     .assert()
     .success();
+}
+
+/// `upload build` registers a build record AND ships the artefact's bytes. Every other platform
+/// treats "register, ship no bytes" as the NORMAL case — it is what Android does unless
+/// `sizeAnalysis.enabled` is set, and what the iOS post-action does unless
+/// `BUGSEE_SIZE_ANALYSIS_ENABLED` is — but the flag that expresses it existed only inside the Rust
+/// `build::Params`, reachable from `xcode post-action` and from nothing on the command line. A web
+/// build has no `.aab`/`.ipa` to ship, so that was the one case it could not express.
+mod register_only_build {
+    use super::*;
+
+    fn build_cmd(extra: &[&str]) -> Command {
+        let tmp = std::env::temp_dir();
+        let payload = tmp.join("bugsee-register-only-payload.json");
+        std::fs::write(
+            &payload,
+            br#"{"uuid":"deadbeefdeadbeefdeadbeefdeadbeef","version":"1.2.3","format":"web"}"#,
+        )
+        .unwrap();
+        let mut c = common::cli();
+        c.args([
+            "--app-token",
+            "TKN",
+            "--endpoint",
+            "http://127.0.0.1:1",
+            "upload",
+            "build",
+            "--payload-json",
+            payload.to_str().unwrap(),
+        ])
+        .args(extra);
+        c
+    }
+
+    /// tracing styles the field name and its value separately, so `contains` over the raw stderr
+    /// cannot see `name=value` as one string. Stripping the escapes keeps the assertion on the VALUE
+    /// — a weaker match on the field name alone would pass for `true` just as happily.
+    fn plain(text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut chars = text.chars();
+        while let Some(c) = chars.next() {
+            if c == '\u{1b}' {
+                for skip in chars.by_ref() {
+                    if skip == 'm' {
+                        break;
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    /// No `--artifact`: the build registers and no bytes are packed or sent.
+    #[test]
+    fn a_build_with_no_artifact_registers_and_ships_nothing() {
+        build_cmd(&["--dry-run"])
+            .assert()
+            .success()
+            .stderr(predicates::function::function(|s: &str| {
+                plain(s).contains("request_artifact_upload=false")
+            }));
+    }
+
+    /// …and WITH one, the same log line says bytes are going — the other half of the same assertion,
+    /// so "ships nothing" cannot be satisfied by a run that never looked at the flag.
+    #[test]
+    fn a_build_with_an_artifact_still_requests_the_upload() {
+        let artifact = std::env::temp_dir().join("bugsee-register-only-app.aab");
+        std::fs::write(&artifact, b"PK\x03\x04 fake aab").unwrap();
+        let out = std::env::temp_dir().join("bugsee-register-only-out.zip");
+        build_cmd(&[
+            "--artifact",
+            artifact.to_str().unwrap(),
+            "--out",
+            out.to_str().unwrap(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::function::function(|s: &str| {
+            plain(s).contains("request_artifact_upload=true")
+        }));
+        assert!(out.is_file(), "the artefact ZIP is still packed");
+    }
+
+    /// `--mapping` rides INSIDE the artefact ZIP, so asking for one without an artefact is a
+    /// contradiction — and silently dropping the mapping would cost symbolication.
+    #[test]
+    fn mapping_without_an_artifact_is_rejected() {
+        let tmp = std::env::temp_dir();
+        let mapping = tmp.join("bugsee-register-only-mapping.txt");
+        std::fs::write(&mapping, b"a -> b\n").unwrap();
+        build_cmd(&["--mapping", mapping.to_str().unwrap(), "--dry-run"])
+            .assert()
+            .code(CONFIG_INVALID)
+            .stderr(contains("--mapping needs --artifact"));
+    }
+
+    /// Same for the two flags that only describe how artefact bytes travel.
+    #[test]
+    fn artifact_transport_flags_without_an_artifact_are_rejected() {
+        build_cmd(&["--chunked", "--dry-run"])
+            .assert()
+            .code(CONFIG_INVALID)
+            .stderr(contains("--chunked needs --artifact"));
+
+        let out = std::env::temp_dir().join("bugsee-register-only.zip");
+        build_cmd(&["--out", out.to_str().unwrap(), "--dry-run"])
+            .assert()
+            .code(CONFIG_INVALID)
+            .stderr(contains("--out needs --artifact"));
+    }
+
+    /// The artefact path is still validated when one IS given — the register-only path must not turn
+    /// a typo into a silent no-op upload.
+    #[test]
+    fn a_missing_artifact_path_is_still_an_error() {
+        const INPUT_NOT_FOUND: i32 = 10;
+        build_cmd(&["--artifact", "/nope/app.aab", "--dry-run"])
+            .assert()
+            .code(INPUT_NOT_FOUND)
+            .stderr(contains("artifact does not exist"));
+    }
 }

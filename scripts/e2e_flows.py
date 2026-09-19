@@ -518,6 +518,10 @@ def main():
                                   "--mapping", os.path.join(fix, "mapping.txt")])
     results["build_chunked"] = run(binpath, "build_chunked", ["upload", "build", "--payload-json", pj,
                                    "--artifact", os.path.join(fix, "app.aab"), "--chunked"])
+    # No --artifact: the build is REGISTERED and no bytes move. This is the normal case on every
+    # platform that has not opted into size analysis, and the only one a web build can express.
+    results["build_register_only"] = run(
+        binpath, "build_register_only", ["upload", "build", "--payload-json", pj])
     results["build_info"] = run(binpath, "build_info", ["upload", "build-info", "--payload-json", pj,
                                 "--deps", os.path.join(fix, "deps.json"),
                                 "--timings", os.path.join(fix, "timings.json")])
@@ -563,6 +567,18 @@ def main():
         results["build_requests_artifact_upload"] = (bp.get("request_artifact_upload") is True)
     except Exception:
         results["build_requests_artifact_upload"] = False
+    try:
+        rp = json.load(open(cappath("build_register_only__builds_post.json")))
+        # Registered, with the producer's payload intact, and asking for no artefact upload…
+        registered = (rp.get("request_artifact_upload") is False and rp.get("uuid") == bp.get("uuid"))
+        # …and no artefact PUT happened at all. `puts` counts artefact/symbol PUTs per flow.
+        results["build_register_only_ships_no_bytes"] = (
+            registered and STATE["puts"].get("build_register_only", 0) == 0)
+        if not results["build_register_only_ships_no_bytes"]:
+            print(f"  [FAIL] register-only payload={rp!r} puts={STATE['puts'].get('build_register_only')!r}")
+    except Exception as e:
+        print("  [FAIL] could not verify the register-only build:", e)
+        results["build_register_only_ships_no_bytes"] = False
 
     srv.shutdown()
     if not a.keep:
