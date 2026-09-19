@@ -100,15 +100,21 @@ fi
 # A separate function ONLY so the test harness can drive it: the fixtures stub npm
 # out, so nothing about this retry was observable while it sat inline in the
 # caller — and a mutation removing it passed all 28 of them.
+#
+# The answer comes back in TRUST_STATE, NOT on stdout, and that is the whole
+# point. A caller writing `state="$(trust_state_interactive …)"` would recapture
+# the stdout this function exists to leave attached to the terminal: npm's prompt
+# would be swallowed again, and `$state` would arrive as several lines that match
+# no arm of the caller's `case`. The first version of this function did exactly
+# that. The test asserts the call site is not wrapped.
 trust_state_interactive() {
-  local pkg="$1" state
-  state="$(trust_state "$pkg")"
-  if [ "$state" = unknown ]; then
+  local pkg="$1"
+  TRUST_STATE="$(trust_state "$pkg")"
+  if [ "$TRUST_STATE" = unknown ]; then
     echo "  auth:     npm needs an interactive 2FA challenge — follow its prompt"
     $TRUST_NPM trust list "$pkg" || true
-    state="$(trust_state "$pkg")"
+    TRUST_STATE="$(trust_state "$pkg")"
   fi
-  printf '%s' "$state"
 }
 
 trust_state() {
@@ -265,7 +271,10 @@ JSON
   fi
 
   # 2. Attach the trusted publisher, so npm-publish.yml's OIDC can publish it.
-  state="$(trust_state_interactive "$pkg")"
+  # NOT `state="$(trust_state_interactive …)"`: that would recapture the stdout
+  # npm's 2FA prompt needs. The state arrives in TRUST_STATE instead.
+  trust_state_interactive "$pkg"
+  state="$TRUST_STATE"
 
   case "$state" in
     granted)
