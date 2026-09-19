@@ -234,21 +234,44 @@ flaky_npm() {
 
 # Asserts the classification AND whether the interactive retry was used, because
 # "granted either way" cannot tell a working retry from one that always runs.
+#
+# The state is read from TRUST_STATE and compared EXACTLY — no `tail -1`. An
+# earlier version of this test took the function's stdout and stripped the last
+# line off it, which quietly accommodated the bug the reviewer found: the state
+# was arriving with npm's output glued to it, and a real caller has no `tail`.
+# Stdout goes to a FILE here for the same reason the real call site leaves it
+# attached to the terminal — capturing it with `$(...)` would put the function in
+# a subshell and lose TRUST_STATE with it.
 ti() {
-  local name="$1" expected="$2" want_retry="$3" out got retried
+  local name="$1" expected="$2" want_retry="$3" out retried
   CALL_FILE="$(mktemp)"; echo 0 > "$CALL_FILE"
-  out="$(TRUST_NPM=flaky_npm trust_state_interactive "@bugsee/x" 2>/dev/null)"
-  got="$(printf '%s' "$out" | tail -1)"
+  local out_file; out_file="$(mktemp)"
+  TRUST_STATE=""
+  TRUST_NPM=flaky_npm trust_state_interactive "@bugsee/x" > "$out_file" 2>/dev/null
+  out="$(cat "$out_file")"
   case "$out" in *"needs an interactive 2FA challenge"*) retried=yes ;; *) retried=no ;; esac
-  rm -f "$CALL_FILE"
-  if [ "$got" = "$expected" ] && [ "$retried" = "$want_retry" ]; then
+  rm -f "$CALL_FILE" "$out_file"
+  if [ "$TRUST_STATE" = "$expected" ] && [ "$retried" = "$want_retry" ]; then
     printf '  ok    %s\n' "$name"
   else
     printf '  FAIL  %s (expected %s/retry=%s, got %s/retry=%s)\n' \
-      "$name" "$expected" "$want_retry" "$got" "$retried"
+      "$name" "$expected" "$want_retry" "$TRUST_STATE" "$retried"
     fails=1
   fi
 }
+
+# The call site itself, which no amount of driving the function can check: wrapping
+# it in a command substitution recaptures the stdout npm's prompt needs, and the
+# multi-line value then matches no arm of the caller's `case`. That is precisely
+# the regression the reviewer caught, so it is pinned structurally.
+# Comments stripped first: this file's own explanation of the hazard, and the
+# script's, both contain the very shape being searched for.
+if grep -vE '^[[:space:]]*#' "$SCRIPT_UNDER_TEST" | grep -qE '[$][(][[:space:]]*trust_state_interactive'; then
+  printf '  FAIL  trust_state_interactive is called in a command substitution — recaptures the 2FA prompt\n'
+  fails=1
+else
+  printf '  ok    the interactive read is not wrapped in a command substitution\n'
+fi
 
 # A cold session: the captured reads fail, so the retry is what rescues it.
 FAIL_FIRST=2
