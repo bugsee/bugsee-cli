@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.12] - 2026-09-23
+
 ### Added
 - **`upload build` can register a build without shipping the artefact's bytes** — omit `--artifact`.
   That is the normal case on every platform that has not opted into size analysis (Android unless
@@ -20,7 +22,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   and a caller who passed `--chunked` is saying they expect bytes to move.
 
   Groundwork for web-build registration — the design and its decisions are in the JS repo,
-  `docs/design/web-build-registration.md`.
+  `docs/design/web-build-registration.md`. See [#52].
+
+  `format` is forwarded from the payload, not validated here, so a web build's `format: "web"`
+  needs the backend to accept it (bugsee-appserver#42) — this release adds no new format value.
+
+### Fixed
+- **`npm/bootstrap-names.sh` can read a package's trust state on a session that needs 2FA.** The
+  read captured npm's output with `$(...)`, which swallowed npm's interactive "Authenticate your
+  account at: <url>" challenge; npm failed with `EOTP` and the script stopped at `unknown`. On
+  `unknown` the state is now re-read once uncaptured, with the terminal attached. A maintainer-only
+  script — the published binary is unchanged by it. See [#53].
+
+[#52]: https://github.com/bugsee/bugsee-cli/pull/52
+[#53]: https://github.com/bugsee/bugsee-cli/pull/53
 
 ## [0.7.11] - 2026-09-18
 
