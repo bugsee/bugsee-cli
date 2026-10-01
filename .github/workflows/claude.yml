@@ -1,6 +1,6 @@
 name: Claude Code
 
-# Answers an `@claude` mention on an issue, a PR, a PR review, or a review
+# Answers an `@claude` mention on an issue, a PR, a PR review, or a review comment.
 on:
   issue_comment:
     types: [created]
