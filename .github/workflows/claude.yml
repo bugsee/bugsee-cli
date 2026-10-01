@@ -1,7 +1,6 @@
 name: Claude Code
 
 # Answers an `@claude` mention on an issue, a PR, a PR review, or a review
-# comment. The automatic per-PR review lives in claude-code-review.yml.
 on:
   issue_comment:
     types: [created]
