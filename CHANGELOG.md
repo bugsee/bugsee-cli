@@ -6,6 +6,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **`build-env machine-label` falls back to the hostname on macOS and Windows.** Outside CI it
+  shelled out to `/usr/bin/hostname`, which does not exist on macOS (`/bin/hostname`) or Windows,
+  so it printed an empty line, `CI=true` without `$HOSTNAME` gave a bare `ci`, and a local
+  `xcode post-action` registered builds without `build_metadata.machine`. The hostname is now read
+  with `gethostname(2)` on Unix and `COMPUTERNAME` on Windows. See [#66].
+
+[#66]: https://github.com/bugsee/bugsee-cli/pull/66
+
 ## [0.7.12] - 2026-10-07
 
 ### Added

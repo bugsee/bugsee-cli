@@ -569,6 +569,16 @@ mod tests {
         assert!(!host.contains('\0'));
     }
 
+    /// Windows counterpart of the Unix pin: `COMPUTERNAME` is set for every
+    /// process, so the fallback must find it rather than pass as `None`.
+    #[test]
+    #[cfg(windows)]
+    fn local_hostname_resolves_on_windows() {
+        let host = local_hostname().expect("Windows always sets COMPUTERNAME");
+        assert!(!host.is_empty());
+        assert_eq!(host, host.trim());
+    }
+
     #[test]
     fn no_provider_returns_local_hostname_or_none() {
         // No CI vars at all → falls through to local_hostname.
