@@ -173,13 +173,27 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         let with_path = |e: std::io::Error| {
             std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
         };
-        let bytes = std::fs::read(entry.path()).map_err(with_path)?;
+        let file = std::fs::File::open(entry.path()).map_err(with_path)?;
+        let len = file.metadata().map_err(with_path)?.len();
+        // Map instead of reading: identity needs only the headers and notes, so
+        // a 100+ MB unstripped library costs a few KB of resident memory, not a
+        // full copy. (An empty file cannot be mapped; it has no build-id anyway.)
+        //
+        // SAFETY: the map is read-only and dropped at the end of this iteration;
+        // the only hazard is another process truncating the library while it is
+        // being parsed, which build output being scanned does not do.
+        let map = if len == 0 {
+            None
+        } else {
+            Some(unsafe { memmap2::Mmap::map(&file) }.map_err(with_path)?)
+        };
+        let bytes: &[u8] = map.as_deref().unwrap_or(&[]);
         let ElfIdentity {
             build_id,
             arch,
             has_debug_info,
             has_symbols,
-        } = parse_elf_identity(&bytes);
+        } = parse_elf_identity(bytes);
         let name = entry
             .path()
             .strip_prefix(dir)
@@ -191,7 +205,7 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
             build_id,
             arch,
             path: entry.path().to_path_buf(),
-            richness: (has_debug_info, has_symbols, bytes.len() as u64),
+            richness: (has_debug_info, has_symbols, len),
         });
     }
     Ok(libs)
@@ -318,6 +332,17 @@ mod tests {
             "da39a3ee5e6b4b0d3255bfef95601890afd80709",
             "SHA-1 of the empty input"
         );
+    }
+
+    #[test]
+    fn scan_dir_handles_an_empty_library_file() {
+        // Mapping a zero-length file fails; it must come out as "no build-id"
+        // (warn + skip upstream), not as a scan error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("libempty.so"), b"").unwrap();
+        let libs = scan_dir(dir.path(), &ExtraSuffixes::default()).unwrap();
+        assert_eq!(names(&libs), ["libempty.so"]);
+        assert_eq!(libs[0].build_id, None);
     }
 
     #[test]
