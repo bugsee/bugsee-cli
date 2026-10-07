@@ -111,8 +111,10 @@ CI recipe (GitHub Actions):
 ```yaml
 - run: cargo build --release
 - run: |
-    curl -fsSL https://download.bugsee.com/cli/install.sh | sh
-    bugsee-cli debug-files upload --type rust target/release \
+    # Pin the install dir and call the binary by path: the installer's default
+    # (/usr/local/bin if writable, else ~/.local/bin) may not be on PATH here.
+    curl -fsSL https://download.bugsee.com/cli/install.sh | BUGSEE_CLI_INSTALL_DIR="$HOME/.local/bin" sh
+    "$HOME/.local/bin/bugsee-cli" debug-files upload --type rust target/release \
       --version "${{ github.ref_name }}" --build "${{ github.run_number }}"
   env:
     BUGSEE_APP_TOKEN: ${{ secrets.BUGSEE_APP_TOKEN }}

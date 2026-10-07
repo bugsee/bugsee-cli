@@ -5,6 +5,14 @@ design; this is the **ordered go-live procedure** for turning on the
 build-time upload unification (build-info bundle + zstd mapping packing) that is
 currently built, tested, and **dormant behind activation gates**.
 
+> **Update (2026-10-07):** the CLI-side gates below are met. `bugsee-cli` is
+> published (0.7.12 on GitHub Releases, npm and `download.bugsee.com/cli`), and
+> the producers pin CLI floors that include `upload build` / `upload build-info`
+> — the Gradle plugin's `CliBinaryResolver.DEFAULT_VERSION` and the fastlane
+> BugseeAgent at 0.6.0, the iOS SDK BugseeAgent at 0.3.0 — so their
+> CLI-delegated paths are active. The rest of this page is the original
+> procedure, kept for the per-track server-side gates and the verification steps.
+
 Status at time of writing (2026-06-15): all code is committed on
 `build-info-bundle` branches across `bugsee-cli`, `android/gradle-plugin`,
 `appserver`, `worker` (+ iOS agents). Nothing is live. `bugsee-cli` is at
