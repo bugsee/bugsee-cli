@@ -564,8 +564,13 @@ fn write_map_debug_id(
 /// / legacy `uuid`, in that precedence. Mirrors the worker's
 /// `symbolfiles/sourcemap.py:parse`.
 pub fn read_debug_id(map_path: &Path) -> Result<Option<String>> {
-    let raw = std::fs::read_to_string(map_path)?;
-    let value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
+    // Mapped rather than read into a String: the JSON tree below is the only
+    // copy this needs. UTF-8 is checked up front so a non-UTF-8 map still fails
+    // as an I/O `InvalidData` error, exactly as `read_to_string` did.
+    let bytes = crate::symbols::mapped::map_file(map_path)?;
+    let raw = std::str::from_utf8(&bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
         Error::InputInvalid(format!(
             "sourcemap is not valid JSON: {e} ({})",
             map_path.display()

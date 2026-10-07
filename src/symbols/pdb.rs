@@ -81,7 +81,7 @@ pub fn identify(pdb_path: &Path) -> Result<PdbIdentity> {
         )));
     }
 
-    let data = std::fs::read(pdb_path)?;
+    let data = super::mapped::map_file(pdb_path)?;
     let archive = Archive::parse(&data).map_err(|e| {
         Error::InputInvalid(format!(
             "failed to parse PDB at {}: {}",

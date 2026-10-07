@@ -25,15 +25,33 @@ pub fn looks_like_mapping_filename(name: &str) -> bool {
 
 /// Read a file from disk and compute (debug-id, sha1 hex).
 ///
-/// Streams the SHA1 chunk-at-a-time to keep memory flat for large mappings
-/// (multi-megabyte mappings are common for big apps). MD5 still needs the
-/// whole buffer because Java's `nameUUIDFromBytes` operates on contiguous
-/// bytes; mappings rarely exceed 50 MB so this is acceptable.
+/// Both digests are computed in ONE streamed pass (64 KiB buffer), so memory
+/// stays flat however large the mapping is: Java's `nameUUIDFromBytes` is just
+/// an MD5 of the bytes with the version/variant bits set, and MD5 is
+/// incremental like SHA-1.
 pub fn identify(path: &Path) -> std::io::Result<MappingIdentity> {
-    let bytes = std::fs::read(path)?;
-    Ok(identify_bytes(&bytes))
+    use std::io::Read as _;
+    let mut file = std::fs::File::open(path)?;
+    let mut md5 = Md5::new();
+    let mut sha1 = Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        md5.update(&buf[..n]);
+        sha1.update(&buf[..n]);
+    }
+    let md5_bytes: [u8; 16] = md5.finalize().into();
+    let sha1_bytes: [u8; 20] = sha1.finalize().into();
+    Ok(MappingIdentity {
+        debug_id: Builder::from_md5_bytes(md5_bytes).into_uuid(),
+        content_sha1_hex: hex::encode(sha1_bytes),
+    })
 }
 
+#[cfg(test)]
 pub fn identify_bytes(bytes: &[u8]) -> MappingIdentity {
     MappingIdentity {
         debug_id: java_name_uuid_from_bytes(bytes),
@@ -51,6 +69,7 @@ pub struct MappingIdentity {
     pub content_sha1_hex: String,
 }
 
+#[cfg(test)]
 /// Replicates Java `UUID.nameUUIDFromBytes(name)`:
 ///   1. MD5 of input bytes.
 ///   2. Set the version nibble of byte 6 to 3.
@@ -62,6 +81,7 @@ pub fn java_name_uuid_from_bytes(name: &[u8]) -> Uuid {
     Builder::from_md5_bytes(md5_bytes).into_uuid()
 }
 
+#[cfg(test)]
 fn sha1_hex(bytes: &[u8]) -> String {
     let digest: [u8; 20] = Sha1::digest(bytes).into();
     hex::encode(digest)
@@ -84,6 +104,25 @@ mod tests {
         // = MD5("")=d41d8cd98f00b204e9800998ecf8427e, then byte6 b2 → 32 and byte8 e9 → a9.
         assert_eq!(
             java_name_uuid_from_bytes(b"").to_string(),
+            "d41d8cd9-8f00-3204-a980-0998ecf8427e"
+        );
+    }
+
+    #[test]
+    fn streamed_identify_equals_in_memory_identify_across_buffer_boundaries() {
+        // Bigger than the 64 KiB buffer and not a multiple of it: a chunking bug
+        // would change either digest relative to the one-shot computation.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("mapping.txt");
+        let data: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        let streamed = identify(&p).unwrap();
+        let whole = identify_bytes(&data);
+        assert_eq!(streamed.debug_id, whole.debug_id);
+        assert_eq!(streamed.content_sha1_hex, whole.content_sha1_hex);
+        std::fs::write(&p, b"").unwrap();
+        assert_eq!(
+            identify(&p).unwrap().debug_id.to_string(),
             "d41d8cd9-8f00-3204-a980-0998ecf8427e"
         );
     }

@@ -232,7 +232,7 @@ pub fn main_executable_uuid(app_path: &Path) -> Option<String> {
         return None;
     }
 
-    let data = std::fs::read(&binary_path).ok()?;
+    let data = crate::symbols::mapped::map_file(&binary_path).ok()?;
     let archive = Archive::parse(&data).ok()?;
     let mut slices: Vec<(String, Uuid)> = Vec::new();
     for obj in archive.objects() {

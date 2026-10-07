@@ -100,8 +100,8 @@ pub fn is_retriable_status(status: reqwest::StatusCode) -> bool {
 /// statuses.
 ///
 /// `make` is invoked once per attempt and MUST build an equivalent request each
-/// time (callers clone the body — fine for the small JSON POSTs and in-memory
-/// bundle PUTs this module serves). Returns the final response (which the caller
+/// time (small JSON POSTs clone their body; a file PUT builds a fresh
+/// [`file_body`] stream per attempt — see [`put_file`]). Returns the final response (which the caller
 /// inspects for success / parses) once it is a success, is non-retriable, or the
 /// attempts are exhausted; returns `UploadTransport` only when every attempt
 /// failed at the transport layer.
@@ -215,11 +215,218 @@ pub fn truncate_for_log(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// A request body that streams `path` from disk in 64 KiB chunks.
+///
+/// Reading the file whole (and cloning it for each retry attempt) holds one or
+/// two full copies of an artefact in memory per upload. The file is opened
+/// lazily on first poll so an open error surfaces as a failed (retriable)
+/// request rather than a panic, and every attempt re-opens it from the start.
+///
+/// A streamed body has no known length and would go out chunked, which a
+/// presigned S3 PUT rejects: the caller MUST also set `Content-Length`
+/// (see [`file_len`]).
+pub fn file_body(path: &std::path::Path) -> reqwest::Body {
+    use tokio::io::AsyncReadExt;
+    enum St {
+        Unopened(std::path::PathBuf),
+        Open(tokio::fs::File),
+        Done,
+    }
+    reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        St::Unopened(path.to_path_buf()),
+        |st| async move {
+            let mut file = match st {
+                St::Unopened(p) => match tokio::fs::File::open(p).await {
+                    Ok(f) => f,
+                    Err(e) => return Some((Err(e), St::Done)),
+                },
+                St::Open(f) => f,
+                St::Done => return None,
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), St::Open(file)))
+                }
+                Err(e) => Some((Err(e), St::Done)),
+            }
+        },
+    ))
+}
+
+/// The byte length to send as `Content-Length` alongside [`file_body`].
+pub async fn file_len(path: &std::path::Path) -> std::io::Result<u64> {
+    Ok(tokio::fs::metadata(path).await?.len())
+}
+
+/// How many 307/308 hops [`put_file`] follows before giving up.
+const MAX_PUT_REDIRECTS: usize = 5;
+
+/// PUT `path` to `url`, streaming it, retrying like [`send_with_retry`], and following
+/// 307/308 redirects ITSELF.
+///
+/// reqwest follows a 307/308 only when it can replay the request body, and a streamed
+/// body cannot be replayed: it hands the 3xx back instead, which would fail the upload
+/// (S3 answers a freshly created bucket's presigned URL with a temporary 307 to the
+/// regional endpoint). Re-issuing the PUT to `Location` with a new stream from the
+/// file is exactly what following it means. `content_type`, when set, is sent on every hop
+/// (a presigned URL's signature may cover it). Returns the final response for the caller
+/// to judge (success or not).
+pub async fn put_file(
+    client: &reqwest::Client,
+    policy: RetryPolicy,
+    what: &str,
+    url: &str,
+    path: &std::path::Path,
+    content_type: Option<&str>,
+) -> Result<reqwest::Response> {
+    let len = file_len(path).await?;
+    let mut target = reqwest::Url::parse(url)
+        .map_err(|e| Error::UploadTransport(format!("{what}: invalid URL: {e}")))?;
+    for _ in 0..=MAX_PUT_REDIRECTS {
+        let resp = send_with_retry(policy, what, true, || {
+            let mut req = client
+                .put(target.clone())
+                .header(reqwest::header::CONTENT_LENGTH, len)
+                .body(file_body(path));
+            if let Some(ct) = content_type {
+                req = req.header(reqwest::header::CONTENT_TYPE, ct);
+            }
+            req
+        })
+        .await?;
+        if !matches!(resp.status().as_u16(), 307 | 308) {
+            return Ok(resp);
+        }
+        let Some(next) = resp
+            .headers()
+            .get(reqwest::header::LOCATION)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|loc| target.join(loc).ok())
+        else {
+            return Ok(resp); // a redirect with no usable Location: let the caller report it
+        };
+        tracing::debug!(
+            from = %redact_url(target.as_str()),
+            to = %redact_url(next.as_str()),
+            status = resp.status().as_u16(),
+            "{what}: following redirect"
+        );
+        target = next;
+    }
+    Err(Error::UploadTransport(format!(
+        "{what}: more than {MAX_PUT_REDIRECTS} redirects"
+    )))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    // ── put_file: streaming PUT that follows 307/308 itself ──────────────────
+
+    fn payload(len: usize) -> (tempfile::TempDir, std::path::PathBuf, Vec<u8>) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("payload.zip");
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&p, &data).unwrap();
+        (dir, p, data)
+    }
+
+    /// reqwest cannot replay a streamed body, so it hands a 307/308 back instead of
+    /// following it. `put_file` must follow it itself — with the WHOLE body again, the same
+    /// Content-Type, and a relative `Location` resolved against the current URL.
+    #[tokio::test]
+    async fn put_file_follows_307_and_308_resending_the_whole_body() {
+        for status in [307u16, 308] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .and(wiremock::matchers::path("/first"))
+                .respond_with(
+                    ResponseTemplate::new(status).insert_header("Location", "/regional/second"),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .and(wiremock::matchers::path("/regional/second"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let (_d, p, data) = payload(200_000);
+            let client = build_client().unwrap();
+            let resp = put_file(
+                &client,
+                RetryPolicy::none(),
+                "test PUT",
+                &format!("{}/first", server.uri()),
+                &p,
+                Some("application/octet-stream"),
+            )
+            .await
+            .unwrap();
+            assert!(resp.status().is_success(), "{status}");
+            let reqs = server.received_requests().await.unwrap();
+            assert_eq!(reqs.len(), 2, "{status}: one redirect hop");
+            for r in &reqs {
+                assert_eq!(r.body, data, "{status}: every hop carries the full body");
+                assert_eq!(
+                    r.headers.get("content-type").unwrap(),
+                    "application/octet-stream"
+                );
+                assert_eq!(
+                    r.headers.get("content-length").unwrap().to_str().unwrap(),
+                    data.len().to_string()
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn put_file_gives_up_on_a_redirect_loop_and_passes_through_an_unusable_redirect() {
+        // A loop: every hop redirects back.
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(307).insert_header("Location", "/again"))
+            .mount(&server)
+            .await;
+        let (_d, p, _) = payload(10);
+        let client = build_client().unwrap();
+        let err = put_file(
+            &client,
+            RetryPolicy::none(),
+            "loop PUT",
+            &format!("{}/x", server.uri()),
+            &p,
+            None,
+        )
+        .await
+        .unwrap_err();
+        assert!(err.to_string().contains("redirects"), "{err}");
+        assert!(server.received_requests().await.unwrap().len() <= MAX_PUT_REDIRECTS + 1);
+
+        // A 307 with no Location is returned for the caller to report, not looped on.
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(307))
+            .mount(&server)
+            .await;
+        let resp = put_file(
+            &client,
+            RetryPolicy::none(),
+            "bare PUT",
+            &format!("{}/x", server.uri()),
+            &p,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status().as_u16(), 307);
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    }
 
     #[test]
     fn backoff_doubles_and_caps() {

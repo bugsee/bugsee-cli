@@ -1954,7 +1954,7 @@ fn stripped_copy_without_sources(
     // Typed, not a bare `?` into anyhow: an I/O failure on the map must classify the way
     // `sourcemap::identify` classifies one on the SAME file moments earlier — exit 10, which
     // integrators are documented not to fall back on — rather than exit 1 ("unexpected").
-    let bytes = std::fs::read(map_path).map_err(crate::error::Error::Io)?;
+    let bytes = crate::symbols::mapped::map_file(map_path).map_err(crate::error::Error::Io)?;
     let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice(&bytes) else {
         return Ok(None);
     };

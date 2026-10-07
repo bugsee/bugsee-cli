@@ -26,6 +26,7 @@
 pub mod dsym;
 pub mod elf;
 pub mod il2cpp_linemap;
+pub mod mapped;
 pub mod pdb;
 pub mod proguard;
 pub mod rust;

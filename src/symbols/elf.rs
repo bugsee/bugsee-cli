@@ -101,23 +101,29 @@ pub fn extract_libs(
             continue;
         }
 
-        let mut bytes = Vec::new();
-        entry.read_to_end(&mut bytes)?;
-        let ElfIdentity {
-            build_id,
-            arch,
-            has_debug_info,
-            has_symbols,
-        } = parse_elf_identity(&bytes);
-        let richness = (has_debug_info, has_symbols, bytes.len() as u64);
-
         let base = Path::new(&name)
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("lib.so");
         // Entries across ABIs can share a basename — prefix with the index.
         let out_path = out_dir.join(format!("{i}_{base}"));
-        std::fs::write(&out_path, &bytes)?;
+        // Stream the entry to disk, then read its identity from the file: an
+        // inflated unstripped library is 100+ MB and was held whole in memory.
+        {
+            let mut out = std::fs::File::create(&out_path)?;
+            std::io::copy(&mut entry, &mut out)?;
+        }
+        let ElfIdentity {
+            build_id,
+            arch,
+            has_debug_info,
+            has_symbols,
+        } = parse_elf_identity(&super::mapped::map_file(&out_path)?);
+        let richness = (
+            has_debug_info,
+            has_symbols,
+            std::fs::metadata(&out_path)?.len(),
+        );
 
         libs.push(ElfLib {
             name,
@@ -173,29 +179,16 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         let with_path = |e: std::io::Error| {
             std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
         };
-        let file = std::fs::File::open(entry.path()).map_err(with_path)?;
-        let len = file.metadata().map_err(with_path)?.len();
-        // Map instead of reading: identity needs only the headers and notes, so
-        // a 100+ MB unstripped library costs a few KB of resident memory, not a
-        // full copy. (An empty file cannot be mapped; it has no build-id anyway.)
-        //
-        // SAFETY: the map is read-only and dropped at the end of this iteration.
-        // The contract (memmap2's): nothing may truncate or rewrite the library while
-        // it is mapped (SIGBUS / undefined behaviour otherwise). It holds for
-        // build-finalized outputs; a directory still being written by a linker is
-        // NOT a supported input (documented on `paths` in `--help`).
-        let map = if len == 0 {
-            None
-        } else {
-            Some(unsafe { memmap2::Mmap::map(&file) }.map_err(with_path)?)
-        };
-        let bytes: &[u8] = map.as_deref().unwrap_or(&[]);
+        // Mapped, not read: identity needs only the headers and notes, so a
+        // 100+ MB unstripped library costs a few KB of resident memory.
+        let bytes = super::mapped::map_file(entry.path()).map_err(with_path)?;
+        let len = bytes.len() as u64;
         let ElfIdentity {
             build_id,
             arch,
             has_debug_info,
             has_symbols,
-        } = parse_elf_identity(bytes);
+        } = parse_elf_identity(&bytes);
         let name = entry
             .path()
             .strip_prefix(dir)

@@ -184,14 +184,18 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         }
         // PUT the artefact ZIP. Idempotent overwrite of the same S3 key, so a
         // retriable 5xx is safe to retry.
-        let body = tokio::fs::read(&zip_path).await?;
-        tracing::debug!(endpoint = %http::redact_url(&reg.artifact_endpoint), body_len = body.len(), "PUT artefact");
-        let put = http::send_with_retry(policy, "artefact PUT", true, || {
-            client
-                .put(&reg.artifact_endpoint)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .body(body.clone())
-        })
+        // Streamed from disk: the artefact is an IPA/APK/AAB (hundreds of MB), and
+        // reading it whole and cloning it per attempt held two copies in memory.
+        let body_len = http::file_len(&zip_path).await?;
+        tracing::debug!(endpoint = %http::redact_url(&reg.artifact_endpoint), body_len, "PUT artefact");
+        let put = http::put_file(
+            &client,
+            policy,
+            "artefact PUT",
+            &reg.artifact_endpoint,
+            &zip_path,
+            Some("application/octet-stream"),
+        )
         .await?;
         if !put.status().is_success() {
             let s = put.status().as_u16();
@@ -470,6 +474,71 @@ mod tests {
         let mut got = Vec::new();
         map.read_to_end(&mut got).unwrap();
         assert_eq!(got, b"x -> y\n".repeat(50));
+    }
+
+    /// The artefact PUT streams the ZIP from disk: a large artefact (bigger than
+    /// the 64 KiB stream chunk) must arrive whole with an exact `Content-Length`
+    /// (no chunked body, which a presigned S3 PUT rejects), and a retried attempt
+    /// must re-send the complete body.
+    #[tokio::test]
+    async fn artefact_put_streams_with_exact_length_and_retries_whole() {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let data: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        let artifact = write(tmp.path(), "app.aab", &data);
+        let payload = write(tmp.path(), "p.json", br#"{"uuid":"abc","version":"1.0"}"#);
+        let put_url = format!("{}/artefact-put", server.uri());
+
+        Mock::given(method("POST"))
+            .and(path("/v2/apps/TKN/builds"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "ok": true, "result": { "build_id": "b1", "endpoint": put_url }
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/artefact-put"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/artefact-put"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        let uri = server.uri();
+        let params = base_params(&uri, &payload, &artifact);
+        run(params, RetryPolicy::fast(3)).await.unwrap();
+
+        let received = server.received_requests().await.unwrap();
+        let puts: Vec<_> = received
+            .iter()
+            .filter(|r| r.url.path() == "/artefact-put")
+            .collect();
+        assert_eq!(puts.len(), 2, "one 503 then one success");
+        for put in &puts {
+            assert_eq!(
+                put.headers
+                    .get("content-length")
+                    .map(|v| v.to_str().unwrap().to_owned()),
+                Some(put.body.len().to_string())
+            );
+            assert!(put.headers.get("transfer-encoding").is_none());
+            assert_eq!(
+                put.headers.get("content-type").unwrap(),
+                "application/octet-stream"
+            );
+            let mut zip = ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
+            let mut got = Vec::new();
+            zip.by_name("app.aab")
+                .unwrap()
+                .read_to_end(&mut got)
+                .unwrap();
+            assert_eq!(got, data, "the artefact survives the stream intact");
+        }
+        assert_eq!(puts[0].body, puts[1].body, "retry re-sends the same bytes");
     }
 
     #[tokio::test]
