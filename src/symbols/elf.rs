@@ -140,13 +140,13 @@ pub fn collect_libs(
 
 /// Walk `dir` recursively for native libraries (same name rules as the zip
 /// entries), reading each one's identity in place. `name` is the path relative
-/// to `dir`. Symlinks are followed (loops are skipped); unreadable entries are
+/// to `dir`. Directory symlinks are not descended, file symlinks are read; unreadable entries are
 /// skipped with a warning rather than failing the whole scan. Sorted by path so
 /// the "first entry wins" tie-break in [`keep_richest_per_build_id`] is stable.
 pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib>> {
     let mut libs = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
-        .follow_links(true)
+        .follow_links(false)
         .sort_by_file_name()
     {
         let entry = match entry {
@@ -159,7 +159,10 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
                 continue;
             }
         };
-        if !entry.file_type().is_file() {
+        // Directory symlinks are never descended (a walk must stay under the
+        // root); a symlink to a FILE is a candidate and `read` follows it.
+        let ft = entry.file_type();
+        if !(ft.is_file() || ft.is_symlink()) {
             continue;
         }
         let file_name = entry.file_name().to_string_lossy();

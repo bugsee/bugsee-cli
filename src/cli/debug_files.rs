@@ -1202,6 +1202,16 @@ async fn run_elf_upload(
                 ))
             }
         })?;
+        if found.is_empty() && input.is_dir() {
+            // A directory is the build's own output: empty usually means a
+            // miswired path or a task that ran before the libraries were merged,
+            // and exit 0 would let the build go green with no native symbols.
+            // (An empty ZIP stays a warning, as it always was.)
+            return Err(input_not_found(format!(
+                "no .so / .so.dbg / .so.sym files (or --extension suffix) under {}",
+                input.display()
+            )));
+        }
         if found.is_empty() {
             // Nothing even matched by name — the one case `--extension` fixes.
             // Ahead of the dry-run exit: a dry run is how a caller checks this.

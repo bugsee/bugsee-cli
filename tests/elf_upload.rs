@@ -505,3 +505,41 @@ fn elf_upload_fails_on_an_unreadable_directory() {
         assert.failure();
     }
 }
+
+/// A directory that exists but holds no libraries is a miswired path / too-early
+/// task, not a finished upload: exit 10, never 0.
+#[test]
+fn elf_upload_empty_directory_is_input_not_found() {
+    let tmp = tempfile::tempdir().unwrap();
+    let inputs = vec![tmp.path().to_string_lossy().into_owned()];
+    common::cli()
+        .args(elf_args("http://127.0.0.1:1", &inputs))
+        .assert()
+        .code(10)
+        .stderr(predicates::str::contains("no .so"));
+}
+
+/// Directory symlinks are not descended; a symlink to a library file is read.
+#[cfg(unix)]
+#[test]
+fn elf_dry_run_does_not_descend_directory_symlinks_but_reads_file_symlinks() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let outside = tmp.path().join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::copy(&fixture, outside.join("libescaped.so")).unwrap();
+    let root = tmp.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();
+    std::os::unix::fs::symlink(&fixture, root.join("liblinked.so")).unwrap();
+    let inputs = vec![root.to_string_lossy().into_owned()];
+    let mut args = elf_args("http://127.0.0.1:1", &inputs);
+    args.push("--dry-run");
+    common::cli()
+        .args(args)
+        .assert()
+        .success()
+        .stderr(predicates::str::contains(
+            "would register + upload 1 libraries",
+        ));
+}
