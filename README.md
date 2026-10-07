@@ -69,7 +69,7 @@ Takes one or more paths: AGP's pre-built `native-debug-symbols.zip`, and/or dire
 
 #### Unity IL2CPP — `--type il2cpp-linemap`
 
-Uploads `LineNumberMappings.json` (+ sibling `MethodMap.tsv` / `il2cppFileRoot.txt`) as format `il2cpp-linemap`, keyed by the IL2CPP module UUID(s) (`libil2cpp` / `UnityFramework`). See [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md).
+Uploads `LineNumberMappings.json` (+ sibling `MethodMap.tsv` / `il2cppFileRoot.txt`) as format `il2cpp-linemap`, keyed by the IL2CPP module UUID(s) (`libil2cpp` / `UnityFramework`). The mappings JSON is validated first (`{cpp_path: {cs_path: {cpp_line: cs_line}}}`, integer line numbers, checked as a stream): a truncated or wrong file exits 11 naming the file and uploads nothing. See [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md).
 
 ```sh
 bugsee-cli debug-files upload path/to/Symbols/LineNumberMappings.json \

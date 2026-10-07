@@ -222,7 +222,9 @@ pub enum DebugFileType {
     /// Unity IL2CPP `LineNumberMappings.json` (+ MethodMap / il2cppFileRoot)
     /// bundle. Keyed by the IL2CPP module UUID(s) (`libil2cpp` / UnityFramework);
     /// pass `--uuid` (comma-separated and/or repeated) and/or `--il2cpp-uuid`
-    /// for multi-ABI.
+    /// for multi-ABI. The mappings JSON is validated before anything is packed
+    /// (`{cpp_path: {cs_path: {cpp_line: cs_line}}}` with integer line numbers);
+    /// a corrupt or wrong file exits 11 and uploads nothing.
     Il2cppLinemap,
 }
 
@@ -1437,6 +1439,14 @@ async fn run_il2cpp_linemap_upload(
     let mut already_existed = 0u32;
     for bundle in &bundles {
         let _ = il2cpp_linemap::read_file_root(bundle, il2cpp_root)?;
+        // Corrupt mappings must fail HERE, before anything is packed or sent.
+        let mappings = il2cpp_linemap::validate_mappings(&bundle.json_path)?;
+        tracing::info!(
+            cpp_files = mappings.cpp_files,
+            cs_files = mappings.cs_files,
+            lines = mappings.lines,
+            "validated the line-number map"
+        );
         tracing::info!(
             path = %bundle.json_path.display(),
             uuids = ?uuids,

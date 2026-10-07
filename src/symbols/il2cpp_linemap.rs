@@ -9,10 +9,11 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ReaderSettings, ValueType};
 use walkdir::WalkDir;
 
 use super::suffix::ExtraSuffixes;
-use crate::error::{config_invalid, input_not_found};
+use crate::error::{config_invalid, input_invalid, input_not_found, Error};
 
 pub const LINE_NUMBER_MAPPINGS: &str = "LineNumberMappings.json";
 pub const METHOD_MAP: &str = "MethodMap.tsv";
@@ -86,6 +87,123 @@ fn bundle_from_json(json_path: &Path) -> Option<LinemapBundle> {
         method_map,
         file_root,
     })
+}
+
+/// What a validated `LineNumberMappings.json` holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MappingsStats {
+    /// Generated C++ files (top-level keys).
+    pub cpp_files: usize,
+    /// (C++ file, C# file) pairs.
+    pub cs_files: usize,
+    /// `cpp_line -> cs_line` entries.
+    pub lines: usize,
+}
+
+/// Check that `path` is the mappings document the symbolicator reads, WITHOUT holding it in
+/// memory (these files run to tens of MB): `{ cpp_path: { cs_path: { cpp_line: cs_line } } }`,
+/// where every line number is a non-negative integer that fits a `u32`.
+///
+/// The CLI packs this file as-is, so without a check a truncated or wrong file (an interrupted
+/// Unity build, the wrong artefact, a merge-conflicted checkout) uploads "successfully" and
+/// every IL2CPP crash then fails to symbolicate with nothing pointing back at the upload.
+/// A document with no entries at all is accepted (a project can have none) but flagged.
+///
+/// Malformed content is `InputInvalid` (exit 11), naming the file and the JSON path of the
+/// problem; an I/O failure reading it stays an I/O error.
+pub fn validate_mappings(path: &Path) -> anyhow::Result<MappingsStats> {
+    let file = fs::File::open(path).map_err(Error::Io)?;
+    let bad = |detail: &str| {
+        input_invalid(format!(
+            "{} is not a valid IL2CPP line-number map ({detail}); expected \
+             {{cpp_path: {{cs_path: {{cpp_line: cs_line}}}}}} with integer line numbers: {}",
+            LINE_NUMBER_MAPPINGS,
+            path.display()
+        ))
+    };
+    let from_reader = |e: ReaderError| match e {
+        // Invalid UTF-8 is damaged content, like any other malformed byte; only a real I/O
+        // failure is an I/O error.
+        ReaderError::IoError { error, .. } if error.kind() != std::io::ErrorKind::InvalidData => {
+            anyhow::Error::from(Error::Io(error))
+        }
+        other => bad(&other.to_string()),
+    };
+    // Numbers are read as text and parsed here, so the reader's big-number guard is moot.
+    let mut r = JsonStreamReader::new_custom(
+        std::io::BufReader::new(file),
+        ReaderSettings {
+            restrict_number_values: false,
+            ..Default::default()
+        },
+    );
+    let mut stats = MappingsStats {
+        cpp_files: 0,
+        cs_files: 0,
+        lines: 0,
+    };
+    let expect = |r: &mut JsonStreamReader<_>, want: ValueType, what: &str| -> anyhow::Result<()> {
+        let got = r.peek().map_err(from_reader)?;
+        if got == want {
+            Ok(())
+        } else {
+            Err(bad(&format!("{what} must be {want}, found {got}")))
+        }
+    };
+
+    expect(&mut r, ValueType::Object, "the top-level value")?;
+    r.begin_object().map_err(from_reader)?;
+    while r.has_next().map_err(from_reader)? {
+        let cpp = r.next_name().map_err(from_reader)?.to_owned();
+        expect(
+            &mut r,
+            ValueType::Object,
+            &format!("the entry for \"{cpp}\""),
+        )?;
+        r.begin_object().map_err(from_reader)?;
+        stats.cpp_files += 1;
+        while r.has_next().map_err(from_reader)? {
+            let cs = r.next_name().map_err(from_reader)?.to_owned();
+            expect(
+                &mut r,
+                ValueType::Object,
+                &format!("the entry for \"{cpp}\" -> \"{cs}\""),
+            )?;
+            r.begin_object().map_err(from_reader)?;
+            stats.cs_files += 1;
+            while r.has_next().map_err(from_reader)? {
+                let line = r.next_name().map_err(from_reader)?.to_owned();
+                if line.is_empty()
+                    || !line.bytes().all(|b| b.is_ascii_digit())
+                    || line.parse::<u32>().is_err()
+                {
+                    return Err(bad(&format!(
+                        "\"{line}\" under \"{cpp}\" is not a C++ line number"
+                    )));
+                }
+                expect(
+                    &mut r,
+                    ValueType::Number,
+                    &format!("the C# line for {cpp}:{line}"),
+                )?;
+                let n = r.next_number_as_string().map_err(from_reader)?;
+                if n.parse::<u32>().is_err() {
+                    return Err(bad(&format!(
+                        "{cpp}:{line} maps to {n}, not a non-negative integer line"
+                    )));
+                }
+                stats.lines += 1;
+            }
+            r.end_object().map_err(from_reader)?;
+        }
+        r.end_object().map_err(from_reader)?;
+    }
+    r.end_object().map_err(from_reader)?;
+    r.consume_trailing_whitespace().map_err(from_reader)?;
+    if stats.lines == 0 {
+        tracing::warn!(path = %path.display(), "the line-number map has no entries");
+    }
+    Ok(stats)
 }
 
 /// Parse `--uuid` values: comma-separated and/or repeated spellings.
@@ -209,6 +327,223 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found[0].json_path.ends_with("Game.linemap.json"));
         assert!(found[0].method_map.is_some(), "siblings resolve next to it");
+    }
+
+    // ── validate_mappings ──────────────────────────────────────────
+
+    fn fixture(platform: &str) -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/il2cpp-linemap")
+            .join(platform)
+            .join(LINE_NUMBER_MAPPINGS)
+    }
+
+    fn write_json(bytes: &[u8]) -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(LINE_NUMBER_MAPPINGS);
+        fs::write(&p, bytes).unwrap();
+        (dir, p)
+    }
+
+    fn invalid(p: &Path) -> String {
+        match validate_mappings(p).unwrap_err().downcast::<Error>() {
+            Ok(Error::InputInvalid(m)) => m,
+            other => panic!("expected InputInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_committed_fixtures_are_valid() {
+        for platform in ["android", "ios"] {
+            let stats = validate_mappings(&fixture(platform)).unwrap();
+            assert!(
+                stats.cpp_files >= 1 && stats.cs_files >= 1 && stats.lines >= 1,
+                "{stats:?}"
+            );
+        }
+        let stats = validate_mappings(&fixture("android")).unwrap();
+        assert_eq!(stats.cpp_files, 2);
+        assert_eq!(stats.cs_files, 3);
+        assert_eq!(stats.lines, 7);
+    }
+
+    #[test]
+    fn an_empty_object_is_accepted_and_counts_nothing() {
+        let (_d, p) = write_json(b"{}");
+        assert_eq!(
+            validate_mappings(&p).unwrap(),
+            MappingsStats {
+                cpp_files: 0,
+                cs_files: 0,
+                lines: 0
+            }
+        );
+        let (_d, p) = write_json(br#"{"a.cpp":{"A.cs":{}}}"#);
+        assert_eq!(validate_mappings(&p).unwrap().cs_files, 1);
+    }
+
+    /// Everything that is not the documented shape is `InputInvalid`, with a message that
+    /// names the file and the problem.
+    #[test]
+    fn malformed_or_misshapen_documents_are_rejected() {
+        let good = br#"{"a.cpp":{"A.cs":{"1":2}}}"#;
+        let cases: Vec<(&str, Vec<u8>, &str)> = vec![
+            ("empty file", Vec::new(), "LineNumberMappings.json"),
+            (
+                "whitespace only",
+                b"  \n".to_vec(),
+                "LineNumberMappings.json",
+            ),
+            (
+                "truncated",
+                good[..good.len() - 3].to_vec(),
+                "LineNumberMappings.json",
+            ),
+            (
+                "trailing junk",
+                [&good[..], b" x"].concat(),
+                "LineNumberMappings.json",
+            ),
+            (
+                "two documents",
+                [&good[..], &good[..]].concat(),
+                "LineNumberMappings.json",
+            ),
+            (
+                "byte-order mark",
+                [&b"\xef\xbb\xbf"[..], &good[..]].concat(),
+                "LineNumberMappings.json",
+            ),
+            (
+                "binary",
+                vec![0xff, 0xfe, 0x00, 0x01],
+                "LineNumberMappings.json",
+            ),
+            ("an array", b"[]".to_vec(), "top-level value must be"),
+            ("a string", br#""x""#.to_vec(), "top-level value must be"),
+            ("cpp entry is a number", br#"{"a.cpp":3}"#.to_vec(), "a.cpp"),
+            (
+                "cs entry is an array",
+                br#"{"a.cpp":{"A.cs":[1]}}"#.to_vec(),
+                "A.cs",
+            ),
+            (
+                "one level short",
+                br#"{"a.cpp":{"1":2}}"#.to_vec(),
+                "must be Object",
+            ),
+            (
+                "string line value",
+                br#"{"a.cpp":{"A.cs":{"1":"2"}}}"#.to_vec(),
+                "C# line",
+            ),
+            (
+                "null line value",
+                br#"{"a.cpp":{"A.cs":{"1":null}}}"#.to_vec(),
+                "C# line",
+            ),
+            (
+                "non-numeric cpp line",
+                br#"{"a.cpp":{"A.cs":{"one":2}}}"#.to_vec(),
+                "not a C++ line",
+            ),
+            (
+                "empty cpp line key",
+                br#"{"a.cpp":{"A.cs":{"":2}}}"#.to_vec(),
+                "not a C++ line",
+            ),
+            (
+                "negative cpp line",
+                br#"{"a.cpp":{"A.cs":{"-1":2}}}"#.to_vec(),
+                "not a C++ line",
+            ),
+            (
+                "cpp line over u32",
+                br#"{"a.cpp":{"A.cs":{"4294967296":2}}}"#.to_vec(),
+                "not a C++ line",
+            ),
+            (
+                "negative cs line",
+                br#"{"a.cpp":{"A.cs":{"1":-2}}}"#.to_vec(),
+                "non-negative integer",
+            ),
+            (
+                "fractional cs line",
+                br#"{"a.cpp":{"A.cs":{"1":2.5}}}"#.to_vec(),
+                "non-negative integer",
+            ),
+            (
+                "exponent cs line",
+                br#"{"a.cpp":{"A.cs":{"1":1e3}}}"#.to_vec(),
+                "non-negative integer",
+            ),
+            (
+                "cs line over u32",
+                br#"{"a.cpp":{"A.cs":{"1":4294967296}}}"#.to_vec(),
+                "non-negative integer",
+            ),
+            (
+                "deeply nested",
+                format!("{}1{}", r#"{"a":"#.repeat(50_000), "}".repeat(50_000)).into_bytes(),
+                "LineNumberMappings.json",
+            ),
+        ];
+        for (label, bytes, needle) in cases {
+            let (_d, p) = write_json(&bytes);
+            let msg = invalid(&p);
+            assert!(msg.contains(needle), "{label}: {msg}");
+            assert!(
+                msg.contains(&p.display().to_string()),
+                "{label}: names the file: {msg}"
+            );
+        }
+    }
+
+    /// No prefix of a real document is itself a valid one, and none crashes the check.
+    #[test]
+    fn every_truncation_of_a_real_map_is_rejected() {
+        let whole = fs::read(fixture("ios")).unwrap();
+        validate_mappings(&fixture("ios")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join(LINE_NUMBER_MAPPINGS);
+        let trimmed = whole.trim_ascii_end();
+        for cut in 0..trimmed.len() {
+            fs::write(&p, &trimmed[..cut]).unwrap();
+            assert!(
+                validate_mappings(&p).is_err(),
+                "a {cut}-byte prefix was accepted"
+            );
+        }
+    }
+
+    /// A map of tens of MB is checked as a stream: this one has 300 000 entries.
+    #[test]
+    fn a_large_map_validates() {
+        let mut doc = String::from("{");
+        for f in 0..30 {
+            if f > 0 {
+                doc.push(',');
+            }
+            doc.push_str(&format!(r#""f{f}.cpp":{{"F{f}.cs":{{"#));
+            for l in 0..10_000 {
+                if l > 0 {
+                    doc.push(',');
+                }
+                doc.push_str(&format!(r#""{l}":{}"#, l / 2));
+            }
+            doc.push_str("}}");
+        }
+        doc.push('}');
+        let (_d, p) = write_json(doc.as_bytes());
+        let stats = validate_mappings(&p).unwrap();
+        assert_eq!((stats.cpp_files, stats.lines), (30, 300_000));
+    }
+
+    #[test]
+    fn a_missing_file_is_an_io_error_not_invalid_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = validate_mappings(&dir.path().join("nope.json")).unwrap_err();
+        assert!(matches!(err.downcast::<Error>(), Ok(Error::Io(_))));
     }
 
     #[test]

@@ -861,41 +861,99 @@ fn unusable_build_artifacts_are_input_not_found() {
 }
 
 // ---------------------------------------------------------------------------
-// IL2CPP line maps: a documented gap (characterisation)
+// IL2CPP line maps
 // ---------------------------------------------------------------------------
 
-/// The IL2CPP mappings JSON is packed as-is and NOT validated: a corrupt file uploads
-/// "successfully". This pins that on purpose — rejecting it would be a behaviour
-/// change integrators must be told about — so a future validation lands deliberately.
-#[test]
-fn il2cpp_linemap_does_not_validate_the_mappings_json_today() {
+fn il2cpp_args(extra: &[&str]) -> Vec<String> {
+    let mut a: Vec<String> = [
+        "debug-files",
+        "upload",
+        "--type",
+        "il2cpp-linemap",
+        "--version",
+        "1",
+        "--build",
+        "1",
+        "--uuid",
+        "11111111-2222-3333-4444-555555555555",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect();
+    a.extend(extra.iter().map(|s| s.to_string()));
+    a
+}
+
+/// The mappings JSON is validated before anything is packed: a corrupt or wrong file is
+/// `InputInvalid` (11) naming the file, in a dry run and for real, and nothing is sent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn il2cpp_linemap_rejects_a_corrupt_mappings_json_and_sends_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
     let tmp = tempfile::tempdir().unwrap();
-    for (label, bytes) in [
-        ("empty", &b""[..]),
-        ("truncated", br#"{"a":"#),
-        ("binary", &[0xff, 0xfe, 0x00]),
-    ] {
-        let dir = tmp.path().join(label);
-        write(&dir, "LineNumberMappings.json", bytes);
+    let endpoint = server.uri();
+    let root = tmp.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        for (label, bytes) in [
+            ("empty", &b""[..]),
+            ("truncated", br#"{"a.cpp":{"A.cs":{"1":"#),
+            ("binary", &[0xff, 0xfe, 0x00]),
+            ("wrong shape", br#"{"a.cpp":{"1":2}}"#),
+            ("string line", br#"{"a.cpp":{"A.cs":{"1":"2"}}}"#),
+            ("an array", b"[]"),
+        ] {
+            let dir = root.join(label.replace(' ', "_"));
+            let p = write(&dir, "LineNumberMappings.json", bytes);
+            for dry in [true, false] {
+                let mut extra = vec![dir.to_str().unwrap()];
+                if dry {
+                    extra.push("--dry-run");
+                }
+                let out = common::cli()
+                    .args(["--endpoint", &endpoint, "--app-token", "TKN"])
+                    .args(il2cpp_args(&extra))
+                    .output()
+                    .unwrap();
+                assert_eq!(code_of(&out), 11, "{label} (dry={dry}): {}", stderr(&out));
+                assert!(
+                    stderr(&out).contains("LineNumberMappings.json")
+                        && stderr(&out).contains(p.to_str().unwrap()),
+                    "{label}: names the file: {}",
+                    stderr(&out)
+                );
+                assert!(out.stdout.is_empty(), "{label}");
+            }
+        }
+    })
+    .await
+    .unwrap();
+}
+
+/// The shipped fixtures are valid and still upload (the check does not get in the way).
+#[test]
+fn il2cpp_linemap_accepts_a_valid_map() {
+    for platform in ["android", "ios"] {
+        let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/il2cpp-linemap")
+            .join(platform);
         let out = common::cli()
-            .args([
-                "debug-files",
-                "upload",
-                "--type",
-                "il2cpp-linemap",
-                "--version",
-                "1",
-                "--build",
-                "1",
-            ])
-            .args([
-                "--uuid",
-                "11111111-2222-3333-4444-555555555555",
-                "--dry-run",
-            ])
-            .arg(&dir)
+            .args(il2cpp_args(&[dir.to_str().unwrap(), "--dry-run"]))
             .output()
             .unwrap();
-        assert_eq!(code_of(&out), 0, "{label}: {}", stderr(&out));
+        assert_eq!(code_of(&out), 0, "{platform}: {}", stderr(&out));
+        assert!(
+            stderr(&out).contains("validated the line-number map"),
+            "{}",
+            stderr(&out)
+        );
     }
 }
