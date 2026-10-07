@@ -1,7 +1,6 @@
 # Build-time upload unification
 
-**Status:** Design — not yet implemented
-**Owner:** Pending
+**Status:** Original design (2026-06), kept in its original tense — "today" and "Future:" below describe the platform *before* this work. Most of it has since shipped in `bugsee-cli` (`upload build`, `upload build-info`, zstd mapping packing); what is live now is in the status note at the top of [`upload-unification-activation.md`](./upload-unification-activation.md). Still open: [Cross-platform readiness](#cross-platform-readiness).
 **Affects:** `bugsee-cli`, `worker`, `appserver`, `android/gradle-plugin`, `ios/fastlane-plugin-bugsee`, `ios/sdk` BugseeAgent
 **Out of scope:** Runtime SDK telemetry uploads (crashes, sessions, attributes — those use a different transport via the SDKs themselves)
 

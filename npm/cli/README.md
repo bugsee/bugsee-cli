@@ -1,14 +1,22 @@
 # @bugsee/cli
 
 The [Bugsee CLI](https://github.com/bugsee/bugsee-cli) — a cross-platform Rust
-binary that collects debug information files (dSYM, ELF, PE/PDB, R8/ProGuard
+binary that collects debug information files (dSYM, ELF, Windows PDB, R8/ProGuard
 mappings, JS source maps), resolves build-environment metadata, and uploads
 symbols to Bugsee.
 
 ```sh
+# Run once, without adding it to a project:
+npx @bugsee/cli --version
+
+# Or add it to a project, then run the `bugsee-cli` binary it provides:
 npm install --save-dev @bugsee/cli
 npx bugsee-cli --version
 ```
+
+`npx bugsee-cli` only works where `@bugsee/cli` is installed. Anywhere else npx
+looks for an unscoped package named `bugsee-cli`, which does not exist, and fails
+with `E404`. Use the scoped `npx @bugsee/cli` there.
 
 ## How the binary gets here
 
@@ -32,10 +40,11 @@ The Linux builds link glibc and are marked `"libc": ["glibc"]`. On musl (Alpine)
 the install still succeeds, and `bugsee-cli` reports that plainly if invoked —
 use a glibc base image, or build from source.
 
-If the platform package is unavailable — `--no-optional`, a registry mirror
-that carries only this package, or an unsupported platform — a `postinstall`
-fallback downloads the release archive for your host and verifies its SHA-256
-before unpacking it into `vendor/`. That fallback **never fails the install**:
+If the platform package is unavailable — `--omit=optional` (or the deprecated
+`--no-optional`), or a registry mirror that carries only this package — a
+`postinstall` fallback downloads the release archive for your host and verifies
+its SHA-256 before unpacking it into `vendor/`. On a platform with no published
+binary there is nothing to download, so it only warns. That fallback **never fails the install**:
 if it cannot fetch the binary it warns and exits 0, and the error surfaces only
 if you actually invoke `bugsee-cli`.
 

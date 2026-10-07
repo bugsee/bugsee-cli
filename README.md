@@ -1,6 +1,6 @@
 # bugsee-cli
 
-Cross-platform Rust binary that collects debug information files (dSYM, ELF, PE/PDB, Portable PDB, Breakpad, R8/ProGuard mappings, JS source maps), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, MSBuild target, Unity post-build hook, Flutter Dart plugin, npm package).
+Cross-platform Rust binary that collects debug information files (dSYM, ELF, Windows PDB, R8/ProGuard mappings, JS source maps, Unity IL2CPP line maps; PE, Portable PDB and Breakpad are planned), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, and the npm package used by the React Native and web tooling); .NET, Unity and Flutter integrations are planned.
 
 ## Installation
 
@@ -22,8 +22,11 @@ The installer auto-detects OS/arch and installs to `/usr/local/bin` (or
 hint if needed. Override via env vars: `BUGSEE_CLI_VERSION` (pin an exact
 `X.Y.Z`), `BUGSEE_CLI_INSTALL_DIR` (install location), `BUGSEE_CLI_BASE_URL`
 (download root, e.g. an internal mirror). Keep it current afterwards with
-`bugsee-cli update` (same-major only). Other channels: npm (`@bugsee/cli` —
-`npm i -D @bugsee/cli && npx bugsee-cli --version`), a Homebrew tap, or the
+`bugsee-cli update` (see [`update`](#update)). Linux builds are glibc-only; the installer
+refuses musl (Alpine). Other channels: npm (`@bugsee/cli` —
+`npx @bugsee/cli --version` to run it once, or `npm i -D @bugsee/cli` and then
+`npx bugsee-cli` inside that project; a bare `npx bugsee-cli` anywhere else asks
+npm for an unscoped `bugsee-cli` package, which does not exist), a Homebrew tap, or the
 per-build-system bundles — see [Distribution](#distribution).
 
 ## Building
@@ -36,7 +39,7 @@ Binary lands at `target/release/bugsee-cli`. Pinned to stable Rust via `rust-too
 
 ## Subcommands
 
-The metadata-resolving subcommands print JSON to stdout and exit 0 on parseable failure (empty list / null / empty object) so Python integrators can shell with `check=False` and rely on the output shape rather than the exit code. (`xcode upload-dsyms` is deliberately not one of these: it prints nothing to stdout and is designed to exit non-zero so a build phase fails — see its section below.) Hard failures (network, auth, malformed argv) follow the [exit-code contract](#exit-code-contract) below.
+The metadata-resolving subcommands print JSON (a bare string for `build-env xcode-version` / `machine-label`) to stdout and exit 0 on parseable failure (empty list / null / empty object) so Python integrators can shell with `check=False` and rely on the output shape rather than the exit code. (`xcode upload-dsyms` is deliberately not one of these: it prints nothing to stdout and is designed to exit non-zero so a build phase fails — see its section below.) Hard failures (network, auth, malformed argv) follow the [exit-code contract](#exit-code-contract) below.
 
 ### `debug-files upload <paths>...`
 
@@ -44,17 +47,25 @@ The metadata-resolving subcommands print JSON to stdout and exit 0 on parseable 
 bugsee-cli debug-files upload <paths>... \
     --version <X> --build <Y> \
     [--type proguard|rust|elf|dsym|pdb|sourcemaps|il2cpp-linemap] \
-    [--uuid <UUID>]   # override / IL2CPP module id(s); comma-separate for multi-ABI \
-    [--icon <PATH>]   # attach launcher icon to the symbol zip \
-    [--zstd-level N]  # 9..=22, default 11; or pass --no-zstd
-    [--force]         # re-upload even if the server already has it (dsym/pdb/rust/il2cpp-linemap/sourcemaps)
+    [--uuid <UUID>]   # required for elf; rejected for dsym/pdb/rust; IL2CPP module id(s), comma-separate for multi-ABI \
+    [--il2cpp-uuid <UUID>] [--il2cpp-root <PATH>]  # il2cpp-linemap only \
+    [--icon <PATH>]   # proguard only: attach launcher icon to the symbol zip \
+    [--zstd-level N | --no-zstd]  # 9..=22, default 11; --no-zstd is diagnostic only
+    [--extension <SUFFIX>]  # also match these file-name suffixes (repeatable / comma-separated), e.g. .so.sym
+    [--force]         # re-upload even if the server already has it (dsym/pdb/elf/rust/il2cpp-linemap/sourcemaps; proguard ignores it)
     [--concurrency N] # sourcemaps only: ceiling on uploads in flight, 1..=32 (default: scaled)
-    [--allow-empty]   # sourcemaps only: "nothing to upload" is success, not exit 10
+    [--allow-empty]   # sourcemaps only: "nothing to upload" is success, not exit 10/11
     [--strip-sources-content]  # sourcemaps only: upload maps without the embedded source
     [--dry-run]
 ```
 
-The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, sourcemap, and Unity IL2CPP line-map types are working; other types are planned via [`debug-files convert`](#debug-files-convert-planned) once their wire format stabilises.
+The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, sourcemap, and Unity IL2CPP line-map types are working; `pe`, `portable-pdb`, `breakpad`, `jvm`, `sourcebundle` and `wasm` are scaffold-only and rejected (exit 20).
+
+`--extension <SUFFIX>` picks up files under a spelling the CLI does not know yet, IN ADDITION to each type's built-in names, so a toolchain change does not need a CLI release first. It matches the end of the whole name (`.so.sym` works), and each type's content check still applies to what it adds (ELF build-id, PDB container, dSYM `Contents/Resources/DWARF`). See `debug-files upload --help` for what it widens per type.
+
+#### Android NDK — `--type elf`
+
+Takes AGP's pre-built `native-debug-symbols.zip` (a directory is rejected; the Gradle plugin zips the intermediates folder first). Every library inside is uploaded as its own symbol, keyed by its GNU build-id — `--uuid` (the SDK's `BUILD_UUID`) is still required but only correlates logs. Built-in entry names are `.so`, `.so.dbg` (`ndk.debugSymbolLevel = 'FULL'`) and `.so.sym` (`'SYMBOL_TABLE'`, function names only — no `file:line`). A library without a build-id is warned about and skipped; two entries with the same build-id upload once, preferring the one with DWARF. The server dedups on the build-id, so switching a library from `SYMBOL_TABLE` to `FULL` needs `--force` to replace the stored symbols.
 
 #### Unity IL2CPP — `--type il2cpp-linemap`
 
@@ -100,8 +111,10 @@ CI recipe (GitHub Actions):
 ```yaml
 - run: cargo build --release
 - run: |
-    curl -fsSL https://download.bugsee.com/cli/install.sh | sh
-    bugsee-cli debug-files upload --type rust target/release \
+    # Pin the install dir and call the binary by path: the installer's default
+    # (/usr/local/bin if writable, else ~/.local/bin) may not be on PATH here.
+    curl -fsSL https://download.bugsee.com/cli/install.sh | BUGSEE_CLI_INSTALL_DIR="$HOME/.local/bin" sh
+    "$HOME/.local/bin/bugsee-cli" debug-files upload --type rust target/release \
       --version "${{ github.ref_name }}" --build "${{ github.run_number }}"
   env:
     BUGSEE_APP_TOKEN: ${{ secrets.BUGSEE_APP_TOKEN }}
@@ -111,7 +124,11 @@ Pass `--dry-run` to verify discovery and see the preflight warnings without uplo
 
 ### `vcs-metadata`
 
-Resolves VCS metadata (provider, commit SHA, branch, base branch, PR number, repo) from CI provider env vars (GitHub Actions, GitLab CI, Bitbucket Pipelines, CircleCI, Bitrise, Jenkins, Xcode Cloud, generic `CI`) or a `git` fallback. Output shape pinned by `tests/cross_language_contract.rs`:
+```
+bugsee-cli vcs-metadata [--working-dir <PATH>]
+```
+
+Resolves VCS metadata (provider, commit SHA, branch, base branch, PR number, repo) from CI provider env vars (GitHub Actions, GitLab CI, Bitbucket Pipelines). On any other CI, or locally, it falls back to `git` in `--working-dir` (default: the current directory), which yields only `commit_sha` and `branch`. Output shape pinned by `tests/cross_language_contract.rs`:
 
 ```json
 {
@@ -130,7 +147,7 @@ Absent fields are omitted, not serialised as `null`. Consumed by the fastlane pl
 bugsee-cli ios-deps collect --project-root <PATH> [--product-binary <PATH>] [--max-entries N]
 ```
 
-Discovers and parses iOS dependency manifests under `<PATH>`: `Podfile.lock` (CocoaPods), `Package.resolved` (SPM — pure-package and Xcode-managed shapes, with sibling `*.xcodeproj` / `*.xcworkspace` probing), `Cartfile.resolved` (Carthage), and vendored frameworks linked into `--product-binary` (via `/usr/bin/otool`). Merges with field-wise url-preference dedup. Output:
+Discovers and parses iOS dependency manifests at `<PATH>` and its ancestors (up to 6 levels): `Podfile.lock` (CocoaPods), `Package.resolved` (SPM — pure-package and Xcode-managed shapes, with sibling `*.xcodeproj` / `*.xcworkspace` probing), `Cartfile.resolved` (Carthage), and vendored frameworks linked into `--product-binary` (via `/usr/bin/otool`). Merges with field-wise url-preference dedup. Output:
 
 ```json
 {
@@ -140,15 +157,15 @@ Discovers and parses iOS dependency manifests under `<PATH>`: `Podfile.lock` (Co
 }
 ```
 
-`version`, `scope`, `url`, and `parents` are emitted only when non-empty (mirrored on the Python side). The `url` field is load-bearing for OSV SwiftURL ecosystem vuln lookups — drift on the optional-field semantics silently degrades vuln-scan coverage.
+`version`, `scope`, and `url` are omitted when absent; `parents` is always present (an empty list when none). Mirrored on the Python side. The `url` field is load-bearing for OSV SwiftURL ecosystem vuln lookups — drift on the optional-field semantics silently degrades vuln-scan coverage.
 
 ### `build-env` helpers
 
 Three sub-subcommands; each prints its result to stdout or empty string on unresolved. Consumed by both Python BugseeAgents to eliminate duplicated in-process helpers.
 
 - `build-env xcode-version` — reads `XCODE_VERSION_ACTUAL` env if set (`"1620"` → `"16.2.0"`), else shells `/usr/bin/xcodebuild -version` and normalises to 3-part dotted form. Empty string on failure.
-- `build-env machine-label` — returns `<provider>[:<detail>]` matching the Android Gradle plugin's `BuildMachineResolver` cascade so the dashboard can group iOS + Android builds from the same CI runner.
-- `build-env read-plist <plist>` — emits a JSON dict of `key → string` for all scalar entries in the plist (string, int, real, bool, uint). Dict / array / Data values are silently dropped (scalars-only contract). Returns `{}` on missing file.
+- `build-env machine-label` — returns `<provider>[:<detail>]`, or the local hostname when no CI provider is detected, matching the Android Gradle plugin's `BuildMachineResolver` cascade so the dashboard can group iOS + Android builds from the same CI runner.
+- `build-env read-plist <plist>` — emits a JSON dict of `key → string` for all scalar entries in the plist (string, int, real, bool, uint). Dict / array / Data / Date values are silently dropped (scalars-only contract). Returns `{}` on missing file.
 
 ### `dsym uuid <path>` / `dsym slices <path>`
 
@@ -230,7 +247,7 @@ only the copy that is uploaded — and the declared `hash` describes the strippe
 carries no `sourcesContent` is uploaded byte-for-byte unchanged.
 
 `--allow-empty` turns "nothing to upload" into success (exit 0) instead of
-exit 10 — a monorepo package built without maps, or a framework whose server
+exit 10 (no maps found) or 11 (only stylesheet / type-declaration maps found) — a monorepo package built without maps, or a framework whose server
 output has none, is a legitimate no-op rather than a reason to fail the build.
 A path that does not exist is an error regardless (`path does not exist: <p>`,
 exit 10) — including when other paths do hold maps — so a typo or a build that
@@ -305,8 +322,11 @@ bugsee-cli upload build --payload-json <path> \
     [--mapping <mapping.txt>]      # needs --artifact (it rides inside the ZIP) \
     [--deps <deps.json>] [--timings <timings.json>] \
     [--chunked]                    # needs --artifact \
+    [--zstd-level N | --no-zstd]   # 9..=22, default 11 \
     [--dry-run [--out <zip>]]      # --out needs --artifact
 ```
+
+On success stdout carries the registered build id, so the producer can correlate.
 
 `--payload-json` is the registration body, written by the producer (the Gradle plugin, the Xcode
 post-action, a bundler plugin) and passed through verbatim apart from two fields the CLI injects:
@@ -320,7 +340,48 @@ separate upload from the artefact. The flags that only describe how artefact byt
 would cost symbolication.
 
 Dedup is server-side on the payload's `uuid` (replace-then-create), which is why the registration POST
-is retried on a transport error but never on a 5xx.
+is retried on a transport error but never on a 5xx (a 429 is still retried: the server rejected the
+request unprocessed).
+
+### `upload build-info`
+
+```
+bugsee-cli upload build-info (--payload-json <path> | --upload-url <url>) \
+    [--deps <dependencies.json>] [--timings <timings.json>] [--sidecar NAME=PATH]... \
+    [--zstd-level N | --no-zstd] [--dry-run [--out <zip>]]
+```
+
+Bundles per-build metadata sidecars into one zstd ZIP and uploads it with a single PUT — on its own,
+for a producer that registers builds elsewhere. With `--payload-json` it registers the build first
+(injecting `request_build_info_upload: true`); with `--upload-url` it skips registration and PUTs to a
+URL the producer already received. The bundle is additive: the worker tolerates unknown entry names.
+
+### `pack`
+
+```
+bugsee-cli pack --artifact <.aab|.apk|.ipa> [--mapping <mapping.txt>] --out <zip> [--zstd-level N | --no-zstd]
+```
+
+Local only: writes the normalized upload ZIP the worker's size-analysis job consumes, and uploads
+nothing. The artefact is STORED verbatim (it is already compressed); the mapping is zstd-compressed
+(method 93). Lets the Gradle plugin delegate compression instead of bundling zstd-jni.
+
+### `xcode post-action`
+
+```
+bugsee-cli xcode post-action [--force-foreground] [--enable-<x> | --disable-<x>]... [--size-check-* <value>]...
+```
+
+The whole iOS build-publish flow from an Xcode scheme **post-action**: build timings, `.app` → `.ipa`
+packaging, build registration, artefact + build-info upload, dSYM upload and the in-build size check.
+It is configured through `BUGSEE_*` environment variables and/or the equivalent `--enable-*` /
+`--disable-*` toggle pairs and `--size-check-*` thresholds (a flag overrides its env var). It gates on
+`BUGSEE_BUILD_INFO_*` (Release-only by default) and is a no-op, exit 0, when gated out.
+
+It runs in the **background** by default — it detaches so the archive returns immediately, logging to
+`$PROJECT_TEMP_DIR/bugsee-cli.log`. `--force-foreground` runs it synchronously, and is the only mode in
+which a size-check FAIL can fail the build (exit 40). Every toggle and variable is listed in
+`bugsee-cli xcode post-action --help`.
 
 ### `xcode upload-dsyms`
 
@@ -386,27 +447,43 @@ Windows there is no fork and every run is synchronous.
 For the full build-publish flow — build registration, build-info, size checks —
 use `xcode post-action` instead; see `bugsee-cli xcode post-action --help`.
 
-### `debug-files convert` (planned)
+### `update`
+
+```
+bugsee-cli update [--check] [--version X.Y.Z] [--force] [--max-age <duration>]
+```
+
+Self-updates the binary in place: downloads the release for the host, verifies its SHA-256 and
+atomically replaces the running executable. By default it takes the newest version **within the same
+major**; `--version X.Y.Z` installs an exact version (a different major is allowed, with a warning).
+`--check` only reports. `--max-age 12h` checks at most once per interval and makes every failure
+best-effort (exit 0), so an integrator can run it on every build. Downloads come from
+`download.bugsee.com/cli`; override with `BUGSEE_CLI_UPDATE_BASE_URL` for an internal mirror.
+
+### `debug-files convert` (not yet implemented)
 
 ```
 bugsee-cli debug-files convert <input> --to bmf|bsf --output <path>
 ```
 
+Converts to Bugsee's legacy BMF/BSF formats, for existing deployments only. The arguments are fixed,
+but the command currently always fails with exit 1.
+
 ### Global flags
 
-`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `upload build`, `upload build-info`, `xcode post-action`, `xcode upload-dsyms`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`, `sourcemaps inject`) do no network I/O and ignore them.
+`--endpoint` (env `BUGSEE_ENDPOINT`), `--app-token` (env `BUGSEE_APP_TOKEN`). Both global so every subcommand inherits the same `BUGSEE_ENDPOINT` override path the per-build-system integrators already standardise on. Only the upload-flavoured subcommands (`debug-files upload`, `upload build`, `upload build-info`, `xcode post-action`, `xcode upload-dsyms`) actually consume these values; metadata-resolving subcommands (`vcs-metadata`, `ios-deps`, `build-env`, `dsym`, `sourcemaps inject`) do no network I/O and ignore them, as do `pack` and `debug-files convert`. `update` does download, but from `download.bugsee.com/cli` (`BUGSEE_CLI_UPDATE_BASE_URL`), not `--endpoint`.
 
 ### Subcommand vocabulary
 
 Multi-word subcommand names are hyphenated (`vcs-metadata`, `ios-deps`, `build-env`, `debug-files`). Single-word names are bare (`dsym`, `sourcemaps`). Sub-subcommands keep the hyphenation pattern (`debug-files upload`, `ios-deps collect`, `build-env xcode-version`). This is the same scheme `cargo`, `kubectl`, and `gh` follow, and the Python integrators consume the names verbatim — renaming any subcommand is a wire-shape break under the [compatibility policy](#wire-shape-compatibility-policy) below.
 
-### Built-in help and machine-readable schemas
+### Built-in help
 
 - `bugsee-cli --help` and `bugsee-cli <subcommand> --help` print the full surface (clap-derived; covers every flag, env-var alias, and subcommand).
 - `bugsee-cli --version` prints the SemVer. Integrators that bind to a specific output shape should pin against this — see the wire-shape compatibility policy.
-- Sample output for every subcommand lives in this README's [Subcommands](#subcommands) section. The pinned reference vectors used by the cross-language integration tests live under `tests/fixtures/`.
+- Sample output for the JSON-emitting metadata subcommands lives in [Subcommands](#subcommands). The pinned reference vectors used by the cross-language integration tests live under `tests/fixtures/`.
 
-There is no `man bugsee-cli` page today; the README and built-in `--help` cover the same ground. A future docs site at `docs.bugsee.com/cli/` is planned but not shipped.
+Full documentation: <https://docs.bugsee.com/cli/>. There is no `man bugsee-cli` page.
 
 ## Wire-shape compatibility policy
 
@@ -422,7 +499,7 @@ Cross-language reference vectors live in `tests/cross_language_contract.rs` + `t
 
 ## Exit-code contract
 
-Stable. Integrators (Gradle plugin, MSBuild target, fastlane plugin, npm wrapper) use these codes to decide whether to fall back to their in-language uploader during the dual-path rollout phase.
+Stable. Integrators (Gradle plugin, fastlane plugin, iOS SDK BugseeAgent) use these codes to decide whether to fall back to their in-language uploader during the dual-path rollout phase. The npm launcher passes them through unchanged.
 
 | Code  | Meaning                                                              | Caller should fall back? |
 |-------|----------------------------------------------------------------------|--------------------------|
@@ -430,32 +507,34 @@ Stable. Integrators (Gradle plugin, MSBuild target, fastlane plugin, npm wrapper
 | 1     | Unexpected / unhandled error.                                        | **yes**                  |
 | 2     | Usage / argv error (likely a plugin↔CLI version mismatch).           | **yes**                  |
 | 10–19 | Input / discovery problems (file not found, unparseable format).      | no                       |
-| 20–29 | Configuration problems (bad token, invalid flags).                   | no                       |
+| 20–29 | Configuration problems (missing/rejected token, incompatible flag combination). | no            |
 | 30–39 | Upload problems (network, server 4xx/5xx).                            | no                       |
 | 40    | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
 | 41+   | Reserved.                                                            | no                       |
 
+An unknown or malformed flag is clap's usage error, exit 2; exit 20 is a valid flag the CLI rejects in combination. If the binary is killed by a signal, the npm launcher reports `128 + signum`, which falls in the reserved range.
+
 The fallback rule: codes ≤ 2 mean the CLI never got a fair chance to run; codes ≥ 10 are substantive failures the in-language uploader would hit the same way. See `src/exit_code.rs` for the source-of-truth enum.
 
-Note: subcommands that emit JSON (vcs-metadata, ios-deps collect, build-env *, dsym *) return exit **0** even when no useful result is found — callers distinguish "no result" from "tool error" by checking the JSON shape (empty list / empty object / specific field absence), not the exit code. This lets Python integrators use `check=False` + `json.loads(stdout)` without branching on returncode.
+Note: the metadata subcommands return exit **0** even when no useful result is found. The JSON emitters (`vcs-metadata`, `ios-deps collect`, `build-env read-plist`, `dsym *`) signal "no result" through the JSON shape (empty list / empty object / specific field absence), so Python integrators can use `check=False` + `json.loads(stdout)` without branching on returncode. `build-env xcode-version` and `build-env machine-label` print **plain text**, not JSON — an empty line when unresolved — so read their stdout as a string; `json.loads` fails on a successful `16.2.0`.
 
 ## Telemetry header
 
-Every metadata `POST` sets `X-Bugsee-Uploader: cli`. The in-language fallback uploaders send a different value of the same header (e.g. `kotlin-fallback-cli-exec-failed`) so the backend can count CLI-vs-fallback usage without touching customer code. The header is **not** added to the presigned S3 `PUT` — that signature is bound to a specific header set, and S3 would reject extras with `SignatureDoesNotMatch`.
+Every metadata `POST` sets `X-Bugsee-Uploader: cli`. The in-language fallback uploaders are meant to send a different value of the same header so the backend can count CLI-vs-fallback usage without touching customer code. The header is **not** added to the presigned S3 `PUT` — that signature is bound to a specific header set, and S3 would reject extras with `SignatureDoesNotMatch`.
 
 ## Distribution
 
 | Channel | Used by |
 |---|---|
-| npm `@bugsee/cli` — per-platform `optionalDependencies` | RN, Cordova, Capacitor, web |
+| GitHub Releases + `download.bugsee.com/cli` (archives, `.sha256`, `latest/` and `v<major>.x/version.txt`), with the shell / PowerShell installers and `bugsee-cli update` | everyone; generic CI |
+| npm `@bugsee/cli` — per-platform `optionalDependencies` | JS toolchains (React Native, web bundler plugins) |
 | npm `@bugsee/bugsee-cli` — single package, `postinstall` downloader | legacy alias for the above |
-| Maven Central `com.bugsee:bugsee-cli` jar bundling binaries | Android Gradle plugin |
-| NuGet `Bugsee.CLI` bundle | .NET MAUI MSBuild target |
-| UPM `com.bugsee.cli` package | Unity Editor post-build |
-| CDN download + SHA-256 checksum on first use | Flutter (Dart plugin), fastlane plugin (`resolveCli`) |
-| Homebrew tap + curl installer | iOS / generic CI |
+| CDN download + SHA-256 checksum on first use | fastlane plugin (`resolveCli`), iOS SDK BugseeAgent |
+| Homebrew tap `bugsee/tap` | macOS / Linux developers |
 
-Target platforms: macOS arm64 + x86_64, Linux x86_64 + aarch64 (glibc; musl if Alpine CI demand exists), Windows x86_64 + arm64. (Windows arm64 builds natively on a `windows-11-arm` runner — see [#20](https://github.com/bugsee/bugsee-cli/issues/20).)
+Planned, not published yet: Maven Central `com.bugsee:bugsee-cli`, NuGet `Bugsee.CLI` and UPM `com.bugsee.cli`.
+
+Target platforms: macOS arm64 + x86_64, Linux x86_64 + aarch64 (glibc only; no musl build), Windows x86_64 + arm64. (Windows arm64 builds natively on a `windows-11-arm` runner — see [#20](https://github.com/bugsee/bugsee-cli/issues/20).)
 
 ### The two npm packages
 
@@ -471,7 +550,7 @@ resolves exactly one. Nothing is downloaded at install time, so it works under
 `--ignore-scripts`, under a lockfile-pinned CI install, and offline from a warm
 cache — which is why it is the right default for a JS toolchain. A
 `postinstall` fallback covers the cases optional dependencies cannot
-(`--no-optional`, a mirror carrying only the front package): it fetches the
+(`--omit=optional`, a mirror carrying only the front package): it fetches the
 same release archive and SHA-256-verifies it, and never fails the install —
 it warns and exits 0, leaving the error to surface only if `bugsee-cli` is
 actually invoked. It also exports `binaryPath()` for spawning the binary
@@ -496,24 +575,39 @@ published, still supported. New integrations should use `@bugsee/cli`.
 
 ```
 src/
-  main.rs              entry point
-  cli/                 clap command tree
+  main.rs              arg parsing, optional daemonize (before the runtime), dispatch
+  daemon.rs            Unix double-fork for background `xcode post-action` / `upload-dsyms`
+  cli/                 clap command tree — one module per command
+    mod.rs               top-level Cli / Command + dispatch
     debug_files.rs       debug-files upload / convert
     sourcemaps.rs        sourcemaps inject
+    upload.rs            upload build / build-info
+    pack.rs              pack
     vcs_metadata.rs      vcs-metadata
     ios_deps.rs          ios-deps collect
     build_env.rs         build-env xcode-version / machine-label / read-plist
     dsym.rs              dsym uuid / dsym slices
-  symbols/             format-specific discovery + identification (dsym, elf, pdb, portable_pdb, breakpad, proguard, jvm)
-  compress/            Zstd-in-ZIP packaging
+    xcode.rs             xcode post-action / upload-dsyms
+    xcactivitylog.rs     build-timings decode (post-action)
+    xcode_ipa.rs         .app → .ipa packaging + Mach-O UUID (post-action)
+    size_check.rs        in-build size gate (post-action)
+    update.rs            update
+  symbols/             per-format discovery + identification (dsym, elf, pdb, proguard, sourcemap,
+                       il2cpp_linemap; rust classifies across them by container magic; suffix = --extension)
+  compress/            Zstd-in-ZIP packaging (the wire format)
   upload/
-    chunked.rs           modern chunked protocol (default)
-    presigned.rs         legacy two-stage POST → PUT
-  inject/              JS source-map debug-ID injection
-  error.rs
+    http.rs              the one HTTP client: retry/backoff, telemetry header, log truncation
+    build.rs             build registration + single-PUT artefact upload
+    chunked.rs           chunked artefact protocol (`upload build --chunked`)
+    build_info.rs        build-info metadata bundle
+    presigned.rs         two-stage POST-metadata → PUT symbol upload (debug-files upload)
+  inject/              JS source-map debug-ID injection (+ sri.rs: Subresource Integrity guard)
+  error.rs             typed errors → exit codes
   exit_code.rs         source-of-truth enum for the exit-code contract above
 
-tests/
-  cross_language_contract.rs   integration tests against the compiled binary
-  fixtures/                    checked-in JSON / lockfile / plist fixtures
+tests/                 integration tests against the compiled binary (cross_language_contract.rs,
+                       debug_files_flags.rs, elf_upload.rs, xcode_*.rs, …) + fixtures/
+scripts/e2e_flows.py   end-to-end harness: every upload flow against a protocol-accurate mock server
+npm/                   the @bugsee/cli package family (see npm/README.md)
+installer/             install.sh / install.ps1 served from download.bugsee.com/cli
 ```
