@@ -1953,8 +1953,19 @@ fn stripped_copy_without_sources(
         std::io::BufWriter::new(std::fs::File::create(&out).map_err(crate::error::Error::Io)?);
     match crate::inject::mapjson::strip_sources_content(input, output) {
         Ok(true) => {}
-        // Nothing to strip, or not the JSON object we expect: the copy is moot.
-        Ok(false) | Err(crate::inject::mapjson::MapJsonError::Json(_)) => {
+        // Nothing to strip: the copy is moot.
+        Ok(false) => {
+            let _ = std::fs::remove_file(&out);
+            return Ok(None);
+        }
+        // Not the JSON object we expect. A privacy preference is not a reason to fail the
+        // upload, but it must not fail SILENTLY either: say that the sources are NOT stripped.
+        Err(crate::inject::mapjson::MapJsonError::Json(why)) => {
+            tracing::warn!(
+                path = %map_path.display(),
+                reason = %why,
+                "--strip-sources-content could not process this map; uploading it UNSTRIPPED"
+            );
             let _ = std::fs::remove_file(&out);
             return Ok(None);
         }

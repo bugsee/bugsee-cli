@@ -12,7 +12,7 @@
 
 use std::io::{Read, Write};
 
-use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ValueType};
+use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ReaderSettings, ValueType};
 use struson::writer::{JsonStreamWriter, JsonWriter};
 
 /// Why a streaming pass over a map failed.
@@ -61,6 +61,22 @@ impl From<std::io::Error> for MapJsonError {
 
 type Res<T> = std::result::Result<T, MapJsonError>;
 
+/// A reader that does NOT apply struson's default "restrict number values" (it rejects
+/// an exponent beyond ±99 and any number over 100 characters). That guard protects code
+/// that PARSES numbers into big integers; this module never parses one, it only skips or
+/// copies the number's text. Left on, valid JSON such as `1e100` made a copy fail, and
+/// `--strip-sources-content` then fell back to uploading the unstripped map: the very
+/// source the flag exists to keep off the wire.
+fn reader<R: Read>(input: R) -> JsonStreamReader<R> {
+    JsonStreamReader::new_custom(
+        input,
+        ReaderSettings {
+            restrict_number_values: false,
+            ..Default::default()
+        },
+    )
+}
+
 /// What [`top_level_strings`] found.
 pub struct TopLevel {
     /// Whether the document's top-level value is an object.
@@ -75,7 +91,7 @@ pub struct TopLevel {
 /// document. A top-level value that is not an object yields `is_object: false`
 /// and no values (it is still syntax-checked).
 pub fn top_level_strings<R: Read>(input: R, keys: &[&str]) -> Res<TopLevel> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut values: Vec<Option<String>> = vec![None; keys.len()];
     let is_object = r.peek()? == ValueType::Object;
     if is_object {
@@ -109,7 +125,7 @@ pub fn top_level_strings<R: Read>(input: R, keys: &[&str]) -> Res<TopLevel> {
 ///
 /// Errors with [`MapJsonError::Json`] when the input is not a JSON object.
 pub fn strip_sources_content<R: Read, W: Write>(input: R, output: W) -> Res<bool> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut w = JsonStreamWriter::new(output);
     if r.peek()? != ValueType::Object {
         return Err(MapJsonError::Json("not a JSON object".into()));
@@ -178,7 +194,7 @@ fn strip_section<R: JsonReader, W: JsonWriter>(r: &mut R, w: &mut W) -> Res<bool
 ///
 /// Errors with [`MapJsonError::Json`] when the input is not a JSON object.
 pub fn set_debug_ids<R: Read, W: Write>(input: R, output: W, debug_id: &str) -> Res<()> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut w = JsonStreamWriter::new(output);
     if r.peek()? != ValueType::Object {
         return Err(MapJsonError::Json("not a JSON object".into()));
@@ -280,6 +296,27 @@ mod tests {
             out.contains(r#""a":1.50"#),
             "numbers keep their text: {out}"
         );
+    }
+
+    /// Numbers are copied as TEXT, however unusual: a large exponent or a very long integer
+    /// is valid JSON, and refusing to copy it must never make a strip give up (which would
+    /// upload the sources it was asked to drop).
+    #[test]
+    fn unusual_numbers_are_copied_verbatim_and_sources_are_still_stripped() {
+        let long_int = "9".repeat(101);
+        for n in ["1e100", "1e-100", "-2.5E+150", "1e999999", long_int.as_str(), "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"] {
+            let doc = format!(r#"{{"n":{n},"sourcesContent":["secret"],"mappings":"AA"}}"#);
+            let (removed, out) = strip(&doc).unwrap_or_else(|e| panic!("{n}: {e}"));
+            assert!(removed, "{n}: the sources must still be stripped");
+            assert_eq!(out, format!(r#"{{"n":{n},"mappings":"AA"}}"#), "{n}");
+            let mut ids = Vec::new();
+            set_debug_ids(doc.as_bytes(), &mut ids, "id").unwrap_or_else(|e| panic!("{n}: {e}"));
+            assert!(String::from_utf8(ids).unwrap().contains(&format!(r#""n":{n}"#)), "{n}");
+            assert_eq!(
+                top_level_strings(doc.as_bytes(), &["mappings"]).unwrap().values,
+                [Some("AA".to_string())]
+            );
+        }
     }
 
     #[test]

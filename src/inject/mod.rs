@@ -570,18 +570,17 @@ fn write_map_debug_id(
         }
     }
     if !dry_run {
-        // Pass 2: stream the map into a sibling temp file with the ids set, then write
-        // its CONTENT into the original (not rename: that would swap the inode and
-        // drop the symlink / hard link the build gave the map; and not `fs::copy`:
-        // it also copies the temp file's metadata, i.e. its 0o600 mode, onto the map).
-        let dir = map_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let tmp = match dir {
-            Some(d) => tempfile::NamedTempFile::new_in(d)?,
-            None => tempfile::NamedTempFile::new_in(".")?,
-        };
+        // Pass 2: stream the map into a scratch file with the ids set, then write its
+        // CONTENT into the original (not rename: that would swap the inode and drop the
+        // symlink / hard link the build gave the map; and not `fs::copy`: it also copies
+        // the scratch file's metadata, i.e. its 0o600 mode, onto the map).
+        // The scratch file is anonymous and lives in the OS temp dir, so rewriting a map
+        // needs no write access to the map's directory and a killed run leaves no stray
+        // `.tmpXXXX` beside it.
+        let mut scratch = tempfile::tempfile()?;
         {
             let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
-            let mut out = std::io::BufWriter::new(tmp.as_file());
+            let mut out = std::io::BufWriter::new(&scratch);
             mapjson::set_debug_ids(input, &mut out, debug_id).map_err(|e| match e {
                 mapjson::MapJsonError::Io(e) => Error::Io(e),
                 mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
@@ -595,7 +594,8 @@ fn write_map_debug_id(
             .write(true)
             .truncate(true)
             .open(map_path)?;
-        std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut dest)?;
+        std::io::Seek::seek(&mut scratch, std::io::SeekFrom::Start(0))?;
+        std::io::copy(&mut scratch, &mut dest)?;
     }
     Ok(true)
 }
