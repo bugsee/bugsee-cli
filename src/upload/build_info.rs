@@ -136,10 +136,9 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         }
     };
 
-    // Read the bundle into memory so retries can re-issue the body. The
-    // build-info bundle is small (typically < 5 MB compressed).
-    let body = tokio::fs::read(&zip_path).await?;
-    tracing::debug!(url = %http::redact_url(&presigned), body_len = body.len(), "PUT build-info bundle");
+    // Streamed from disk like the other presigned PUTs (each retry re-opens it).
+    let body_len = http::file_len(&zip_path).await?;
+    tracing::debug!(url = %http::redact_url(&presigned), body_len, "PUT build-info bundle");
     // The PUT to the presigned S3 URL is idempotent (an overwrite of the same
     // key), so retrying on a retriable 5xx is safe.
     //
@@ -153,7 +152,8 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         client
             .put(&presigned)
             .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .body(body.clone())
+            .header(reqwest::header::CONTENT_LENGTH, body_len)
+            .body(http::file_body(&zip_path))
     })
     .await?;
 

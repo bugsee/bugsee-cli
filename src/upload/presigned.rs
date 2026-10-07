@@ -232,16 +232,14 @@ pub async fn put_payload(
     // attempt) held two-plus copies of the archive in memory per upload. The
     // length is sent explicitly because a streamed body would otherwise go out
     // chunked, which a presigned S3 PUT rejects.
-    let len = tokio::fs::metadata(payload).await?.len();
+    let len = http::file_len(payload).await?;
     // The PUT is idempotent (overwrite of the same key) — retry on transport
     // AND retriable status. Each attempt re-opens the file from the start.
     let put_resp = http::send_with_retry(policy, "symbol PUT", true, || {
         client
             .put(presigned_url)
             .header(reqwest::header::CONTENT_LENGTH, len)
-            .body(reqwest::Body::wrap_stream(file_chunks(
-                payload.to_path_buf(),
-            )))
+            .body(http::file_body(payload))
     })
     .await?;
 
@@ -255,38 +253,6 @@ pub async fn put_payload(
     }
 
     Ok(())
-}
-
-/// The file's bytes in 64 KiB chunks. The file is opened lazily on first poll so
-/// an open error surfaces as a failed (retriable) request, not a panic.
-fn file_chunks(
-    path: std::path::PathBuf,
-) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
-    use tokio::io::AsyncReadExt;
-    enum St {
-        Unopened(std::path::PathBuf),
-        Open(tokio::fs::File),
-        Done,
-    }
-    futures_util::stream::unfold(St::Unopened(path), |st| async move {
-        let mut file = match st {
-            St::Unopened(p) => match tokio::fs::File::open(p).await {
-                Ok(f) => f,
-                Err(e) => return Some((Err(e), St::Done)),
-            },
-            St::Open(f) => f,
-            St::Done => return None,
-        };
-        let mut buf = vec![0u8; 64 * 1024];
-        match file.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok(buf), St::Open(file)))
-            }
-            Err(e) => Some((Err(e), St::Done)),
-        }
-    })
 }
 
 /// Run the two-stage presigned upload for a single symbol artifact

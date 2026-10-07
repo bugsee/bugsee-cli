@@ -155,7 +155,7 @@ fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
             return;
         }
     }
-    let data = match std::fs::read(path) {
+    let data = match crate::symbols::mapped::map_file(path) {
         Ok(d) => d,
         Err(_) => return,
     };

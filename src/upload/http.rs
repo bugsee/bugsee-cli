@@ -215,6 +215,52 @@ pub fn truncate_for_log(s: &str, max: usize) -> String {
     format!("{}…", &s[..end])
 }
 
+/// A request body that streams `path` from disk in 64 KiB chunks.
+///
+/// Reading the file whole (and cloning it for each retry attempt) holds one or
+/// two full copies of an artefact in memory per upload. The file is opened
+/// lazily on first poll so an open error surfaces as a failed (retriable)
+/// request rather than a panic, and every attempt re-opens it from the start.
+///
+/// A streamed body has no known length and would go out chunked, which a
+/// presigned S3 PUT rejects: the caller MUST also set `Content-Length`
+/// (see [`file_len`]).
+pub fn file_body(path: &std::path::Path) -> reqwest::Body {
+    use tokio::io::AsyncReadExt;
+    enum St {
+        Unopened(std::path::PathBuf),
+        Open(tokio::fs::File),
+        Done,
+    }
+    reqwest::Body::wrap_stream(futures_util::stream::unfold(
+        St::Unopened(path.to_path_buf()),
+        |st| async move {
+            let mut file = match st {
+                St::Unopened(p) => match tokio::fs::File::open(p).await {
+                    Ok(f) => f,
+                    Err(e) => return Some((Err(e), St::Done)),
+                },
+                St::Open(f) => f,
+                St::Done => return None,
+            };
+            let mut buf = vec![0u8; 64 * 1024];
+            match file.read(&mut buf).await {
+                Ok(0) => None,
+                Ok(n) => {
+                    buf.truncate(n);
+                    Some((Ok::<_, std::io::Error>(buf), St::Open(file)))
+                }
+                Err(e) => Some((Err(e), St::Done)),
+            }
+        },
+    ))
+}
+
+/// The byte length to send as `Content-Length` alongside [`file_body`].
+pub async fn file_len(path: &std::path::Path) -> std::io::Result<u64> {
+    Ok(tokio::fs::metadata(path).await?.len())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

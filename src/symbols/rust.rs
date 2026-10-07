@@ -153,7 +153,7 @@ fn is_bundle_like(p: &Path, extra: &ExtraSuffixes) -> bool {
 /// on — and to the `code_id` the Rust SDK reports for that module at crash
 /// time. All three agreeing is what makes symbolication resolve.
 fn parse_elf(path: &Path) -> Option<(Option<String>, String, bool)> {
-    let bytes = std::fs::read(path).ok()?;
+    let bytes = super::mapped::map_file(path).ok()?;
     let archive = Archive::parse(&bytes).ok()?;
     let obj = archive.objects().next()?.ok()?;
     Some((

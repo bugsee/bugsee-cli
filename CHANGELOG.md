@@ -24,6 +24,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   SHA-1 are streamed from disk in 64 KiB chunks (the PUT keeps an exact `Content-Length` and
   re-opens the file per retry), and the ELF identity scan memory-maps libraries instead of reading
   them. Peak RSS for four 100 MB libraries dropped from 564 MB to 36 MB. Wire format unchanged.
+- **The rest of the whole-file reads are gone too.** The build artefact PUT (`upload build`, an
+  IPA/APK/AAB) and the build-info PUT stream from disk; ProGuard identification hashes in one
+  streamed pass; dSYM, PDB, Rust and `xcode` identity reads memory-map the file instead of copying
+  it; zip-input extraction streams entries to disk; source-map identification streams its hash.
+  Peak RSS: `upload build` with a 300 MB artefact + 200 MB mapping 661 MB -> 32 MB, a 200 MB
+  ProGuard mapping 241 MB -> 32 MB, an ELF zip of four 100 MB libraries 463 MB -> 36 MB. Wire
+  format and exit codes unchanged.
+
 
 ## [0.7.13] - 2026-10-07
 

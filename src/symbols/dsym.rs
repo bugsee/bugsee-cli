@@ -79,7 +79,7 @@ pub fn identify(dsym_path: &Path) -> Result<DsymIdentity> {
             continue;
         }
         let bin_path = entry.path();
-        let data = std::fs::read(&bin_path)?;
+        let data = super::mapped::map_file(&bin_path)?;
         let archive = Archive::parse(&data).map_err(|e| {
             Error::InputInvalid(format!(
                 "failed to parse Mach-O at {}: {}",
