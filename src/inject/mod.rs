@@ -647,10 +647,16 @@ fn write_map_debug_id(
         // CONTENT into the original (not rename: that would swap the inode and drop the
         // symlink / hard link the build gave the map; and not `fs::copy`: it also copies
         // the scratch file's metadata, i.e. its 0o600 mode, onto the map).
-        // The scratch file is anonymous and lives in the OS temp dir, so rewriting a map
-        // needs no write access to the map's directory and a killed run leaves no stray
-        // `.tmpXXXX` beside it.
-        let mut scratch = tempfile::tempfile()?;
+        // The scratch file is anonymous (a killed run leaves no stray `.tmpXXXX`). It lives
+        // beside the map, on the volume that already holds one copy of it: a tens-of-MB map
+        // must not need that much free space in `$TMPDIR`, which in CI containers is often a
+        // small tmpfs. Only when the directory refuses a file (it is read-only: editing the
+        // map in place never needed it writable) does it fall back to the OS temp dir.
+        let dir = map_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut scratch = tempfile::tempfile_in(dir).or_else(|_| tempfile::tempfile())?;
         {
             let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
             let mut out = std::io::BufWriter::new(&scratch);
