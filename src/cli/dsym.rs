@@ -164,6 +164,10 @@ fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
         Err(_) => return,
     };
     for obj in archive.objects().flatten() {
+        // No LC_UUID reads as the nil UUID: not an identity, so not reported.
+        if obj.debug_id().is_nil() {
+            continue;
+        }
         out.push(DsymSliceView {
             uuid: format_uuid(obj.debug_id()),
             arch: obj.arch().name().to_string(),
@@ -192,6 +196,52 @@ pub fn format_uuid(id: DebugId) -> String {
 mod tests {
     use super::*;
     use tempfile::TempDir;
+
+    /// A Mach-O without an `LC_UUID` reads as the nil UUID: not an identity, so it
+    /// is not reported (an integrator would otherwise key a build on all zeros).
+    #[test]
+    fn extract_uuids_omits_nil_uuid_slices() {
+        let tmp = TempDir::new().unwrap();
+        let good: [u8; 16] = [7; 16];
+        let fat = crate::symbols::test_macho::fat_macho(&[
+            (0x0100_000c, 0, good),
+            (0x0100_0007, 3, [0; 16]),
+        ]);
+        let p = tmp.path().join("fat");
+        std::fs::write(&p, &fat).unwrap();
+        let out = extract_uuids(&p);
+        assert_eq!(
+            out,
+            [format_uuid(DebugId::from_uuid(uuid::Uuid::from_bytes(
+                good
+            )))]
+        );
+
+        let only_nil = tmp.path().join("nil");
+        std::fs::write(
+            &only_nil,
+            crate::symbols::test_macho::thin_macho(0x0100_000c, 0, [0; 16]),
+        )
+        .unwrap();
+        assert!(extract_uuids(&only_nil).is_empty());
+    }
+
+    /// Truncated Mach-O files never crash the extractor and never report a made-up UUID.
+    #[test]
+    fn extract_uuids_on_truncated_machos_is_empty_or_the_true_uuid() {
+        let tmp = TempDir::new().unwrap();
+        let valid = crate::symbols::test_macho::thin_macho(0x0100_000c, 0, [9; 16]);
+        let true_uuid = format_uuid(DebugId::from_uuid(uuid::Uuid::from_bytes([9; 16])));
+        let p = tmp.path().join("m");
+        for len in 0..valid.len() {
+            std::fs::write(&p, &valid[..len]).unwrap();
+            let out = extract_uuids(&p);
+            assert!(
+                out.is_empty() || out == [true_uuid.clone()],
+                "len {len}: {out:?}"
+            );
+        }
+    }
 
     #[test]
     fn extract_uuids_returns_empty_for_nonexistent_path() {

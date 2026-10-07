@@ -275,6 +275,12 @@ fn parse_elf_identity(bytes: &[u8]) -> ElfIdentity {
         has_debug_info: false,
         has_symbols: false,
     };
+    // `symbolic` identifies Mach-O, PE and PDB just as readily, and their ids would
+    // read as a "build-id" here: a macOS `.so` or a stray `.pdb` named `*.so` would
+    // be registered as an ELF symbol under a foreign key. This uploader takes ELF.
+    if !bytes.starts_with(b"\x7fELF") {
+        return unknown();
+    }
     let archive = match Archive::parse(bytes) {
         Ok(a) => a,
         Err(_) => return unknown(),
@@ -544,6 +550,226 @@ mod tests {
             names(&collect_libs(&zip_path, &out, &x).unwrap()),
             ["arm64-v8a/libsymbol1.so"]
         );
+    }
+
+    // ── corrupted / truncated ELF files ────────────────────────────
+
+    const TRUE_BUILD_ID: &str = "bca64abfec40dbb631bb8f1c37414472";
+
+    fn fixture() -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so"),
+        )
+        .unwrap()
+    }
+
+    /// Deterministic xorshift, so a failure names a reproducible byte.
+    fn xorshift(state: &mut u64) -> u64 {
+        *state ^= *state << 13;
+        *state ^= *state >> 7;
+        *state ^= *state << 17;
+        *state
+    }
+
+    /// Run `parse_elf_identity`, turning a panic into a reportable failure.
+    fn parse_catching(bytes: &[u8], label: &str) -> ElfIdentity {
+        std::panic::catch_unwind(|| parse_elf_identity(bytes))
+            .unwrap_or_else(|_| panic!("parse_elf_identity PANICKED on {label}"))
+    }
+
+    /// The key of a symbol is its build-id, so the one thing a damaged file must never
+    /// do is report ANOTHER build-id: it would be uploaded under the wrong key and
+    /// look like a different library's symbols. Any prefix of the real library either
+    /// parses to no build-id or to the TRUE one — nothing in between.
+    #[test]
+    fn a_truncated_elf_has_no_build_id_or_the_true_one() {
+        let elf = fixture();
+        let mut cuts: Vec<usize> = (0..=130).collect(); // every byte of the headers
+        let mut at = 131usize;
+        while at < elf.len() {
+            cuts.push(at);
+            at += at / 7 + 13; // geometric-ish sweep over the whole file
+        }
+        cuts.push(elf.len() - 1);
+        for cut in cuts {
+            let id = parse_catching(&elf[..cut], &format!("a {cut}-byte prefix"));
+            assert!(
+                id.build_id.is_none() || id.build_id.as_deref() == Some(TRUE_BUILD_ID),
+                "prefix of {cut} bytes reported build-id {:?}",
+                id.build_id
+            );
+        }
+        // And the whole file still parses to the true identity (the sweep's control).
+        assert_eq!(
+            parse_catching(&elf, "the whole file").build_id.as_deref(),
+            Some(TRUE_BUILD_ID)
+        );
+    }
+
+    /// Damage to the ELF header and the section/program header tables — the
+    /// structures `symbolic` walks to find the build-id note and the debug sections —
+    /// must be survivable: no panic, whatever it then reports.
+    #[test]
+    fn corrupt_elf_headers_and_tables_never_panic() {
+        let elf = fixture();
+        // e_shoff (0x28), e_phoff (0x20), e_shentsize/num/shstrndx (0x3a..0x40), e_phnum.
+        let fields: &[(usize, usize)] = &[
+            (0x20, 8),
+            (0x28, 8),
+            (0x36, 2),
+            (0x38, 2),
+            (0x3a, 2),
+            (0x3c, 2),
+            (0x3e, 2),
+        ];
+        let mut checked = 0;
+        for &(off, len) in fields {
+            for fill in [0x00u8, 0xff, 0x7f, 0x80, 0x01] {
+                let mut b = elf.clone();
+                b[off..off + len].fill(fill);
+                parse_catching(&b, &format!("header field @{off:#x} = {fill:#x}"));
+                checked += 1;
+            }
+        }
+        // Every one of the first 64 header bytes flipped to a few values.
+        for i in 0..64 {
+            for v in [0x00u8, 0xff, 0x55] {
+                let mut b = elf.clone();
+                b[i] = v;
+                parse_catching(&b, &format!("e_ident/header byte {i} = {v:#x}"));
+                checked += 1;
+            }
+        }
+        // The section header table is at e_shoff; flip bytes throughout it.
+        let shoff = u64::from_le_bytes(elf[0x28..0x30].try_into().unwrap()) as usize;
+        let shnum = u16::from_le_bytes(elf[0x3c..0x3e].try_into().unwrap()) as usize;
+        assert!(shoff > 0 && shnum > 0, "fixture has section headers");
+        let table_end = (shoff + shnum * 64).min(elf.len());
+        for i in (shoff..table_end).step_by(5) {
+            let mut b = elf.clone();
+            b[i] ^= 0xff;
+            parse_catching(&b, &format!("section header byte {i} flipped"));
+            checked += 1;
+        }
+        assert!(checked > 100);
+    }
+
+    #[test]
+    fn random_byte_flips_anywhere_never_panic() {
+        let elf = fixture();
+        let mut state = 0x2545_F491_4F6C_DD1Du64;
+        for round in 0..300 {
+            let mut b = elf.clone();
+            for _ in 0..1 + round % 8 {
+                let at = (xorshift(&mut state) % b.len() as u64) as usize;
+                b[at] = xorshift(&mut state) as u8;
+            }
+            parse_catching(&b, &format!("random corruption round {round}"));
+        }
+    }
+
+    #[test]
+    fn non_elf_and_degenerate_inputs_have_no_identity() {
+        for (label, bytes) in [
+            ("empty", Vec::new()),
+            ("one byte", vec![0x7f]),
+            ("magic only", b"\x7fELF".to_vec()),
+            ("zeros", vec![0; 4096]),
+            ("a text file", b"#!/bin/sh\necho hi\n".repeat(50)),
+            ("a ZIP", b"PK\x03\x04junk".repeat(40)),
+            (
+                "a Mach-O",
+                crate::symbols::test_macho::thin_macho(0x0100_000c, 0, [3; 16]),
+            ),
+        ] {
+            let id = parse_catching(&bytes, label);
+            assert_eq!(id.build_id, None, "{label}");
+        }
+    }
+
+    /// A library that parses but carries no build-id (`-Wl,--build-id` was off) is
+    /// reported without one, so the uploader can warn and skip it.
+    #[test]
+    fn scan_dir_reports_damaged_libraries_without_a_build_id_instead_of_failing() {
+        let elf = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("libgood.so"), &elf).unwrap();
+        std::fs::write(dir.path().join("libhalf.so"), &elf[..elf.len() / 2]).unwrap();
+        std::fs::write(dir.path().join("libzero.so"), vec![0u8; 5000]).unwrap();
+        std::fs::write(dir.path().join("libtext.so"), b"not an elf").unwrap();
+        let libs = scan_dir(dir.path(), &ExtraSuffixes::default()).unwrap();
+        let by_name = |n: &str| libs.iter().find(|l| l.name == n).unwrap();
+        assert_eq!(
+            by_name("libgood.so").build_id.as_deref(),
+            Some(TRUE_BUILD_ID)
+        );
+        for damaged in ["libhalf.so", "libzero.so", "libtext.so"] {
+            assert_eq!(by_name(damaged).build_id, None, "{damaged}");
+        }
+        let kept = keep_richest_per_build_id(libs);
+        assert_eq!(
+            kept.len(),
+            4,
+            "keyless libs pass through for the uploader to warn about"
+        );
+    }
+
+    /// A ZIP entry that fails its CRC (bit rot in `native-debug-symbols.zip`) is an
+    /// error for the archive, never a silently-wrong library.
+    #[test]
+    fn a_zip_entry_with_a_bad_crc_is_an_error() {
+        let elf = fixture();
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("n.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            zw.start_file(
+                "arm64-v8a/libfoo.so",
+                SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
+            )
+            .unwrap();
+            zw.write_all(&elf).unwrap();
+            zw.finish().unwrap();
+        }
+        let mut raw = std::fs::read(&zip_path).unwrap();
+        let mid = raw.len() / 2; // inside the stored payload
+        raw[mid] ^= 0x5a;
+        std::fs::write(&zip_path, &raw).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(extract_libs(&zip_path, &out, &ExtraSuffixes::default()).is_err());
+    }
+
+    #[test]
+    fn truncated_or_garbage_zips_are_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&good).unwrap());
+            zw.start_file("a/libfoo.so", SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&fixture()).unwrap();
+            zw.finish().unwrap();
+        }
+        let raw = std::fs::read(&good).unwrap();
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        for (label, bytes) in [
+            ("empty", Vec::new()),
+            ("half", raw[..raw.len() / 2].to_vec()),
+            ("no end-of-central-directory", raw[..raw.len() - 8].to_vec()),
+            (
+                "garbage",
+                (0..5000u32).map(|i| (i * 7 % 251) as u8).collect(),
+            ),
+        ] {
+            let p = dir.path().join("bad.zip");
+            std::fs::write(&p, bytes).unwrap();
+            assert!(
+                extract_libs(&p, &out, &ExtraSuffixes::default()).is_err(),
+                "{label}"
+            );
+        }
     }
 
     fn lib(name: &str, build_id: Option<&str>, richness: (bool, bool, u64)) -> ElfLib {

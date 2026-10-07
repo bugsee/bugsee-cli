@@ -40,6 +40,26 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   original key order (it was alphabetical), and `inject` writes `debug_id` / `debugId` last. Both
   are still valid maps; an invalid-UTF-8 map outside a string value now reports as invalid JSON
   (exit 11) rather than I/O (exit 10).
+- **`sourcemaps inject` edits bundles in place.** The debug-id stub is appended (or, to re-key, our
+  own trailing stub is swapped) without copying the bundle: a 150 MB bundle's dirty memory went
+  from 317 MB to 2.4 MB. Output bytes are identical, and permissions and symlinks survive as before.
+
+### Fixed
+- **`dsym uuid` and `debug-files upload --type dsym` no longer report a Mach-O with no `LC_UUID`
+  as the nil UUID** (`00000000-0000-0000-0000-000000000000`). Such a slice can never match a crash
+  report and every one would collide on the same all-zero key, so it is skipped; a bundle with no
+  usable slice is rejected (and fails an `xcode upload-dsyms` build phase, as any unreadable
+  bundle does). The app-binary path already treated nil as absent.
+- **`--type elf` only treats real ELF files as ELF.** `symbolic` identifies Mach-O, PE and PDB just
+  as readily, so a macOS-built `.so` found by a directory scan would have been uploaded as an "elf"
+  symbol keyed by its Mach-O UUID. A file without the `\x7fELF` magic now has no build-id and is
+  skipped with the usual warning.
+- **`build-env read-plist` (and the `xcode` flows that read `Info.plist`) no longer crash on a
+  deeply nested plist.** Tens of thousands of nested arrays overflowed the stack and aborted the
+  process with SIGABRT; it now reads as `{}` like any other unusable plist. Plists over 1 MiB are
+  refused up front.
+- **`ios-deps` no longer reports a nameless dependency** (`library::`) for a truncated or mangled
+  `Podfile.lock` line such as `- (2.0)`.
 
 
 ## [0.7.13] - 2026-10-07

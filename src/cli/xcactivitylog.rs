@@ -1775,6 +1775,142 @@ mod tests {
         assert!(t.summary.is_none() && t.timeline.is_none());
     }
 
+    // ── corrupted logs ─────────────────────────────────────────────
+
+    /// A synthetic log with several sections, a blob and unicode titles.
+    fn sample_log() -> Vec<u8> {
+        build_log(
+            &[
+                ("Ld App normal arm64", T0 + 1.0, T0 + 3.0),
+                ("CompileSwift normal arm64 héllo.swift", T0 + 0.5, T0 + 2.0),
+            ],
+            &[("Build App", T0, T0 + 5.0)],
+            &[],
+            true,
+        )
+    }
+
+    /// Cutting the stream anywhere is survivable: `None` or a parse of what is left,
+    /// never a panic and never a hang on a half-read length.
+    #[test]
+    fn every_truncation_of_a_log_is_survivable() {
+        let log = sample_log();
+        assert!(
+            parse_stream(&log).is_some(),
+            "control: the whole log parses"
+        );
+        for cut in 0..log.len() {
+            let r = std::panic::catch_unwind(|| parse_stream(&log[..cut]));
+            assert!(r.is_ok(), "parse_stream PANICKED on a {cut}-byte prefix");
+        }
+    }
+
+    /// Flip, replace and insert bytes all over the stream, concentrating on the
+    /// length-prefixed fields: a corrupted length (`99999999999`) must not turn into a
+    /// huge allocation or an out-of-bounds read.
+    #[test]
+    fn corrupted_bytes_never_panic_or_over_allocate() {
+        let log = sample_log();
+        let mut state = 0xA076_1D64_78BD_642Fu64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let started = std::time::Instant::now();
+        for round in 0..2000 {
+            let mut b = log.clone();
+            for _ in 0..1 + next() % 4 {
+                let at = (next() % b.len() as u64) as usize;
+                match next() % 4 {
+                    0 => b[at] = next() as u8,
+                    1 => b[at] = b"0123456789^#%\"@"[(next() % 14) as usize],
+                    2 => {
+                        b.remove(at);
+                    }
+                    _ => b.insert(at, next() as u8),
+                }
+            }
+            let r = std::panic::catch_unwind(|| parse_stream(&b));
+            assert!(
+                r.is_ok(),
+                "parse_stream PANICKED on corruption round {round}"
+            );
+        }
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(60),
+            "corrupted input must not make the tokenizer crawl"
+        );
+    }
+
+    #[test]
+    fn a_length_prefix_claiming_the_moon_is_rejected_cheaply() {
+        // `SLF0` header, then a string token claiming 2^60 bytes: must come back at once.
+        let mut data = b"SLF0".to_vec();
+        data.extend_from_slice(b"99999999999999999999\"");
+        data.extend_from_slice(b"1152921504606846976\"x");
+        let r = std::panic::catch_unwind(|| parse_stream(&data));
+        assert!(r.is_ok());
+    }
+
+    /// Gzip-level damage: truncated stream, flipped payload byte, trailing junk,
+    /// empty file. All read as "no timings" (`None`), none panics.
+    #[test]
+    fn damaged_gzip_logs_parse_as_none() {
+        let td = tempfile::tempdir().unwrap();
+        let path = write_gzipped_log(td.path(), &sample_log());
+        let raw = std::fs::read(&path).unwrap();
+        assert!(
+            parse_xcactivitylog(&path).is_some(),
+            "control: the intact log parses"
+        );
+        let mut flipped = raw.clone();
+        let mid = flipped.len() / 2;
+        flipped[mid] ^= 0xff;
+        let cases: Vec<(&str, Vec<u8>)> = vec![
+            ("empty file", Vec::new()),
+            ("gzip magic only", vec![0x1f, 0x8b]),
+            ("truncated in half", raw[..raw.len() / 2].to_vec()),
+            ("trailer chopped", raw[..raw.len() - 6].to_vec()),
+            ("flipped payload byte", flipped),
+            ("not gzip", b"SLF0 plain, never compressed".to_vec()),
+        ];
+        for (label, bytes) in cases {
+            let p = td.path().join("broken.xcactivitylog");
+            std::fs::write(&p, bytes).unwrap();
+            let r = std::panic::catch_unwind(|| parse_xcactivitylog(&p));
+            assert!(r.is_ok(), "{label}: PANICKED");
+            assert!(r.unwrap().is_none(), "{label}: must read as no timings");
+        }
+    }
+
+    /// A log that inflates far past the cap (a decompression bomb) is cut at the cap,
+    /// not inflated into memory.
+    #[test]
+    fn a_decompression_bomb_is_capped() {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::Write;
+        let td = tempfile::tempdir().unwrap();
+        let p = td.path().join("bomb.xcactivitylog");
+        let mut enc = GzEncoder::new(std::fs::File::create(&p).unwrap(), Compression::best());
+        enc.write_all(b"SLF0").unwrap();
+        let zeros = vec![0u8; 1024 * 1024];
+        for _ in 0..(super::MAX_DECOMPRESSED / (1024 * 1024) + 30) {
+            enc.write_all(&zeros).unwrap(); // ~50 MB of zeros, a few KB compressed
+        }
+        enc.finish().unwrap();
+        assert!(
+            std::fs::metadata(&p).unwrap().len() < 200_000,
+            "the bomb really is tiny"
+        );
+        // Returns promptly with no timings; the proof of the cap is that this does not
+        // hold ~50 MB (it reads at most MAX_DECOMPRESSED + 1 bytes).
+        let r = std::panic::catch_unwind(|| parse_xcactivitylog(&p));
+        assert!(r.is_ok() && r.unwrap().is_none());
+    }
+
     #[test]
     fn resolve_swallows_bad_gzip() {
         // A `.xcactivitylog` that is not valid gzip → parse returns None →
