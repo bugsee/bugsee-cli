@@ -9,6 +9,7 @@ rust-version = "1.88"
 authors = ["Bugsee"]
 description = "Bugsee CLI — cross-platform symbol collection, conversion, and upload."
 readme = "README.md"
+license = "MIT"
 repository = "https://github.com/bugsee/bugsee-cli"
 homepage = "https://github.com/bugsee/bugsee-cli"
 publish = false

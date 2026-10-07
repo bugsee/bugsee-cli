@@ -611,3 +611,7 @@ scripts/e2e_flows.py   end-to-end harness: every upload flow against a protocol-
 npm/                   the @bugsee/cli package family (see npm/README.md)
 installer/             install.sh / install.ps1 served from download.bugsee.com/cli
 ```
+
+## License
+
+[MIT](LICENSE) © Bugsee, Inc.

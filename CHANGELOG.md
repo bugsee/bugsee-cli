@@ -6,6 +6,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **Licensed under MIT.** The repository has a `LICENSE`, the crate declares `license = "MIT"`,
+  and every published artefact carries it: the release archives, the Homebrew formula, and all
+  eight npm packages (`@bugsee/cli`, its six platform packages and `@bugsee/bugsee-cli`), which
+  previously had no `license` field. See [#67].
+
 ### Fixed
 - **`build-env machine-label` falls back to the hostname on macOS and Windows.** Outside CI it
   shelled out to `/usr/bin/hostname`, which does not exist on macOS (`/bin/hostname`) or Windows,
@@ -14,6 +20,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   with `gethostname(2)` on Unix and `COMPUTERNAME` on Windows. See [#66].
 
 [#66]: https://github.com/bugsee/bugsee-cli/pull/66
+[#67]: https://github.com/bugsee/bugsee-cli/pull/67
 
 ## [0.7.12] - 2026-10-07
 
