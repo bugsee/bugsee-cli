@@ -117,6 +117,9 @@ pub struct MappingsStats {
 pub fn validate_mappings(path: &Path) -> anyhow::Result<MappingsStats> {
     let file = fs::File::open(path).map_err(Error::Io)?;
     let bad = |detail: &str| {
+        // The reader's own message can echo the offending token (a 50 000-digit number):
+        // cap what reaches stderr.
+        let detail: String = detail.chars().take(240).collect();
         input_invalid(format!(
             "{} is not a valid IL2CPP line-number map ({detail}); expected \
              {{cpp_path: {{cs_path: {{cpp_line: cs_line}}}}}} with integer line numbers: {}",
