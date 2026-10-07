@@ -52,8 +52,10 @@ so a new triple needs no workflow edit. See the comment on `allow-dirty` in
 ## Build locally
 
 ```sh
-# 1. Fetch the release assets for a version (archives + .sha256 sidecars).
-gh release download v0.7.5 --repo bugsee/bugsee-cli --dir /tmp/assets \
+# 1. Fetch the release assets for the version in Cargo.toml (archives + .sha256
+#    sidecars). build.mjs labels the packages with Cargo.toml's version unless
+#    --version says otherwise, so fetch the matching tag.
+gh release download v0.7.12 --repo bugsee/bugsee-cli --dir /tmp/assets \
   --pattern 'bugsee-cli-*-*.tar.xz*' --pattern 'bugsee-cli-*-*.zip*'
 
 # 2. Assemble. Every archive is SHA-256 verified against its sidecar.
@@ -161,10 +163,13 @@ What it does per name, and why:
 Do **not** drive `npm publish` with `--otp` in a loop. A wrong or reused TOTP
 trips npm's per-account OTP rate limiter (`429 ... rate limited otp`), which then
 blocks publishing across the whole account for a while. A granular token is not
-a way around it either: npm removes direct publish for tokens in January 2027.
+a way around it either: npm removes direct publish for 2FA-bypass tokens in
+January 2027.
 
-`@bugsee/bugsee-cli` and the six names published in 0.7.6 are already
-bootstrapped and need none of this.
+All eight published names — `@bugsee/bugsee-cli`, `@bugsee/cli` and the six
+platform packages — are already bootstrapped and need none of this. (Their
+`0.0.0` placeholders were kept; the 72-hour unpublish window has passed, and they
+are not under any dist-tag a user would install.)
 
 ### What it looks like if you skip it
 
@@ -183,4 +188,6 @@ first leaves a window in which `npm install @bugsee/cli` resolves optional
 dependencies that do not exist yet — npm skips missing optional deps
 _silently_, so the install succeeds with no binary and the failure only shows
 up when someone runs the CLI. `npm-publish.yml` enforces the order inside one
-job.
+job. The `@bugsee/cli` family publishes a prerelease (`X.Y.Z-rc.1`) under the
+`next` dist-tag and a stable one under `latest`, so a prerelease never becomes
+the default install.

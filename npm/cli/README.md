@@ -40,10 +40,11 @@ The Linux builds link glibc and are marked `"libc": ["glibc"]`. On musl (Alpine)
 the install still succeeds, and `bugsee-cli` reports that plainly if invoked —
 use a glibc base image, or build from source.
 
-If the platform package is unavailable — `--no-optional`, a registry mirror
-that carries only this package, or an unsupported platform — a `postinstall`
-fallback downloads the release archive for your host and verifies its SHA-256
-before unpacking it into `vendor/`. That fallback **never fails the install**:
+If the platform package is unavailable — `--omit=optional` (or the deprecated
+`--no-optional`), or a registry mirror that carries only this package — a
+`postinstall` fallback downloads the release archive for your host and verifies
+its SHA-256 before unpacking it into `vendor/`. On a platform with no published
+binary there is nothing to download, so it only warns. That fallback **never fails the install**:
 if it cannot fetch the binary it warns and exits 0, and the error surfaces only
 if you actually invoke `bugsee-cli`.
 
