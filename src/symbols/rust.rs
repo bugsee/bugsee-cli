@@ -137,6 +137,15 @@ fn has_dsym_name(p: &Path, extra: &ExtraSuffixes) -> bool {
     p.extension().and_then(|e| e.to_str()) == Some("dSYM") || extra.matches_path(p)
 }
 
+/// Whether the walk treats `p` as a bundle (the upload unit, never descended
+/// into). A `.dSYM` name is enough, as before — even a malformed one is not
+/// walked. A caller-chosen `--extension` suffix is broader, so a directory
+/// matching only that must ALSO be structurally a bundle; otherwise it is an
+/// ordinary directory and is walked.
+fn is_bundle_like(p: &Path, extra: &ExtraSuffixes) -> bool {
+    has_dsym_name(p, &ExtraSuffixes::default()) || is_dsym_bundle(p, extra)
+}
+
 /// Parse an ELF's identity: `(build_id, arch, has_debug_info)`.
 ///
 /// Uses the same `symbolic` major the worker parses uploads with, so the
@@ -202,7 +211,7 @@ pub fn discover(paths: &[PathBuf], extra: &ExtraSuffixes) -> Findings {
             // misfires the preflight in the worst direction: telling a correctly
             // configured project to set `split-debuginfo`, which it already has.
             if ft.is_dir() || ft.is_symlink() {
-                if has_dsym_name(ep, extra) {
+                if is_bundle_like(ep, extra) {
                     if is_dsym_bundle(ep, extra) && seen.insert(ep.to_path_buf()) {
                         f.dsyms.push(ep.to_path_buf());
                     }
@@ -239,20 +248,27 @@ pub fn discover(paths: &[PathBuf], extra: &ExtraSuffixes) -> Findings {
     // visited before its bundle.
     if !f.macho_without_dsym.is_empty() && !f.dsyms.is_empty() {
         let have: std::collections::HashSet<PathBuf> = f.dsyms.iter().cloned().collect();
-        f.macho_without_dsym
-            .retain(|bin| !have.contains(&dsym_sibling(bin)));
+        f.macho_without_dsym.retain(|bin| {
+            !dsym_siblings(bin, extra)
+                .iter()
+                .any(|sibling| have.contains(sibling))
+        });
     }
     f
 }
 
-/// The `.dSYM` path Cargo/dsymutil would emit for a binary: a sibling
-/// directory with `.dSYM` appended to the full filename (`app` → `app.dSYM`).
-fn dsym_sibling(binary: &Path) -> PathBuf {
+/// The bundle paths that count as a binary's `.dSYM`: the sibling Cargo /
+/// dsymutil emits, with `.dSYM` appended to the full filename (`app` →
+/// `app.dSYM`), plus the same with each `--extension` suffix (`app.dsymx`).
+fn dsym_siblings(binary: &Path, extra: &ExtraSuffixes) -> Vec<PathBuf> {
     let name = binary
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    binary.with_file_name(format!("{name}.dSYM"))
+    std::iter::once(".dSYM")
+        .chain(extra.as_slice().iter().map(String::as_str))
+        .map(|suffix| binary.with_file_name(format!("{name}{suffix}")))
+        .collect()
 }
 
 /// Classify one regular file into `f`.
@@ -321,8 +337,10 @@ fn classify_file(
 }
 
 /// Whether this Mach-O lives inside a `.dSYM` bundle (its DWARF payload).
+/// Only ANCESTOR directories count: a binary that is itself named with an
+/// extra suffix is not inside anything.
 fn is_dsym_inner_binary(path: &Path, extra: &ExtraSuffixes) -> bool {
-    path.ancestors().any(|a| has_dsym_name(a, extra))
+    path.ancestors().skip(1).any(|a| is_bundle_like(a, extra))
 }
 
 /// Build-configuration advice derived from a walk.
@@ -685,6 +703,47 @@ mod tests {
         // An explicit path to the inner binary is recognized as bundle payload too.
         let f = discover(&[dwarf.join("app")], &extra);
         assert!(f.macho_without_dsym.is_empty());
+    }
+
+    /// The shipped binary next to a custom-suffix bundle is NOT a near-miss: the
+    /// bundle is its `.dSYM`, so no `split-debuginfo` advice may fire.
+    #[test]
+    fn extra_suffix_bundle_counts_as_the_binarys_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "app", b"\xcf\xfa\xed\xfe stub macho");
+        let bundle = tmp.path().join("app.dsymx");
+        let dwarf = bundle.join("Contents").join("Resources").join("DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join("app"), b"\xcf\xfa\xed\xfe stub macho").unwrap();
+
+        let extra = ExtraSuffixes::parse(&[".dsymx".to_string()]).unwrap();
+        let f = discover(&[tmp.path().to_path_buf()], &extra);
+        assert_eq!(f.dsyms, vec![bundle]);
+        assert!(
+            f.macho_without_dsym.is_empty(),
+            "{:?}",
+            f.macho_without_dsym
+        );
+        assert!(preflight_advice(&f).is_empty());
+    }
+
+    /// A directory matching only an extra suffix but with no DWARF payload is an
+    /// ordinary directory: it is walked, so a binary inside it is still found.
+    #[test]
+    fn extra_suffix_directory_that_is_not_a_bundle_is_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out.dsymx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elf = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so"),
+        )
+        .unwrap();
+        touch(&dir, "libapp.so", &elf);
+
+        let extra = ExtraSuffixes::parse(&[".dsymx".to_string()]).unwrap();
+        let f = discover(&[tmp.path().to_path_buf()], &extra);
+        assert!(f.dsyms.is_empty());
+        assert_eq!(f.elves.len(), 1, "the walk descended into the directory");
     }
 
     #[test]

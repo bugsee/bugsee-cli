@@ -61,6 +61,9 @@ pub struct ElfLib {
     pub arch: String,
     /// Temp file holding the extracted `.so` bytes, packed into its own upload.
     pub path: PathBuf,
+    /// How much this file can symbolicate: (DWARF debug info, symbol table,
+    /// byte size), compared in that order by [`keep_richest_per_build_id`].
+    richness: (bool, bool, u64),
 }
 
 /// Extract every ELF `.so` from `archive_path` into `out_dir`, reading each
@@ -92,7 +95,13 @@ pub fn extract_libs(
 
         let mut bytes = Vec::new();
         entry.read_to_end(&mut bytes)?;
-        let (build_id, arch) = parse_elf_identity(&bytes);
+        let ElfIdentity {
+            build_id,
+            arch,
+            has_debug_info,
+            has_symbols,
+        } = parse_elf_identity(&bytes);
+        let richness = (has_debug_info, has_symbols, bytes.len() as u64);
 
         let base = Path::new(&name)
             .file_name()
@@ -107,6 +116,7 @@ pub fn extract_libs(
             build_id,
             arch,
             path: out_path,
+            richness,
         });
     }
     Ok(libs)
@@ -123,20 +133,76 @@ fn is_native_lib_entry(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
-/// Parse the first ELF object's GNU build-id (`code_id`) + arch. Returns
-/// `(None, "unknown")` when the bytes are not a parseable ELF or carry no
-/// build-id.
-fn parse_elf_identity(bytes: &[u8]) -> (Option<String>, String) {
+/// Keep ONE library per GNU build-id: the one that symbolicates best.
+///
+/// The server dedups on the build-id alone, so two entries sharing one are not
+/// two symbols — they are the same library in two forms, e.g. a stripped
+/// `libfoo.so` next to its GNU split-debug `libfoo.so.debug` (which an
+/// `--extension` suffix can add to the set). Uploading both concurrently let
+/// whichever registered first win, often the stripped one, leaving crashes
+/// matched but without line info. Preference: DWARF debug info, then a symbol
+/// table, then the larger file; on a full tie the first entry wins. Entries
+/// without a build-id pass through for the caller's warn-and-skip. The order of
+/// the kept entries is preserved.
+pub fn keep_richest_per_build_id(libs: Vec<ElfLib>) -> Vec<ElfLib> {
+    let mut best: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (i, lib) in libs.iter().enumerate() {
+        if let Some(id) = &lib.build_id {
+            let b = best.entry(id.clone()).or_insert(i);
+            if lib.richness > libs[*b].richness {
+                *b = i;
+            }
+        }
+    }
+    for (i, lib) in libs.iter().enumerate() {
+        if let Some(id) = &lib.build_id {
+            let winner = best[id];
+            if winner != i {
+                tracing::info!(
+                    dropped = %lib.name,
+                    kept = %libs[winner].name,
+                    build_id = %id,
+                    "same GNU build-id as a richer entry; uploading only the richer one"
+                );
+            }
+        }
+    }
+    libs.into_iter()
+        .enumerate()
+        .filter(|(i, lib)| lib.build_id.as_ref().is_none_or(|id| best[id] == *i))
+        .map(|(_, lib)| lib)
+        .collect()
+}
+
+struct ElfIdentity {
+    build_id: Option<String>,
+    arch: String,
+    has_debug_info: bool,
+    has_symbols: bool,
+}
+
+/// Parse the first ELF object's GNU build-id (`code_id`), arch, and what it
+/// carries for symbolication. No build-id and arch `"unknown"` when the bytes
+/// are not a parseable ELF.
+fn parse_elf_identity(bytes: &[u8]) -> ElfIdentity {
+    let unknown = || ElfIdentity {
+        build_id: None,
+        arch: "unknown".to_string(),
+        has_debug_info: false,
+        has_symbols: false,
+    };
     let archive = match Archive::parse(bytes) {
         Ok(a) => a,
-        Err(_) => return (None, "unknown".to_string()),
+        Err(_) => return unknown(),
     };
     match archive.objects().next() {
-        Some(Ok(obj)) => (
-            obj.code_id().map(|c| c.as_str().to_owned()),
-            obj.arch().name().to_owned(),
-        ),
-        _ => (None, "unknown".to_string()),
+        Some(Ok(obj)) => ElfIdentity {
+            build_id: obj.code_id().map(|c| c.as_str().to_owned()),
+            arch: obj.arch().name().to_owned(),
+            has_debug_info: obj.has_debug_info(),
+            has_symbols: obj.has_symbols(),
+        },
+        _ => unknown(),
     }
 }
 
@@ -163,9 +229,9 @@ mod tests {
 
     #[test]
     fn parse_elf_identity_on_non_elf_returns_none_unknown() {
-        let (build_id, arch) = parse_elf_identity(b"this is not an ELF file");
-        assert_eq!(build_id, None);
-        assert_eq!(arch, "unknown");
+        let id = parse_elf_identity(b"this is not an ELF file");
+        assert_eq!(id.build_id, None);
+        assert_eq!(id.arch, "unknown");
     }
 
     #[test]
@@ -178,12 +244,12 @@ mod tests {
         let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/elf/libsymbol1.so");
         let bytes = std::fs::read(&fixture).unwrap();
-        let (build_id, arch) = parse_elf_identity(&bytes);
+        let id = parse_elf_identity(&bytes);
         assert_eq!(
-            build_id.as_deref(),
+            id.build_id.as_deref(),
             Some("bca64abfec40dbb631bb8f1c37414472")
         );
-        assert_eq!(arch, "arm64");
+        assert_eq!(id.arch, "arm64");
     }
 
     #[test]
@@ -291,5 +357,68 @@ mod tests {
             "the .so bytes were extracted to disk"
         );
         assert_eq!(std::fs::read(&libs[0].path).unwrap(), b"not a real elf");
+    }
+
+    fn lib(name: &str, build_id: Option<&str>, richness: (bool, bool, u64)) -> ElfLib {
+        ElfLib {
+            name: name.to_string(),
+            build_id: build_id.map(str::to_string),
+            arch: "arm64".to_string(),
+            path: PathBuf::from(name),
+            richness,
+        }
+    }
+
+    fn names(libs: &[ElfLib]) -> Vec<&str> {
+        libs.iter().map(|l| l.name.as_str()).collect()
+    }
+
+    #[test]
+    fn keep_richest_prefers_debug_info_over_a_stripped_companion() {
+        // GNU split-debug layout: the stripped `.so` FIRST in the zip, its
+        // `.so.debug` (DWARF) second, same build-id.
+        let kept = keep_richest_per_build_id(vec![
+            lib("arm64-v8a/libfoo.so", Some("abc"), (false, false, 10_000)),
+            lib(
+                "arm64-v8a/libfoo.so.debug",
+                Some("abc"),
+                (true, true, 4_000),
+            ),
+            lib("arm64-v8a/libbar.so", Some("def"), (false, true, 500)),
+        ]);
+        assert_eq!(
+            names(&kept),
+            ["arm64-v8a/libfoo.so.debug", "arm64-v8a/libbar.so"]
+        );
+    }
+
+    #[test]
+    fn keep_richest_ranks_symbols_then_size_and_passes_unkeyed_through() {
+        let kept = keep_richest_per_build_id(vec![
+            lib("a/libfoo.so", Some("abc"), (false, false, 9_000)),
+            lib("a/libfoo.so.sym", Some("abc"), (false, true, 1_000)),
+            lib("a/libbig.so", Some("x"), (false, true, 10)),
+            lib("a/libbig.so.sym", Some("x"), (false, true, 20)),
+            lib("a/nobuildid.so", None, (true, true, 1)),
+            lib("b/nobuildid.so", None, (true, true, 1)),
+        ]);
+        assert_eq!(
+            names(&kept),
+            [
+                "a/libfoo.so.sym",
+                "a/libbig.so.sym",
+                "a/nobuildid.so",
+                "b/nobuildid.so"
+            ]
+        );
+    }
+
+    #[test]
+    fn parse_elf_identity_reads_symbolication_content_from_the_elf() {
+        // `richness` must come from the object itself, never from the name.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/elf/libsymbol1.so");
+        let id = parse_elf_identity(&std::fs::read(fixture).unwrap());
+        assert!(id.has_symbols);
     }
 }

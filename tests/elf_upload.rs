@@ -230,3 +230,70 @@ async fn elf_upload_picks_up_an_extra_suffix_entry() {
     .await
     .unwrap();
 }
+
+/// GNU split-debug companions — a `libfoo.so` and its `libfoo.so.debug`, same
+/// build-id — are ONE symbol. With `--extension so.debug` both match by name;
+/// registering both raced two POSTs for one id. Exactly one is registered and PUT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_sends_one_library_per_build_id() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let elf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let bytes = std::fs::read(&elf).unwrap();
+    let zip_path = tmp.path().join("native-debug-symbols.zip");
+    {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        for name in ["arm64-v8a/libsymbol1.so", "arm64-v8a/libsymbol1.so.debug"] {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .and(body_string_contains(FIXTURE_BUILD_ID))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let zip = zip_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "elf",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            "--uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "--extension",
+            "so.debug",
+            &zip,
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("uploading only the richer one"));
+    })
+    .await
+    .unwrap();
+}

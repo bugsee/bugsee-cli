@@ -1198,6 +1198,7 @@ async fn run_elf_upload(
         tracing::info!(path = %archive.display(), "processing native-debug-symbols archive");
         let work_dir = tempfile::tempdir()?;
         let libs = elf::extract_libs(archive, work_dir.path(), extra)?;
+        let libs = elf::keep_richest_per_build_id(libs);
         let total = libs.len();
 
         // A `.so` with no GNU build-id can never be matched at crash time, so
