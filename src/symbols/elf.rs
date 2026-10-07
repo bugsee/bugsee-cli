@@ -30,6 +30,8 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use symbolic_debuginfo::Archive;
 
+use super::suffix::ExtraSuffixes;
+
 fn sha1_hex(bytes: &[u8]) -> String {
     let digest: [u8; 20] = Sha1::digest(bytes).into();
     hex::encode(digest)
@@ -62,10 +64,15 @@ pub struct ElfLib {
 }
 
 /// Extract every ELF `.so` from `archive_path` into `out_dir`, reading each
-/// library's GNU build-id. The wire `code_id` is produced by the same
+/// library's GNU build-id. An entry counts as a library when its name ends in
+/// a built-in suffix (see [`is_native_lib_entry`]) or one of `extra`. The wire `code_id` is produced by the same
 /// `symbolic` crate family (major 13) the worker uses, so the identifier is
 /// byte-identical producer↔consumer.
-pub fn extract_libs(archive_path: &Path, out_dir: &Path) -> std::io::Result<Vec<ElfLib>> {
+pub fn extract_libs(
+    archive_path: &Path,
+    out_dir: &Path,
+    extra: &ExtraSuffixes,
+) -> std::io::Result<Vec<ElfLib>> {
     let file = std::fs::File::open(archive_path)?;
     let mut archive = zip::ZipArchive::new(file)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
@@ -79,7 +86,7 @@ pub fn extract_libs(archive_path: &Path, out_dir: &Path) -> std::io::Result<Vec<
             continue;
         }
         let name = entry.name().to_string();
-        if !is_native_lib_entry(&name) {
+        if !(is_native_lib_entry(&name) || extra.matches(&name)) {
             continue;
         }
 
@@ -211,7 +218,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
 
-        let libs = extract_libs(&zip_path, &out).unwrap();
+        let libs = extract_libs(&zip_path, &out, &ExtraSuffixes::default()).unwrap();
         assert_eq!(libs.len(), 1, "the .so.sym entry is collected");
         assert_eq!(libs[0].name, "arm64-v8a/libsymbol1.so.sym");
         assert_eq!(
@@ -220,6 +227,39 @@ mod tests {
         );
         assert_eq!(libs[0].arch, "arm64");
         assert_eq!(std::fs::read(&libs[0].path).unwrap(), elf_bytes);
+    }
+
+    #[test]
+    fn extract_libs_collects_extra_suffix_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("native-debug-symbols.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("arm64-v8a/libfoo.so", opts).unwrap();
+            zw.write_all(b"elf").unwrap();
+            zw.start_file("arm64-v8a/libbar.so.debug", opts).unwrap();
+            zw.write_all(b"elf").unwrap();
+            zw.finish().unwrap();
+        }
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let names = |extra: &ExtraSuffixes| -> Vec<String> {
+            extract_libs(&zip_path, &out, extra)
+                .unwrap()
+                .into_iter()
+                .map(|l| l.name)
+                .collect()
+        };
+        assert_eq!(names(&ExtraSuffixes::default()), ["arm64-v8a/libfoo.so"]);
+        let extra = ExtraSuffixes::parse(&["so.debug".to_string()]).unwrap();
+        assert_eq!(
+            names(&extra),
+            ["arm64-v8a/libfoo.so", "arm64-v8a/libbar.so.debug"],
+            "extra suffixes ADD to the built-in ones"
+        );
     }
 
     #[test]
@@ -242,7 +282,7 @@ mod tests {
         let out = dir.path().join("out");
         std::fs::create_dir_all(&out).unwrap();
 
-        let libs = extract_libs(&zip_path, &out).unwrap();
+        let libs = extract_libs(&zip_path, &out, &ExtraSuffixes::default()).unwrap();
         assert_eq!(libs.len(), 1, "only the .so entry is collected");
         assert_eq!(libs[0].name, "arm64-v8a/libfoo.so");
         assert_eq!(libs[0].build_id, None, "non-ELF content yields no build-id");

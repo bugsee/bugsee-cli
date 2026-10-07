@@ -6,6 +6,7 @@ use walkdir::WalkDir;
 
 use crate::compress::{self, Strategy, ZipEntry};
 use crate::error::{config_invalid, input_invalid, input_not_found};
+use crate::symbols::suffix::ExtraSuffixes;
 use crate::symbols::{dsym, elf, il2cpp_linemap, pdb, proguard, rust, sourcemap};
 use crate::upload::http::{self, RetryPolicy};
 use crate::upload::presigned;
@@ -131,6 +132,28 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         strip_sources_content: bool,
 
+        /// Also pick up files whose name ends in SUFFIX, in addition to the names the
+        /// chosen `--type` already recognizes. Repeat the flag or comma-separate values;
+        /// a missing leading `.` is added (`so.sym` = `.so.sym`).
+        ///
+        /// For a toolchain that starts emitting a new spelling before the CLI learns it.
+        /// The suffix is matched against the end of the whole name, so multi-part suffixes
+        /// such as `.so.sym` work. It only widens the NAME match: each type's content check
+        /// still applies to what it picks up.
+        ///
+        /// Per type: `elf` — entries in the native-debug-symbols zip (built in: `.so`,
+        /// `.so.dbg`, `.so.sym`; each still needs a GNU build-id). `proguard` — files in a
+        /// scanned directory (built in: `mapping*.txt`). `sourcemaps` — files in a scanned
+        /// directory (built in: `.map`). `pdb` — files in a scanned directory, compared
+        /// case-insensitively (built in: `.pdb`; each still needs the MSF container
+        /// magic). `dsym` — bundle directories (built in: `.dSYM`; each still needs
+        /// `Contents/Resources/DWARF`). `rust` — `.dSYM`-style bundle directories only:
+        /// files are already identified by content whatever their name.
+        /// `il2cpp-linemap` — files taken as the mappings JSON (built in:
+        /// `LineNumberMappings.json`), with siblings resolved next to them.
+        #[arg(long = "extension", value_name = "SUFFIX", value_delimiter = ',')]
+        extensions: Vec<String>,
+
         /// Dry-run — discover and pack files but skip the HTTP upload.
         #[arg(long)]
         dry_run: bool,
@@ -225,6 +248,7 @@ pub async fn dispatch(
             concurrency,
             allow_empty,
             strip_sources_content,
+            extensions,
             dry_run,
         } => {
             let kind = r#type.unwrap_or(DebugFileType::Proguard);
@@ -246,6 +270,10 @@ pub async fn dispatch(
             }
 
             let strategy = compress::resolve_strategy(no_zstd, zstd_level)?;
+            let extra = ExtraSuffixes::parse(&extensions)?;
+            if !extra.is_empty() {
+                tracing::info!(extensions = ?extra.as_slice(), "also matching extra file-name suffixes");
+            }
 
             // GNU build-ids (Android libil2cpp) are 40-hex, not UUID-shaped.
             // Only parse as Uuid for types that require a real UUID. `--uuid`
@@ -351,6 +379,7 @@ pub async fn dispatch(
                     &build,
                     uuid_for_elf,
                     force,
+                    &extra,
                     dry_run,
                 )
                 .await;
@@ -358,7 +387,8 @@ pub async fn dispatch(
 
             if kind == DebugFileType::Dsym {
                 return run_dsym_upload(
-                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, &extra,
+                    dry_run,
                 )
                 .await
                 .map(|_| ());
@@ -366,14 +396,16 @@ pub async fn dispatch(
 
             if kind == DebugFileType::Pdb {
                 return run_pdb_upload(
-                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, &extra,
+                    dry_run,
                 )
                 .await;
             }
 
             if kind == DebugFileType::Rust {
                 return run_rust_upload(
-                    &paths, &endpoint, &app_token, &version, &build, strategy, force, dry_run,
+                    &paths, &endpoint, &app_token, &version, &build, strategy, force, &extra,
+                    dry_run,
                 )
                 .await;
             }
@@ -392,6 +424,7 @@ pub async fn dispatch(
                     allow_empty,
                     dry_run,
                     strip_sources_content,
+                    &extra,
                 )
                 .await;
             }
@@ -409,6 +442,7 @@ pub async fn dispatch(
                     il2cpp_root.as_deref(),
                     strategy,
                     force,
+                    &extra,
                     dry_run,
                 )
                 .await;
@@ -423,6 +457,7 @@ pub async fn dispatch(
                 parsed_override,
                 icon.as_deref(),
                 strategy,
+                &extra,
                 dry_run,
             )
             .await
@@ -449,9 +484,10 @@ async fn run_proguard_upload(
     uuid_override: Option<Uuid>,
     icon: Option<&std::path::Path>,
     strategy: Strategy,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let candidates = discover_mappings(paths);
+    let candidates = discover_mappings(paths, extra);
     if candidates.is_empty() {
         return Err(input_not_found(format!(
             "no mapping files found under: {}",
@@ -573,7 +609,7 @@ async fn run_proguard_upload(
     Ok(())
 }
 
-fn discover_mappings(paths: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_mappings(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_file() {
@@ -590,7 +626,8 @@ fn discover_mappings(paths: &[PathBuf]) -> Vec<PathBuf> {
                 continue;
             }
             let name = entry.file_name().to_string_lossy();
-            if proguard::looks_like_mapping_filename(name.as_ref()) {
+            if proguard::looks_like_mapping_filename(name.as_ref()) || extra.matches(name.as_ref())
+            {
                 out.push(entry.into_path());
             }
         }
@@ -608,8 +645,9 @@ struct SourcemapCandidate {
 
 /// Discover `.map` source-map files under the given paths. Explicit file
 /// arguments are trusted as-is (regardless of extension) so a caller can point
-/// at a single non-`.map`-named map; directories are walked for `*.map`.
-fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<SourcemapCandidate> {
+/// at a single non-`.map`-named map; directories are walked for `*.map` and any
+/// `extra` suffix.
+fn discover_sourcemaps(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<SourcemapCandidate> {
     let mut out = Vec::new();
     for p in paths {
         if p.is_file() {
@@ -633,7 +671,9 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<SourcemapCandidate> {
             if !entry.file_type().is_file() {
                 continue;
             }
-            if entry.path().extension().and_then(|e| e.to_str()) == Some("map") {
+            if entry.path().extension().and_then(|e| e.to_str()) == Some("map")
+                || extra.matches_path(entry.path())
+            {
                 out.push(SourcemapCandidate {
                     path: entry.into_path(),
                     explicit: false,
@@ -651,7 +691,7 @@ fn discover_sourcemaps(paths: &[PathBuf]) -> Vec<SourcemapCandidate> {
 /// candidate confirmed by its MSF container magic rather than by extension —
 /// a Rust `*-pc-windows-msvc` build drops the PDB next to the `.exe` in
 /// `target/<profile>/`, alongside plenty of unrelated files.
-fn discover_pdbs(paths: &[PathBuf]) -> Vec<PathBuf> {
+fn discover_pdbs(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for p in paths {
@@ -673,10 +713,11 @@ fn discover_pdbs(paths: &[PathBuf]) -> Vec<PathBuf> {
             // Extension first (cheap), then confirm the container magic. The
             // comparison is case-insensitive: Windows filesystems are, and
             // older MSVC/CMake tooling emits `APP.PDB`.
-            if !ep
+            let named_pdb = ep
                 .extension()
                 .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("pdb"))
+                .is_some_and(|e| e.eq_ignore_ascii_case("pdb"));
+            if !(named_pdb || extra.matches_ignore_ascii_case(&entry.file_name().to_string_lossy()))
             {
                 continue;
             }
@@ -707,9 +748,10 @@ async fn run_pdb_upload(
     build: &str,
     strategy: Strategy,
     force: bool,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let candidates = discover_pdbs(paths);
+    let candidates = discover_pdbs(paths, extra);
     if candidates.is_empty() {
         return Err(input_not_found("no .pdb files found in the given paths"));
     }
@@ -826,9 +868,10 @@ async fn run_rust_upload(
     build: &str,
     strategy: Strategy,
     force: bool,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<()> {
-    let findings = rust::discover(paths);
+    let findings = rust::discover(paths, extra);
 
     tracing::info!(
         dsyms = findings.dsyms.len(),
@@ -860,6 +903,7 @@ async fn run_rust_upload(
             build,
             strategy,
             force,
+            extra,
             dry_run,
         )
         .await?;
@@ -873,6 +917,7 @@ async fn run_rust_upload(
             build,
             strategy,
             force,
+            extra,
             dry_run,
         )
         .await?;
@@ -997,12 +1042,15 @@ async fn run_rust_elf_upload(
 /// subdirectory). The recursive scan lets a caller point at an Xcode archive's
 /// `dSYMs/` folder (or a whole DerivedData tree) instead of enumerating bundles
 /// itself. De-duplicated.
-pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
-    fn is_dsym_bundle(p: &std::path::Path) -> bool {
+pub(crate) fn discover_dsyms(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<PathBuf> {
+    let has_dsym_name = |p: &std::path::Path| {
+        p.extension().and_then(|e| e.to_str()) == Some("dSYM") || extra.matches_path(p)
+    };
+    let is_dsym_bundle = |p: &std::path::Path| {
         p.is_dir()
-            && p.extension().and_then(|e| e.to_str()) == Some("dSYM")
+            && has_dsym_name(p)
             && p.join("Contents").join("Resources").join("DWARF").is_dir()
-    }
+    };
 
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
@@ -1010,7 +1058,7 @@ pub(crate) fn discover_dsyms(paths: &[PathBuf]) -> Vec<PathBuf> {
         // Explicit `.dSYM` bundle — trust it as-is (even if the DWARF subdir
         // is missing, so the caller gets a clear identify error later rather
         // than a silent skip).
-        if p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("dSYM") {
+        if p.is_dir() && has_dsym_name(p) {
             if seen.insert(p.clone()) {
                 out.push(p.clone());
             }
@@ -1097,6 +1145,7 @@ async fn run_elf_upload(
     build: &str,
     build_uuid: Uuid,
     force: bool,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     if paths.is_empty() {
@@ -1148,7 +1197,7 @@ async fn run_elf_upload(
     for archive in paths {
         tracing::info!(path = %archive.display(), "processing native-debug-symbols archive");
         let work_dir = tempfile::tempdir()?;
-        let libs = elf::extract_libs(archive, work_dir.path())?;
+        let libs = elf::extract_libs(archive, work_dir.path(), extra)?;
         let total = libs.len();
 
         // A `.so` with no GNU build-id can never be matched at crash time, so
@@ -1178,6 +1227,16 @@ async fn run_elf_upload(
                 "dry-run: would register + upload {} libraries from {}",
                 uploadable.len(),
                 archive.display()
+            );
+            continue;
+        }
+        if total == 0 {
+            // Nothing even matched by name — the one case `--extension` fixes.
+            tracing::warn!(
+                archive = %archive.display(),
+                "no entries named .so / .so.dbg / .so.sym (or an --extension suffix) — \
+                 nothing to upload. If your toolchain emits another suffix, pass it \
+                 with --extension"
             );
             continue;
         }
@@ -1326,10 +1385,11 @@ async fn run_il2cpp_linemap_upload(
     il2cpp_root: Option<&Path>,
     strategy: Strategy,
     force: bool,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let uuids = il2cpp_linemap::parse_uuids(uuid_args)?;
-    let bundles = il2cpp_linemap::discover(paths);
+    let bundles = il2cpp_linemap::discover(paths, extra);
     il2cpp_linemap::require_bundles(paths, &bundles)?;
 
     if bundles.len() > 1 {
@@ -1589,6 +1649,7 @@ async fn run_sourcemap_upload(
     allow_empty: bool,
     dry_run: bool,
     strip_sources_content: bool,
+    extra: &ExtraSuffixes,
 ) -> anyhow::Result<()> {
     // A path that does not exist is a typo, not an empty build: it must not be swallowed by
     // `--allow-empty`, and naming it beats the "no .map files found under …" it used to produce.
@@ -1601,7 +1662,7 @@ async fn run_sourcemap_upload(
         }
     }
 
-    let candidates = discover_sourcemaps(paths);
+    let candidates = discover_sourcemaps(paths, extra);
     if candidates.is_empty() {
         if allow_empty {
             tracing::info!("no .map source-map files found — nothing to upload (--allow-empty)");
@@ -1939,9 +2000,10 @@ pub(crate) async fn run_dsym_upload(
     build: &str,
     strategy: Strategy,
     force: bool,
+    extra: &ExtraSuffixes,
     dry_run: bool,
 ) -> anyhow::Result<DsymUploadSummary> {
-    let candidates = discover_dsyms(paths);
+    let candidates = discover_dsyms(paths, extra);
     if candidates.is_empty() {
         return Err(input_not_found(format!(
             "no .dSYM bundles found under: {}",
@@ -2106,7 +2168,7 @@ mod sourcemap_upload_tests {
         std::fs::create_dir(tmp.path().join("sub")).unwrap();
         write(&tmp.path().join("sub"), "c.map", b"{}");
 
-        let mut found = discover_sourcemaps(&[tmp.path().to_path_buf()]);
+        let mut found = discover_sourcemaps(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         found.sort_by(|a, b| a.path.cmp(&b.path));
         assert!(found.iter().all(|c| !c.explicit), "walked, not named");
         let names: Vec<_> = found
@@ -2121,7 +2183,8 @@ mod sourcemap_upload_tests {
 
         // An explicit non-.map file is trusted as-is.
         let explicit = write(tmp.path(), "weird-name", b"{}");
-        let found2 = discover_sourcemaps(std::slice::from_ref(&explicit));
+        let found2 =
+            discover_sourcemaps(std::slice::from_ref(&explicit), &ExtraSuffixes::default());
         assert_eq!(
             found2,
             vec![SourcemapCandidate {
@@ -2170,6 +2233,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -2258,6 +2322,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap_err();
@@ -2290,6 +2355,7 @@ mod sourcemap_upload_tests {
             false,
             true,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -2401,6 +2467,7 @@ mod sourcemap_upload_tests {
             tweak.allow_empty,
             tweak.dry_run,
             tweak.strip_sources_content,
+            &ExtraSuffixes::default(),
         )
         .await
     }
@@ -2538,6 +2605,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap_err();
@@ -2575,6 +2643,7 @@ mod sourcemap_upload_tests {
                 false,
                 dry_run,
                 false,
+                &ExtraSuffixes::default(),
             )
             .await
             .unwrap_err();
@@ -2660,6 +2729,7 @@ mod sourcemap_upload_tests {
             Some("33333333-3333-3333-3333-333333333333".parse().unwrap()),
             None,
             Strategy::Zstd(11),
+            &ExtraSuffixes::default(),
             false,
         )
         .await
@@ -2765,6 +2835,7 @@ mod sourcemap_upload_tests {
                 false,
                 false,
                 false,
+                &ExtraSuffixes::default(),
             )
             .await
             .unwrap();
@@ -2806,6 +2877,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3016,6 +3088,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3184,6 +3257,7 @@ mod sourcemap_upload_tests {
             false,
             true,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3245,6 +3319,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             true,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3288,6 +3363,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             true,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3362,6 +3438,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             true,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3466,6 +3543,7 @@ mod sourcemap_upload_tests {
             false,
             false,
             true,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap();
@@ -3560,7 +3638,7 @@ mod sourcemap_upload_tests {
         }
         write(&tmp.path().join("m"), "b.js.map", b"{}");
 
-        let found = discover_sourcemaps(&[tmp.path().to_path_buf()]);
+        let found = discover_sourcemaps(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         let rel: Vec<_> = found
             .iter()
             .map(|c| {
@@ -3590,6 +3668,7 @@ mod sourcemap_upload_tests {
             false,
             true,
             false,
+            &ExtraSuffixes::default(),
         )
         .await
         .unwrap_err();
@@ -3631,7 +3710,7 @@ mod dsym_discovery_tests {
         std::fs::create_dir_all(tmp.path().join("NotADsym")).unwrap();
         std::fs::write(tmp.path().join("readme.txt"), b"x").unwrap();
 
-        let found = discover_dsyms(&[tmp.path().to_path_buf()]);
+        let found = discover_dsyms(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(names(&found), vec!["App.dSYM", "Framework.dSYM"]);
     }
 
@@ -3639,7 +3718,10 @@ mod dsym_discovery_tests {
     fn explicit_dsym_path_is_taken_as_is() {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = make_dsym(tmp.path(), "Direct");
-        assert_eq!(discover_dsyms(std::slice::from_ref(&bundle)), vec![bundle]);
+        assert_eq!(
+            discover_dsyms(std::slice::from_ref(&bundle), &ExtraSuffixes::default()),
+            vec![bundle]
+        );
     }
 
     #[test]
@@ -3649,7 +3731,10 @@ mod dsym_discovery_tests {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = tmp.path().join("Empty.dSYM");
         std::fs::create_dir_all(&bundle).unwrap();
-        assert_eq!(discover_dsyms(std::slice::from_ref(&bundle)), vec![bundle]);
+        assert_eq!(
+            discover_dsyms(std::slice::from_ref(&bundle), &ExtraSuffixes::default()),
+            vec![bundle]
+        );
     }
 
     #[test]
@@ -3659,7 +3744,7 @@ mod dsym_discovery_tests {
         let tmp = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(tmp.path().join("Bogus.dSYM")).unwrap();
         make_dsym(tmp.path(), "Real");
-        let found = discover_dsyms(&[tmp.path().to_path_buf()]);
+        let found = discover_dsyms(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(names(&found), vec!["Real.dSYM"]);
     }
 
@@ -3668,7 +3753,10 @@ mod dsym_discovery_tests {
         let tmp = tempfile::tempdir().unwrap();
         let bundle = make_dsym(tmp.path(), "Once");
         // Pass both the containing folder (walk finds it) and the explicit bundle.
-        let found = discover_dsyms(&[tmp.path().to_path_buf(), bundle.clone()]);
+        let found = discover_dsyms(
+            &[tmp.path().to_path_buf(), bundle.clone()],
+            &ExtraSuffixes::default(),
+        );
         assert_eq!(found.iter().filter(|p| **p == bundle).count(), 1);
     }
 
@@ -3677,7 +3765,9 @@ mod dsym_discovery_tests {
         let tmp = tempfile::tempdir().unwrap();
         let f = tmp.path().join("a.txt");
         std::fs::write(&f, b"x").unwrap();
-        assert!(discover_dsyms(&[f, tmp.path().join("nope")]).is_empty());
+        assert!(
+            discover_dsyms(&[f, tmp.path().join("nope")], &ExtraSuffixes::default()).is_empty()
+        );
     }
 }
 
@@ -3738,6 +3828,7 @@ mod rust_upload_tests {
                 "1",
                 Strategy::Zstd(11),
                 force,
+                &ExtraSuffixes::default(),
                 false,
             )
             .await
@@ -3792,6 +3883,7 @@ mod rust_upload_tests {
             "42",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             false,
         )
         .await
@@ -3860,6 +3952,7 @@ mod rust_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             false,
         )
         .await
@@ -3882,6 +3975,7 @@ mod rust_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             true,
         )
         .await
@@ -3917,7 +4011,7 @@ mod rust_upload_tests {
 
         // Dry-run: the dSYM stub is not a parseable Mach-O, so this asserts
         // routing + discovery without depending on a real fat binary fixture.
-        let findings = rust::discover(&[tmp.path().to_path_buf()]);
+        let findings = rust::discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(findings.elves.len(), 1);
         assert_eq!(findings.pdbs.len(), 1);
         assert_eq!(findings.dsyms.len(), 1);
@@ -3937,6 +4031,7 @@ mod rust_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             true,
         )
         .await
@@ -3995,8 +4090,28 @@ mod pdb_upload_tests {
         )
         .unwrap();
 
-        let found = discover_pdbs(&[tmp.path().to_path_buf()]);
+        let found = discover_pdbs(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(names(&found), vec!["OTHER.PDB", "app.pdb", "nested.pdb"]);
+    }
+
+    #[test]
+    fn extra_suffix_widens_the_name_match_but_the_magic_still_decides() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_pdb(tmp.path(), "app.pdb");
+        write_pdb(tmp.path(), "APP.DBGPDB");
+        // Matches the suffix, not an MSF container.
+        std::fs::write(tmp.path().join("notes.dbgpdb"), b"just text").unwrap();
+
+        let without = discover_pdbs(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
+        assert_eq!(names(&without), vec!["app.pdb"]);
+
+        let extra = ExtraSuffixes::parse(&[".dbgpdb".to_string()]).unwrap();
+        let with = discover_pdbs(&[tmp.path().to_path_buf()], &extra);
+        assert_eq!(
+            names(&with),
+            vec!["APP.DBGPDB", "app.pdb"],
+            "case-insensitive like the built-in `.pdb`, and confirmed by the magic"
+        );
     }
 
     #[test]
@@ -4007,9 +4122,15 @@ mod pdb_upload_tests {
         // clear parse error instead of a silent skip.
         let odd = tmp.path().join("no-extension");
         std::fs::write(&odd, b"not a container").unwrap();
-        assert_eq!(discover_pdbs(std::slice::from_ref(&odd)), vec![odd]);
+        assert_eq!(
+            discover_pdbs(std::slice::from_ref(&odd), &ExtraSuffixes::default()),
+            vec![odd]
+        );
 
-        let found = discover_pdbs(&[tmp.path().to_path_buf(), pdb.clone()]);
+        let found = discover_pdbs(
+            &[tmp.path().to_path_buf(), pdb.clone()],
+            &ExtraSuffixes::default(),
+        );
         assert_eq!(found.iter().filter(|p| **p == pdb).count(), 1);
     }
 
@@ -4047,6 +4168,7 @@ mod pdb_upload_tests {
             "42",
             Strategy::Zstd(11),
             force,
+            &ExtraSuffixes::default(),
             false,
         )
         .await
@@ -4121,6 +4243,7 @@ mod pdb_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             true,
         )
         .await
@@ -4138,6 +4261,7 @@ mod pdb_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             true,
         )
         .await
@@ -4161,6 +4285,7 @@ mod pdb_upload_tests {
             "1",
             Strategy::Zstd(11),
             false,
+            &ExtraSuffixes::default(),
             true,
         )
         .await
@@ -4170,5 +4295,99 @@ mod pdb_upload_tests {
             Some(Error::InputInvalid(_))
         ));
         assert_eq!(classify(&err), ExitCode::InputInvalid);
+    }
+}
+
+/// `--extension` for the name-matched types whose discovery lives in this file.
+/// (`pdb` is covered next to its fixtures above; `elf`, `rust` and
+/// `il2cpp-linemap` next to their own discovery.)
+#[cfg(test)]
+mod extra_suffix_discovery_tests {
+    use super::*;
+
+    fn extra(values: &[&str]) -> ExtraSuffixes {
+        ExtraSuffixes::parse(&values.iter().map(|s| s.to_string()).collect::<Vec<_>>()).unwrap()
+    }
+
+    fn sorted_names(paths: impl IntoIterator<Item = PathBuf>) -> Vec<String> {
+        let mut n: Vec<String> = paths
+            .into_iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    }
+
+    #[test]
+    fn proguard_picks_up_extra_suffix_alongside_built_in_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["mapping.txt", "r8-release.map.txt", "unrelated.txt"] {
+            std::fs::write(tmp.path().join(name), b"a -> b:\n").unwrap();
+        }
+        let root = vec![tmp.path().to_path_buf()];
+
+        assert_eq!(
+            sorted_names(discover_mappings(&root, &ExtraSuffixes::default())),
+            vec!["mapping.txt"]
+        );
+        assert_eq!(
+            sorted_names(discover_mappings(&root, &extra(&[".map.txt"]))),
+            vec!["mapping.txt", "r8-release.map.txt"]
+        );
+    }
+
+    #[test]
+    fn sourcemaps_pick_up_extra_suffix_alongside_dot_map() {
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["app.js.map", "main.jsbundle.sourcemap", "app.js"] {
+            std::fs::write(tmp.path().join(name), b"{}").unwrap();
+        }
+        let root = vec![tmp.path().to_path_buf()];
+        let names = |found: Vec<SourcemapCandidate>| {
+            assert!(found.iter().all(|c| !c.explicit), "walked, not explicit");
+            sorted_names(found.into_iter().map(|c| c.path))
+        };
+
+        assert_eq!(
+            names(discover_sourcemaps(&root, &ExtraSuffixes::default())),
+            vec!["app.js.map"]
+        );
+        assert_eq!(
+            names(discover_sourcemaps(&root, &extra(&["sourcemap"]))),
+            vec!["app.js.map", "main.jsbundle.sourcemap"]
+        );
+    }
+
+    #[test]
+    fn dsyms_pick_up_extra_suffix_bundles_that_still_have_dwarf() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = |name: &str, dwarf: bool| {
+            let b = tmp.path().join(name);
+            if dwarf {
+                std::fs::create_dir_all(b.join("Contents/Resources/DWARF")).unwrap();
+            } else {
+                std::fs::create_dir_all(&b).unwrap();
+            }
+            b
+        };
+        bundle("App.dSYM", true);
+        let custom = bundle("App.symbols", true);
+        bundle("Empty.symbols", false);
+        let root = vec![tmp.path().to_path_buf()];
+
+        assert_eq!(
+            sorted_names(discover_dsyms(&root, &ExtraSuffixes::default())),
+            vec!["App.dSYM"]
+        );
+        assert_eq!(
+            sorted_names(discover_dsyms(&root, &extra(&[".symbols"]))),
+            vec!["App.dSYM", "App.symbols"],
+            "a suffix match without Contents/Resources/DWARF is not a bundle"
+        );
+        // An explicit bundle with the custom suffix is trusted as-is, like `.dSYM`.
+        assert_eq!(
+            discover_dsyms(std::slice::from_ref(&custom), &extra(&[".symbols"])),
+            vec![custom]
+        );
     }
 }

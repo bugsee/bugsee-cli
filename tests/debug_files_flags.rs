@@ -329,3 +329,43 @@ mod register_only_build {
             .stderr(contains("artifact does not exist"));
     }
 }
+
+/// An `--extension` that would match everything (empty) or nothing (a path) is a
+/// caller-configuration mistake, for every type.
+#[test]
+fn invalid_extension_is_config_invalid() {
+    let tmp = tempfile::tempdir().unwrap();
+    for (kind, bad) in [
+        ("proguard", ""),
+        ("sourcemaps", "."),
+        ("dsym", "dir/x.dSYM"),
+        ("elf", ""),
+    ] {
+        upload(
+            kind,
+            &[&format!("--extension={bad}"), tmp.path().to_str().unwrap()],
+        )
+        .assert()
+        .code(CONFIG_INVALID)
+        .stderr(contains("--extension value"));
+    }
+}
+
+/// Repeated and comma-separated spellings both parse, for any type.
+#[test]
+fn extension_accepts_repeated_and_comma_separated_values() {
+    let tmp = tempfile::tempdir().unwrap();
+    upload(
+        "sourcemaps",
+        &[
+            "--allow-empty",
+            "--extension",
+            "sourcemap,.jsmap",
+            "--extension",
+            "bundle.map",
+            tmp.path().to_str().unwrap(),
+        ],
+    )
+    .assert()
+    .success();
+}

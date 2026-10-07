@@ -174,3 +174,59 @@ async fn elf_force_overwrites_a_library_already_on_the_server() {
     assert_eq!(posts[1]["overwrite"], true);
     assert_eq!(posts[1]["uuid"], FIXTURE_BUILD_ID);
 }
+
+/// `--extension` lets a caller pick up a symbol spelling the CLI does not know
+/// yet: the entry is keyed by its real build-id exactly like a `.so`. Without
+/// the flag the same archive uploads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_picks_up_an_extra_suffix_entry() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so.debug");
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .and(body_string_contains(FIXTURE_BUILD_ID))
+        .and(body_string_contains("breakpad"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(1) // only the run WITH --extension registers anything
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let zip = zip_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let run = |extra: &[&str]| {
+            let mut c = common::cli();
+            c.args([
+                "--endpoint",
+                &endpoint,
+                "--app-token",
+                "TKN",
+                "debug-files",
+                "upload",
+                "--type",
+                "elf",
+                "--version",
+                "1.0",
+                "--build",
+                "1",
+                "--uuid",
+                "00000000-0000-0000-0000-000000000000",
+            ]);
+            c.args(extra).arg(&zip).assert().success();
+        };
+        run(&[]);
+        run(&["--extension", "so.debug"]);
+    })
+    .await
+    .unwrap();
+}
