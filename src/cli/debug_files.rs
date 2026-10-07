@@ -91,10 +91,15 @@ pub enum DebugFilesCommand {
         /// Force a re-upload even if the server already has the symbol. Without
         /// it, a symbol the server already has is skipped (exit 0) and the rest
         /// of the batch continues. Applies to `--type dsym`, `--type pdb`,
-        /// `--type rust` (when those declare identity up front),
-        /// `--type il2cpp-linemap` and `--type sourcemaps` — sets `overwrite` on
-        /// the metadata POST so format-scoped peers are replaced. Proguard and
-        /// elf ignore this flag today.
+        /// `--type elf`, `--type rust`, `--type il2cpp-linemap` and
+        /// `--type sourcemaps` — sets `overwrite` on the metadata POST so
+        /// format-scoped peers are replaced. Proguard ignores this flag today.
+        ///
+        /// For `--type elf` this is how richer symbols replace poorer ones: an
+        /// AGP `SYMBOL_TABLE` upload (`.so.sym`, function names only) and a later
+        /// `FULL` one (`.so.dbg`, with line info) of the same library share its
+        /// GNU build-id, so without `--force` the `FULL` upload is skipped as
+        /// already present.
         #[arg(long)]
         force: bool,
 
@@ -345,6 +350,7 @@ pub async fn dispatch(
                     &version,
                     &build,
                     uuid_for_elf,
+                    force,
                     dry_run,
                 )
                 .await;
@@ -879,6 +885,7 @@ async fn run_rust_upload(
             version,
             build,
             strategy,
+            force,
             dry_run,
         )
         .await?;
@@ -906,6 +913,7 @@ async fn run_rust_elf_upload(
     version: &str,
     build: &str,
     strategy: Strategy,
+    force: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     let client = if dry_run {
@@ -956,7 +964,7 @@ async fn run_rust_elf_upload(
             transform: Some("breakpad"),
             format: Some("elf"),
             uuids: None,
-            overwrite: None,
+            overwrite: if force { Some(true) } else { None },
         };
         let outcome = presigned::upload(
             client.as_ref().expect("client built when not dry-run"),
@@ -1077,8 +1085,10 @@ struct ElfUploadCtx<'a> {
     version: &'a str,
     build: &'a str,
     strategy: Strategy,
+    force: bool,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_elf_upload(
     paths: &[PathBuf],
     endpoint: &str,
@@ -1086,6 +1096,7 @@ async fn run_elf_upload(
     version: &str,
     build: &str,
     build_uuid: Uuid,
+    force: bool,
     dry_run: bool,
 ) -> anyhow::Result<()> {
     if paths.is_empty() {
@@ -1123,10 +1134,15 @@ async fn run_elf_upload(
         version,
         build,
         strategy,
+        force,
     };
 
     let mut uploaded = 0u32;
     let mut already_existed = 0u32;
+    // Skipped libraries that carry full debug info (`.so` / `.so.dbg`). The
+    // server dedups on build-id alone, so one of these may have been skipped in
+    // favour of an earlier `SYMBOL_TABLE` (`.so.sym`) upload of the same library.
+    let mut full_already_existed = 0u32;
     let mut skipped_no_build_id = 0u32;
 
     for archive in paths {
@@ -1176,21 +1192,30 @@ async fn run_elf_upload(
         let client = client.as_ref().expect("client constructed when !dry_run");
 
         // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
-        let outcomes: Vec<anyhow::Result<presigned::Outcome>> =
+        let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
             futures_util::stream::iter(uploadable)
                 .map(|lib| {
                     let client = client.clone();
                     let work = work_dir.path().to_path_buf();
-                    async move { upload_one_so(&client, ctx, &lib, &work).await }
+                    async move {
+                        let symbol_table_only = lib.name.ends_with(".so.sym");
+                        let outcome = upload_one_so(&client, ctx, &lib, &work).await;
+                        (symbol_table_only, outcome)
+                    }
                 })
                 .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
                 .collect()
                 .await;
 
-        for outcome in outcomes {
+        for (symbol_table_only, outcome) in outcomes {
             match outcome? {
                 presigned::Outcome::Uploaded => uploaded += 1,
-                presigned::Outcome::AlreadyExists => already_existed += 1,
+                presigned::Outcome::AlreadyExists => {
+                    already_existed += 1;
+                    if !symbol_table_only {
+                        full_already_existed += 1;
+                    }
+                }
             }
         }
     }
@@ -1204,6 +1229,18 @@ async fn run_elf_upload(
             skipped_no_build_id,
             "native upload complete"
         );
+        // Never overwrite automatically: that would re-upload every unchanged
+        // library on every build. The CLI cannot see what the server holds, so
+        // say how to replace it when that is what the caller wants.
+        if full_already_existed > 0 && !force {
+            tracing::info!(
+                libraries = full_already_existed,
+                "full-debug-info libraries were skipped as already on the server; if \
+                 they were previously uploaded with ndk.debugSymbolLevel = \
+                 'SYMBOL_TABLE' (.so.sym, no line info), re-run with --force to \
+                 replace them"
+            );
+        }
     }
     Ok(())
 }
@@ -1250,7 +1287,7 @@ async fn upload_one_so(
         transform: Some("breakpad"),
         format: Some("elf"),
         uuids: None,
-        overwrite: None,
+        overwrite: if ctx.force { Some(true) } else { None },
     };
     let outcome = presigned::upload(
         client,
@@ -3669,6 +3706,55 @@ mod rust_upload_tests {
         let p = dir.join(name);
         std::fs::write(&p, bytes).unwrap();
         p
+    }
+
+    /// `--force` reaches the wire as `overwrite` for a Rust ELF too (it was
+    /// dropped on this path while dSYM and PDB honoured it), and stays absent
+    /// without the flag.
+    #[tokio::test]
+    async fn elf_force_asks_the_server_to_overwrite() {
+        for force in [false, true] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_elf(tmp.path(), "myapp");
+            let server = MockServer::start().await;
+            let put_url = format!("{}/elf-put", server.uri());
+            Mock::given(method("POST"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "code": 0, "endpoint": put_url
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+
+            let uri = server.uri();
+            run_rust_upload(
+                &[tmp.path().to_path_buf()],
+                &uri,
+                "TKN",
+                "1",
+                "1",
+                Strategy::Zstd(11),
+                force,
+                false,
+            )
+            .await
+            .unwrap();
+
+            let received = server.received_requests().await.unwrap();
+            let post = received
+                .iter()
+                .find(|r| r.method.as_str() == "POST")
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&post.body).unwrap();
+            if force {
+                assert_eq!(body["overwrite"], true, "{body}");
+            } else {
+                assert!(body.get("overwrite").is_none(), "{body}");
+            }
+        }
     }
 
     /// An ELF binary keyed by its own build-id, packed as a single Zstd entry

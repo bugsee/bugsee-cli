@@ -2,7 +2,8 @@
 //!
 //! The caller hands the CLI an already-packaged `native-debug-symbols.zip`
 //! (the artifact AGP writes under `build/outputs/native-debug-symbols/
-//! <variant>/`). We open it and, for EACH `.so`, read the GNU build-id
+//! <variant>/`). We open it and, for EACH `.so` (or the `.so.dbg` / `.so.sym`
+//! variants, depending on `ndk.debugSymbolLevel`), read the GNU build-id
 //! (`code_id`) via `symbolic-debuginfo` — the SAME crate family (major 13) the
 //! worker uses, so the identifier is byte-identical producer↔consumer.
 //!
@@ -78,8 +79,7 @@ pub fn extract_libs(archive_path: &Path, out_dir: &Path) -> std::io::Result<Vec<
             continue;
         }
         let name = entry.name().to_string();
-        // AGP packs unstripped `.so` (and occasionally `.so.dbg`) debug objects.
-        if !(name.ends_with(".so") || name.ends_with(".so.dbg")) {
+        if !is_native_lib_entry(&name) {
             continue;
         }
 
@@ -103,6 +103,17 @@ pub fn extract_libs(archive_path: &Path, out_dir: &Path) -> std::io::Result<Vec<
         });
     }
     Ok(libs)
+}
+
+/// Whether a `native-debug-symbols.zip` entry is a native library to upload.
+/// The suffix depends on AGP's `ndk.debugSymbolLevel`: `FULL` packs unstripped
+/// `.so` (occasionally `.so.dbg`), while `SYMBOL_TABLE` packs `.so.sym` — an
+/// ELF that still carries `.note.gnu.build-id`, so it is keyed the same way
+/// (function names only; no line info).
+fn is_native_lib_entry(name: &str) -> bool {
+    [".so", ".so.dbg", ".so.sym"]
+        .iter()
+        .any(|suffix| name.ends_with(suffix))
 }
 
 /// Parse the first ELF object's GNU build-id (`code_id`) + arch. Returns
@@ -166,6 +177,49 @@ mod tests {
             Some("bca64abfec40dbb631bb8f1c37414472")
         );
         assert_eq!(arch, "arm64");
+    }
+
+    #[test]
+    fn is_native_lib_entry_accepts_every_agp_symbol_level_suffix() {
+        assert!(is_native_lib_entry("arm64-v8a/libfoo.so"));
+        assert!(is_native_lib_entry("arm64-v8a/libfoo.so.dbg"));
+        assert!(is_native_lib_entry("arm64-v8a/libfoo.so.sym"));
+        assert!(!is_native_lib_entry("manifest.json"));
+        assert!(!is_native_lib_entry("arm64-v8a/libfoo.so.txt"));
+        assert!(!is_native_lib_entry("arm64-v8a/libfoo.sym"));
+    }
+
+    #[test]
+    fn extract_libs_keys_symbol_table_so_sym_by_build_id() {
+        // AGP `ndk.debugSymbolLevel = 'SYMBOL_TABLE'` packs ONLY `<abi>/lib*.so.sym`.
+        // Before #61 every such entry was dropped and the upload silently sent
+        // nothing. A `.so.sym` is an ELF with `.note.gnu.build-id`, so the
+        // real fixture's bytes under that name must key by its build-id.
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/elf/libsymbol1.so");
+        let elf_bytes = std::fs::read(&fixture).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let zip_path = dir.path().join("native-debug-symbols.zip");
+        {
+            let f = std::fs::File::create(&zip_path).unwrap();
+            let mut zw = zip::ZipWriter::new(f);
+            let opts = SimpleFileOptions::default();
+            zw.start_file("arm64-v8a/libsymbol1.so.sym", opts).unwrap();
+            zw.write_all(&elf_bytes).unwrap();
+            zw.finish().unwrap();
+        }
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+
+        let libs = extract_libs(&zip_path, &out).unwrap();
+        assert_eq!(libs.len(), 1, "the .so.sym entry is collected");
+        assert_eq!(libs[0].name, "arm64-v8a/libsymbol1.so.sym");
+        assert_eq!(
+            libs[0].build_id.as_deref(),
+            Some("bca64abfec40dbb631bb8f1c37414472")
+        );
+        assert_eq!(libs[0].arch, "arm64");
+        assert_eq!(std::fs::read(&libs[0].path).unwrap(), elf_bytes);
     }
 
     #[test]
