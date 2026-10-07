@@ -31,6 +31,11 @@ const repoRoot = path.join(here, "..");
 
 const { PLATFORMS, artifactName } = require("./cli/lib/platforms.js");
 
+// Every package ships the repo's LICENSE and declares the same SPDX id as the
+// crate (Cargo.toml `license`), which is what the cargo-dist package uses.
+const LICENSE_ID = "MIT";
+const licenseFile = path.join(repoRoot, "LICENSE");
+
 function die(msg) {
   console.error(`error: ${msg}`);
   process.exit(1);
@@ -163,6 +168,7 @@ for (const [triple, platform] of Object.entries(PLATFORMS)) {
     homepage: "https://github.com/bugsee/bugsee-cli",
     repository: "https://github.com/bugsee/bugsee-cli",
     author: "Bugsee",
+    license: LICENSE_ID,
     // The whole mechanism: npm consults os/cpu before downloading an optional
     // dependency, so exactly one of the six is ever fetched.
     os: [platform.os],
@@ -172,8 +178,9 @@ for (const [triple, platform] of Object.entries(PLATFORMS)) {
     // Yarn PnP would otherwise keep this in a zip, where the binary cannot be
     // exec'd.
     preferUnplugged: true,
-    files: ["bin"],
+    files: ["bin", "LICENSE"],
   });
+  fs.copyFileSync(licenseFile, path.join(dir, "LICENSE"));
 
   fs.writeFileSync(
     path.join(dir, "README.md"),
@@ -195,6 +202,7 @@ fs.mkdirSync(frontDir, { recursive: true });
 for (const entry of ["bin", "lib", "scripts", "README.md"]) {
   copyDir(path.join(frontSrc, entry), path.join(frontDir, entry));
 }
+fs.copyFileSync(licenseFile, path.join(frontDir, "LICENSE"));
 
 const template = JSON.parse(
   fs.readFileSync(path.join(frontSrc, "package.json"), "utf8"),

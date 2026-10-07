@@ -85,3 +85,7 @@ an alias; **prefer `@bugsee/cli`** — it is the one that works under
 `--ignore-scripts`. See the
 [Distribution section](https://github.com/bugsee/bugsee-cli#distribution) for
 the shell installer, Homebrew tap, and the per-build-system bundles.
+
+## License
+
+[MIT](https://github.com/bugsee/bugsee-cli/blob/main/LICENSE) © Bugsee, Inc.

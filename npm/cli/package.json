@@ -13,6 +13,7 @@
   "homepage": "https://github.com/bugsee/bugsee-cli",
   "repository": "https://github.com/bugsee/bugsee-cli",
   "author": "Bugsee",
+  "license": "MIT",
   "bin": {
     "bugsee-cli": "bin/bugsee-cli.js"
   },
@@ -25,7 +26,8 @@
     "bin",
     "lib",
     "scripts",
-    "README.md"
+    "README.md",
+    "LICENSE"
   ],
   "scripts": {
     "postinstall": "node scripts/postinstall.js"
