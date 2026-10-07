@@ -249,38 +249,6 @@ pub async fn put_payload(
     Ok(())
 }
 
-/// The file's bytes in 64 KiB chunks. The file is opened lazily on first poll so
-/// an open error surfaces as a failed (retriable) request, not a panic.
-fn file_chunks(
-    path: std::path::PathBuf,
-) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
-    use tokio::io::AsyncReadExt;
-    enum St {
-        Unopened(std::path::PathBuf),
-        Open(tokio::fs::File),
-        Done,
-    }
-    futures_util::stream::unfold(St::Unopened(path), |st| async move {
-        let mut file = match st {
-            St::Unopened(p) => match tokio::fs::File::open(p).await {
-                Ok(f) => f,
-                Err(e) => return Some((Err(e), St::Done)),
-            },
-            St::Open(f) => f,
-            St::Done => return None,
-        };
-        let mut buf = vec![0u8; 64 * 1024];
-        match file.read(&mut buf).await {
-            Ok(0) => None,
-            Ok(n) => {
-                buf.truncate(n);
-                Some((Ok(buf), St::Open(file)))
-            }
-            Err(e) => Some((Err(e), St::Done)),
-        }
-    })
-}
-
 /// Run the two-stage presigned upload for a single symbol artifact
 /// ([`register`] then [`put_payload`]). The payload is always produced up
 /// front; callers that want to skip producing it when the server already has
