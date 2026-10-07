@@ -17,6 +17,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   partial set. See #69.
 
 ### Changed
+- **`debug-files upload --type il2cpp-linemap` validates `LineNumberMappings.json` before packing
+  it.** It is checked as a stream (these files run to tens of MB) against the shape the
+  symbolicator reads, `{cpp_path: {cs_path: {cpp_line: cs_line}}}` with non-negative integer line
+  numbers. A truncated, wrong or otherwise corrupt file now exits 11 naming the file and the
+  problem, in a dry run too, and uploads nothing; it used to upload "successfully" and leave every
+  IL2CPP crash unsymbolicated. The optional top-level `__debug-id__` sentinel is ignored, as the symbolicator ignores it. An empty map is still accepted (with a warning). Integrators that
+  treated this command's success as proof of a usable map can now rely on it.
 - **`--type elf` collects every input before uploading anything.** A corrupt second zip now aborts
   (exit 11) before the first zip uploads, instead of after. A path that does not exist now exits
   10 (input not found) rather than 11; both are in the no-fallback range.
