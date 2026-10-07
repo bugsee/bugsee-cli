@@ -6,9 +6,17 @@ mappings, JS source maps), resolves build-environment metadata, and uploads
 symbols to Bugsee.
 
 ```sh
+# Run once, without adding it to a project:
+npx @bugsee/cli --version
+
+# Or add it to a project, then run the `bugsee-cli` binary it provides:
 npm install --save-dev @bugsee/cli
 npx bugsee-cli --version
 ```
+
+`npx bugsee-cli` only works where `@bugsee/cli` is installed. Anywhere else npx
+looks for an unscoped package named `bugsee-cli`, which does not exist, and fails
+with `E404`. Use the scoped `npx @bugsee/cli` there.
 
 ## How the binary gets here
 

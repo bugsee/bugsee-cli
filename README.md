@@ -23,7 +23,9 @@ hint if needed. Override via env vars: `BUGSEE_CLI_VERSION` (pin an exact
 `X.Y.Z`), `BUGSEE_CLI_INSTALL_DIR` (install location), `BUGSEE_CLI_BASE_URL`
 (download root, e.g. an internal mirror). Keep it current afterwards with
 `bugsee-cli update` (same-major only). Other channels: npm (`@bugsee/cli` —
-`npm i -D @bugsee/cli && npx bugsee-cli --version`), a Homebrew tap, or the
+`npx @bugsee/cli --version` to run it once, or `npm i -D @bugsee/cli` and then
+`npx bugsee-cli` inside that project; a bare `npx bugsee-cli` anywhere else asks
+npm for an unscoped `bugsee-cli` package, which does not exist), a Homebrew tap, or the
 per-build-system bundles — see [Distribution](#distribution).
 
 ## Building
