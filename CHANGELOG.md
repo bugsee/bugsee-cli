@@ -31,6 +31,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   Peak RSS: `upload build` with a 300 MB artefact + 200 MB mapping 661 MB -> 32 MB, a 200 MB
   ProGuard mapping 241 MB -> 32 MB, an ELF zip of four 100 MB libraries 463 MB -> 36 MB. Wire
   format and exit codes unchanged.
+- **Source maps are streamed instead of parsed into a JSON tree.** Reading a map's debug-id,
+  stripping `sourcesContent` (`--strip-sources-content`, including nested indexed-map sections) and
+  `sourcemaps inject` rewriting a map's ids now walk the document with `struson`, and the inject
+  debug-id hash is computed incrementally instead of over a concatenated copy. Peak RSS for an
+  89 MB map: upload 183 MB -> 32 MB, `--strip-sources-content` 262 MB -> 32 MB, `inject` 298 MB ->
+  6 MB. Debug-ids are unchanged. Two byte-level differences: a stripped copy keeps the map's
+  original key order (it was alphabetical), and `inject` writes `debug_id` / `debugId` last. Both
+  are still valid maps; an invalid-UTF-8 map outside a string value now reports as invalid JSON
+  (exit 11) rather than I/O (exit 10).
 
 
 ## [0.7.13] - 2026-10-07

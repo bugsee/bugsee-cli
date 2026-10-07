@@ -1917,23 +1917,6 @@ fn is_stylesheet_or_declaration_map(path: &Path, extra: &ExtraSuffixes) -> bool 
         })
 }
 
-/// Remove every `sourcesContent` a source map can carry; `true` when one was there.
-///
-/// Not just the top-level key: an INDEXED map (spec §Index-Map) keeps its source inside
-/// `sections[i].map`, and those sections nest. Stripping only the top level left the source in the
-/// upload while reporting success — the flag's whole promise, failing silently.
-fn remove_sources_content(map: &mut serde_json::Map<String, serde_json::Value>) -> bool {
-    let mut removed = map.remove("sourcesContent").is_some();
-    if let Some(serde_json::Value::Array(sections)) = map.get_mut("sections") {
-        for section in sections {
-            if let Some(serde_json::Value::Object(inner)) = section.get_mut("map") {
-                removed |= remove_sources_content(inner);
-            }
-        }
-    }
-    removed
-}
-
 /// A copy of `map_path` with `sourcesContent` removed, plus its recomputed identity — or `None`
 /// when nothing needs stripping (flag off, no `sourcesContent`, or the map is not the JSON object we
 /// expect, which is a privacy preference's business to ignore rather than to fail over).
@@ -1952,40 +1935,42 @@ fn stripped_copy_without_sources(
     // Typed, not a bare `?` into anyhow: an I/O failure on the map must classify the way
     // `sourcemap::identify` classifies one on the SAME file moments earlier — exit 10, which
     // integrators are documented not to fall back on — rather than exit 1 ("unexpected").
-    let bytes = crate::symbols::mapped::map_file(map_path).map_err(crate::error::Error::Io)?;
-    let Ok(serde_json::Value::Object(mut map)) = serde_json::from_slice(&bytes) else {
-        return Ok(None);
-    };
-    if !remove_sources_content(&mut map) {
-        return Ok(None);
-    }
-    let stripped = serde_json::to_vec(&map).map_err(|e| {
-        input_invalid(format!(
-            "{}: could not re-serialize the map without its sources: {e}",
-            map_path.display()
-        ))
-    })?;
     let name = map_path
         .file_name()
         .map(Path::new)
         .unwrap_or_else(|| Path::new("bundle.js.map"));
     let out = tmpdir.join(name);
-    std::fs::write(&out, &stripped).map_err(crate::error::Error::Io)?;
+    // Streamed input -> output: only the dropped `sourcesContent` values (the bulk of a
+    // map) are never held, and nothing else is either, so memory is flat however big the map.
+    let before_bytes = std::fs::metadata(map_path)
+        .map_err(crate::error::Error::Io)?
+        .len();
+    let input =
+        std::io::BufReader::new(std::fs::File::open(map_path).map_err(crate::error::Error::Io)?);
+    let output =
+        std::io::BufWriter::new(std::fs::File::create(&out).map_err(crate::error::Error::Io)?);
+    match crate::inject::mapjson::strip_sources_content(input, output) {
+        Ok(true) => {}
+        // Nothing to strip, or not the JSON object we expect: the copy is moot.
+        Ok(false) | Err(crate::inject::mapjson::MapJsonError::Json(_)) => {
+            let _ = std::fs::remove_file(&out);
+            return Ok(None);
+        }
+        Err(crate::inject::mapjson::MapJsonError::Io(e)) => {
+            let _ = std::fs::remove_file(&out);
+            return Err(crate::error::Error::Io(e).into());
+        }
+    }
+    // The identity describes what is UPLOADED (the stripped copy): its streamed hash and size.
+    // The debug-id is carried over untouched: it is the key, and re-deriving it here would
+    // break the pair with the bundle that `sourcemaps inject` stamped.
+    let identity = sourcemap::identify(&out)?;
     tracing::info!(
         path = %map_path.display(),
-        before_bytes = bytes.len(),
-        after_bytes = stripped.len(),
+        before_bytes,
+        after_bytes = identity.size_bytes,
         "stripped sourcesContent from the uploaded copy"
     );
-    let identity = sourcemap::SourcemapIdentity {
-        debug_id: crate::inject::read_debug_id(&out)?,
-        content_sha1_hex: {
-            use sha1::Digest;
-            let digest: [u8; 20] = sha1::Sha1::digest(&stripped).into();
-            hex::encode(digest)
-        },
-        size_bytes: stripped.len() as u64,
-    };
     Ok(Some((out, identity)))
 }
 
@@ -3399,18 +3384,7 @@ mod sourcemap_upload_tests {
     }
 
     async fn uploaded_map_json(server: &MockServer) -> serde_json::Value {
-        let requests = server.received_requests().await.unwrap();
-        let put = requests
-            .iter()
-            .find(|r| r.method.as_str() == "PUT")
-            .expect("no PUT");
-        let mut archive =
-            zip::ZipArchive::new(std::io::Cursor::new(put.body.clone())).expect("not a zip");
-        assert_eq!(archive.len(), 1, "one entry: just the map");
-        let mut entry = archive.by_index(0).unwrap();
-        let mut body = String::new();
-        std::io::Read::read_to_string(&mut entry, &mut body).unwrap();
-        serde_json::from_str(&body).expect("uploaded map is not JSON")
+        serde_json::from_slice(&uploaded_map_bytes(server).await).expect("uploaded map is not JSON")
     }
 
     /// `sourcesContent` embeds the ORIGINAL SOURCE in the map, which is how symbolication shows
@@ -3495,14 +3469,17 @@ mod sourcemap_upload_tests {
                 .body,
         )
         .unwrap();
-        let uploaded = uploaded_map_json(&server).await;
+        let uploaded = uploaded_map_bytes(&server).await;
         let expected = {
             use sha1::Digest;
-            let digest: [u8; 20] =
-                sha1::Sha1::digest(serde_json::to_vec(&uploaded).unwrap()).into();
+            let digest: [u8; 20] = sha1::Sha1::digest(&uploaded).into();
             hex::encode(digest)
         };
         assert_eq!(post["hash"].as_str().unwrap(), expected);
+        assert!(
+            !String::from_utf8_lossy(&uploaded).contains("sourcesContent"),
+            "and the hash is of the STRIPPED bytes"
+        );
     }
 
     /// Without the flag, the source rides along exactly as before — that is what makes the
