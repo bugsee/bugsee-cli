@@ -583,6 +583,9 @@ fn elf_upload_empty_directory_is_input_not_found() {
 }
 
 /// The fixture with its GNU build-id's first byte flipped: same ELF, different identity.
+/// (Unix-only because its sole user is: an unused helper is a hard error under CI's
+/// `-D warnings` on Windows.)
+#[cfg(unix)]
 fn fixture_with_other_build_id() -> (Vec<u8>, String) {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
     let mut bytes = std::fs::read(&fixture).unwrap();
