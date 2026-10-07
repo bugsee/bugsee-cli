@@ -49,4 +49,43 @@ mod tests {
         assert!(map_file(&p).unwrap().is_empty());
         assert!(map_file(&dir.path().join("missing")).is_err());
     }
+
+    #[test]
+    fn a_directory_is_an_error_not_a_panic_or_empty_bytes() {
+        // `File::open` succeeds on a directory on Unix; mapping it must not.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(map_file(dir.path()).is_err());
+    }
+
+    #[test]
+    fn large_and_page_straddling_files_map_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [4095usize, 4096, 4097, 1_000_003] {
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let p = dir.path().join("f");
+            std::fs::write(&p, &data).unwrap();
+            let m = map_file(&p).unwrap();
+            assert_eq!(m.len(), len);
+            assert_eq!(&*m, &data[..]);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_file_is_a_permission_error() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("f");
+        std::fs::write(&p, b"secret").unwrap();
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::File::open(&p).is_ok(); // root ignores modes
+        let r = map_file(&p);
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o644)).unwrap();
+        if !readable {
+            assert_eq!(
+                r.err().unwrap().kind(),
+                std::io::ErrorKind::PermissionDenied
+            );
+        }
+    }
 }

@@ -324,6 +324,132 @@ def run(binpath, flow, args, expect_code=0, expect_stderr=None):
     return ok
 
 
+# --- Memory regression -------------------------------------------------------------------
+#
+# The CLI handles artefacts and symbol files of hundreds of MB and must do it in
+# bounded memory: stream, or map and look at headers, never hold a whole file (or
+# two) on the heap. A regression to `fs::read` is invisible to every functional
+# check, so run each large-input flow in a fresh process and bound its PEAK RSS.
+#
+# Inputs are ~96 MB; every flow must stay under MEM_LIMIT_MB. The budget is far above
+# the streaming cost (~30-40 MB: runtime + zstd encoders) and far below any whole-file
+# read (>= the input, doubled by a per-retry clone), so it is not flaky either way.
+MEM_INPUT_MB = 96
+MEM_LIMIT_MB = 64
+
+_RSS_WRAPPER = (
+    "import resource, subprocess, sys\n"
+    "r = subprocess.run(sys.argv[1:], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+    "print(r.returncode, resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss)\n"
+)
+
+
+def peak_rss_mb(argv, env):
+    """(exit code, peak RSS in MB) of `argv`, measured in a throwaway wrapper process so
+    RUSAGE_CHILDREN's maximum belongs to this command alone. None where RSS is unavailable."""
+    if sys.platform == "win32":
+        return None
+    r = subprocess.run([sys.executable, "-c", _RSS_WRAPPER] + argv, capture_output=True,
+                       text=True, env=env)
+    try:
+        rc, raw = r.stdout.split()
+        raw = int(raw)
+    except ValueError:
+        return None
+    # ru_maxrss is bytes on macOS, kilobytes on Linux.
+    return int(rc), raw / (1024 * 1024 if sys.platform == "darwin" else 1024)
+
+
+def _write_big(path, total_mb, block):
+    with open(path, "wb") as f:
+        for _ in range(total_mb):
+            f.write(block())
+
+
+def memory_checks(binpath, fix, results):
+    if sys.platform == "win32":
+        print("  [SKIP] memory checks (no RSS accounting on Windows)")
+        return
+    mem = os.path.join(fix, "memory")
+    os.makedirs(mem, exist_ok=True)
+    env = dict(os.environ, BUGSEE_APP_TOKEN=TOKEN)
+    endpoint = f"http://127.0.0.1:{STATE['port']}"
+    base = [binpath, "--endpoint", endpoint, "--app-token", TOKEN]
+    mb = 1024 * 1024
+
+    # Incompressible artefact (stored in the upload zip, so the PUT is ~its size).
+    artefact = os.path.join(mem, "app.aab")
+    _write_big(artefact, MEM_INPUT_MB, lambda: os.urandom(mb))
+    payload = os.path.join(mem, "p.json")
+    with open(payload, "w") as f:
+        json.dump({"uuid": "mem-build", "version": "1.0"}, f)
+    # A text mapping (compressible, like the real thing).
+    pg = os.path.join(mem, "pg")
+    os.makedirs(pg, exist_ok=True)
+    line = b"com.example.pkg.ClassNameNumber -> a.b:\n    int fieldName -> a\n"
+    _write_big(os.path.join(pg, "mapping.txt"), MEM_INPUT_MB, lambda: line * (mb // len(line)))
+    # Native libraries: the real ELF fixture (it has a GNU build-id) padded to ~32 MB each,
+    # three ABIs with distinct build-ids, in AGP's merged_native_libs layout.
+    fixture = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "tests",
+                           "fixtures", "elf", "libsymbol1.so")
+    elf = open(fixture, "rb").read()
+    bid = bytes.fromhex("bca64abfec40dbb631bb8f1c37414472")
+    pos = elf.index(bid)
+    for i, abi in enumerate(["arm64-v8a", "armeabi-v7a", "x86_64"]):
+        d = os.path.join(mem, "libs", "lib", abi)
+        os.makedirs(d, exist_ok=True)
+        lib = bytearray(elf)
+        lib[pos] ^= i + 1
+        with open(os.path.join(d, "libbig.so"), "wb") as f:
+            f.write(bytes(lib))
+            for _ in range(MEM_INPUT_MB // 3):
+                f.write(os.urandom(mb))
+    # A ~64 MB source map: a small `mappings` and a large `sourcesContent`.
+    maps = os.path.join(mem, "maps")
+    os.makedirs(maps, exist_ok=True)
+    with open(os.path.join(maps, "app.js.map"), "w") as f:
+        f.write('{"version":3,"debug_id":"44444444-4444-4444-4444-444444444444",'
+                '"sources":["a.ts"],"names":[],"mappings":"AAAA;","sourcesContent":["')
+        chunk = "x" * mb
+        for _ in range(MEM_INPUT_MB * 2 // 3):
+            f.write(chunk)
+        f.write('"]}')
+    # `sourcemaps inject` over the same map (the bundle stays small).
+    inj = os.path.join(mem, "inject")
+    os.makedirs(inj, exist_ok=True)
+    shutil.copy(os.path.join(maps, "app.js.map"), os.path.join(inj, "app.js.map"))
+    with open(os.path.join(inj, "app.js"), "w") as f:
+        f.write("console.log(1);\n")
+
+    flows = [
+        ("mem_artefact_put", base + ["upload", "build", "--payload-json", payload,
+                                     "--artifact", artefact]),
+        ("mem_proguard", base + ["debug-files", "upload", "--type", "proguard",
+                                 "--version", "1", "--build", "1", pg]),
+        ("mem_elf_directory", base + ["debug-files", "upload", "--type", "elf",
+                                      "--version", "1", "--build", "1",
+                                      "--uuid", "11111111-2222-3333-4444-555555555555",
+                                      os.path.join(mem, "libs")]),
+        ("mem_sourcemap", base + ["debug-files", "upload", "--type", "sourcemaps",
+                                  "--version", "1", "--build", "1", maps]),
+        ("mem_sourcemap_strip", base + ["debug-files", "upload", "--type", "sourcemaps",
+                                        "--strip-sources-content", "--version", "1",
+                                        "--build", "1", maps]),
+        ("mem_inject", [binpath, "sourcemaps", "inject", inj]),
+    ]
+    for flow, argv in flows:
+        STATE["flow"] = flow
+        got = peak_rss_mb(argv, env)
+        if got is None:
+            print(f"  [SKIP] {flow} (no RSS available)")
+            continue
+        rc, rss = got
+        ok = rc == 0 and rss < MEM_LIMIT_MB
+        print(f"  [{'PASS' if ok else 'FAIL'}] {flow}: exit {rc}, peak RSS {rss:.0f} MB "
+              f"(budget {MEM_LIMIT_MB} MB, input ~{MEM_INPUT_MB} MB)")
+        results[flow + "_bounded_memory"] = ok
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bin", required=True, help="path to bugsee-cli[.exe]")
@@ -596,6 +722,9 @@ def main():
     except Exception as e:
         print("  [FAIL] could not verify the register-only build:", e)
         results["build_register_only_ships_no_bytes"] = False
+
+    print("\n=== MEMORY ===")
+    memory_checks(binpath, fix, results)
 
     srv.shutdown()
     if not a.keep:

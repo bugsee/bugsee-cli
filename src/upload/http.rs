@@ -267,6 +267,81 @@ mod tests {
     use wiremock::matchers::method;
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    async fn put_file(
+        server: &MockServer,
+        path: &std::path::Path,
+        declared_len: u64,
+    ) -> reqwest::Result<reqwest::Response> {
+        reqwest::Client::new()
+            .put(format!("{}/put", server.uri()))
+            .header(reqwest::header::CONTENT_LENGTH, declared_len)
+            .body(file_body(path))
+            .send()
+            .await
+    }
+
+    /// Sizes around the 64 KiB chunk: the streamed body is the file, byte for byte,
+    /// with the length the caller declared and no chunked encoding.
+    #[tokio::test]
+    async fn file_body_streams_every_byte_around_the_chunk_size() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [0usize, 1, 65_535, 65_536, 65_537, 200_000] {
+            let server = MockServer::start().await;
+            Mock::given(method("PUT"))
+                .respond_with(ResponseTemplate::new(200))
+                .mount(&server)
+                .await;
+            let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+            let p = dir.path().join("payload");
+            std::fs::write(&p, &data).unwrap();
+            let declared = file_len(&p).await.unwrap();
+            assert_eq!(declared, len as u64);
+
+            put_file(&server, &p, declared).await.unwrap();
+            let req = &server.received_requests().await.unwrap()[0];
+            assert_eq!(req.body, data, "len {len}");
+            assert_eq!(
+                req.headers.get("content-length").unwrap().to_str().unwrap(),
+                len.to_string()
+            );
+            assert!(req.headers.get("transfer-encoding").is_none(), "len {len}");
+        }
+    }
+
+    /// A payload that vanished (or cannot be read) fails the request instead of
+    /// sending an empty body that the server would store as a valid, empty symbol.
+    #[tokio::test]
+    async fn file_body_of_a_missing_file_fails_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let result = put_file(&server, &dir.path().join("gone"), 10).await;
+        assert!(result.is_err(), "must not succeed with an empty body");
+    }
+
+    /// The file shrank after its length was read (a concurrent writer): the body
+    /// ends short of the declared Content-Length, which must surface as a failed
+    /// request, never as a "successful" upload of a truncated symbol.
+    #[tokio::test]
+    async fn file_body_shorter_than_its_declared_length_fails_the_request() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("payload");
+        std::fs::write(&p, vec![7u8; 1000]).unwrap();
+        let result = put_file(&server, &p, 5000).await;
+        assert!(
+            result.is_err(),
+            "a truncated body must not look like success"
+        );
+    }
+
     #[test]
     fn backoff_doubles_and_caps() {
         let p = RetryPolicy {
