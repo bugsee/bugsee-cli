@@ -1223,21 +1223,22 @@ async fn run_elf_upload(
             "extracted native libraries"
         );
 
-        if dry_run {
-            tracing::info!(
-                "dry-run: would register + upload {} libraries from {}",
-                uploadable.len(),
-                archive.display()
-            );
-            continue;
-        }
         if total == 0 {
             // Nothing even matched by name — the one case `--extension` fixes.
+            // Ahead of the dry-run exit: a dry run is how a caller checks this.
             tracing::warn!(
                 archive = %archive.display(),
                 "no entries named .so / .so.dbg / .so.sym (or an --extension suffix) — \
                  nothing to upload. If your toolchain emits another suffix, pass it \
                  with --extension"
+            );
+            continue;
+        }
+        if dry_run {
+            tracing::info!(
+                "dry-run: would register + upload {} libraries from {}",
+                uploadable.len(),
+                archive.display()
             );
             continue;
         }

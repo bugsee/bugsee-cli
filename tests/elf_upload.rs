@@ -297,3 +297,31 @@ async fn elf_upload_sends_one_library_per_build_id() {
     .await
     .unwrap();
 }
+
+/// A dry run is how a caller checks whether an archive will upload anything, so
+/// an archive with no name-matching entry must point at `--extension` there too.
+#[test]
+fn elf_dry_run_with_no_matching_entries_suggests_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so.debug");
+    let mut c = common::cli();
+    c.args([
+        "--app-token",
+        "TKN",
+        "debug-files",
+        "upload",
+        "--type",
+        "elf",
+        "--version",
+        "1.0",
+        "--build",
+        "1",
+        "--uuid",
+        "00000000-0000-0000-0000-000000000000",
+        "--dry-run",
+    ])
+    .arg(&zip_path)
+    .assert()
+    .success()
+    .stderr(predicates::str::contains("pass it with --extension"));
+}
