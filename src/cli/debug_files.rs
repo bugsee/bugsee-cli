@@ -1695,7 +1695,10 @@ async fn run_sourcemap_upload(
         explicit,
     } in candidates
     {
-        if !explicit && uuid_override.is_none() && is_stylesheet_or_declaration_map(&map_path) {
+        if !explicit
+            && uuid_override.is_none()
+            && is_stylesheet_or_declaration_map(&map_path, extra)
+        {
             skipped += 1;
             tracing::info!(
                 path = %map_path.display(),
@@ -1865,7 +1868,10 @@ async fn run_sourcemap_upload(
 }
 
 /// Whether a `.map`'s name marks it as a stylesheet (`.css.map`) or TypeScript
-/// declaration (`.d.ts.map` / `.d.mts.map` / `.d.cts.map`) source map.
+/// declaration (`.d.ts.map` / `.d.mts.map` / `.d.cts.map`) source map. The same
+/// holds under each `--extension` map suffix (`main.css.sourcemap` for
+/// `--extension sourcemap`): discovery accepts those maps, so the skip must
+/// recognize them too, or one stylesheet map fails the whole run.
 ///
 /// Deliberately by NAME only. Deciding "this map belongs to no bundle" by
 /// pairing maps with the bundles in the walk looked more general, but every gap
@@ -1873,14 +1879,19 @@ async fn run_sourcemap_upload(
 /// `.bundle`, a `../` or absolute `sourceMappingURL` — silently skipped a real
 /// JS map and let CI pass with that bundle unsymbolicated. A name can only
 /// prove a map is NOT JavaScript, which is the one case that is safe to skip.
-fn is_stylesheet_or_declaration_map(path: &Path) -> bool {
+fn is_stylesheet_or_declaration_map(path: &Path, extra: &ExtraSuffixes) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };
     let name = name.to_ascii_lowercase();
-    [".css.map", ".d.ts.map", ".d.mts.map", ".d.cts.map"]
-        .iter()
-        .any(|suffix| name.ends_with(suffix))
+    std::iter::once(".map")
+        .chain(extra.as_slice().iter().map(String::as_str))
+        .any(|map_suffix| {
+            let map_suffix = map_suffix.to_ascii_lowercase();
+            [".css", ".d.ts", ".d.mts", ".d.cts"]
+                .iter()
+                .any(|kind| name.ends_with(&format!("{kind}{map_suffix}")))
+        })
 }
 
 /// Remove every `sourcesContent` a source map can carry; `true` when one was there.
@@ -2448,6 +2459,8 @@ mod sourcemap_upload_tests {
         allow_empty: bool,
         dry_run: bool,
         strip_sources_content: bool,
+        /// `--extension` values.
+        extensions: &'static [&'static str],
     }
 
     async fn upload_paths(
@@ -2468,7 +2481,14 @@ mod sourcemap_upload_tests {
             tweak.allow_empty,
             tweak.dry_run,
             tweak.strip_sources_content,
-            &ExtraSuffixes::default(),
+            &ExtraSuffixes::parse(
+                &tweak
+                    .extensions
+                    .iter()
+                    .map(|e| e.to_string())
+                    .collect::<Vec<_>>(),
+            )
+            .unwrap(),
         )
         .await
     }
@@ -2530,6 +2550,80 @@ mod sourcemap_upload_tests {
 
         assert_eq!(posted_ids(&server).await, vec!["did-js"]);
         assert_eq!(puts(&server).await, 1);
+    }
+
+    /// `--extension sourcemap` (webpack `sourceMapFilename: '[file].sourcemap'`): the
+    /// stylesheet / declaration skip must cover the custom spelling too. A
+    /// `main.css.sourcemap` never carries a debug-id; without the skip it failed
+    /// the run before the stamped JS map was uploaded.
+    #[tokio::test]
+    async fn extra_suffix_stylesheet_and_declaration_maps_are_skipped_too() {
+        let tmp = tempfile::tempdir().unwrap();
+        write(
+            tmp.path(),
+            "main.js.sourcemap",
+            br#"{"version":3,"debug_id":"did-js","mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "main.css.sourcemap",
+            br#"{"version":3,"sources":["a.css"],"mappings":""}"#,
+        );
+        write(
+            tmp.path(),
+            "theme.CSS.SourceMap",
+            b"\xEF\xBB\xBF{\"version\":3}",
+        );
+        for name in [
+            "types.d.ts.sourcemap",
+            "esm.d.mts.sourcemap",
+            "cjs.d.cts.sourcemap",
+        ] {
+            write(tmp.path(), name, br#"{"version":3,"mappings":""}"#);
+        }
+
+        let server = collector(&[]).await;
+        upload_paths(
+            &[tmp.path().to_path_buf()],
+            &server.uri(),
+            SourcemapUploadTweak {
+                concurrency: Some(1),
+                extensions: &["sourcemap"],
+                ..SourcemapUploadTweak::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(posted_ids(&server).await, vec!["did-js"]);
+        assert_eq!(puts(&server).await, 1);
+    }
+
+    /// The extra-suffix skip is still a whole-segment SUFFIX match: an unstamped
+    /// JS map under the custom spelling fails the run, as a `.map` one does.
+    #[tokio::test]
+    async fn extra_suffix_js_map_without_a_debug_id_still_fails_the_run() {
+        for name in [
+            "app.js.sourcemap",
+            "precss.sourcemap",
+            "main.css.sourcemap.js.sourcemap",
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write(tmp.path(), name, br#"{"version":3,"mappings":""}"#);
+            let server = collector(&[]).await;
+            let err = upload_paths(
+                &[tmp.path().to_path_buf()],
+                &server.uri(),
+                SourcemapUploadTweak {
+                    concurrency: Some(1),
+                    extensions: &["sourcemap"],
+                    ..SourcemapUploadTweak::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(err.to_string().contains("no debug_id"), "{name}: {err}");
+        }
     }
 
     /// Only a name can prove a map is not JavaScript. Anything else without a
