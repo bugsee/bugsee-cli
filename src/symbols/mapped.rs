@@ -29,9 +29,10 @@ pub fn map_file(path: &Path) -> std::io::Result<Mapped> {
     if file.metadata()?.len() == 0 {
         return Ok(Mapped(None));
     }
-    // SAFETY: the map is read-only; the only hazard is another process
-    // truncating the file while it is being parsed, which the build output
-    // and symbol files scanned here do not do.
+    // SAFETY: the map is read-only. The contract (memmap2's): nothing may truncate
+    // or rewrite the file while it is mapped (SIGBUS / undefined behaviour
+    // otherwise). It holds for finished build outputs and symbol files, which is all
+    // this reads; a file still being written by a linker is not a supported input.
     Ok(Mapped(Some(unsafe { memmap2::Mmap::map(&file) }?)))
 }
 

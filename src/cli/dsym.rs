@@ -137,24 +137,11 @@ pub fn extract_slices(path: &Path) -> Vec<DsymSliceView> {
     out
 }
 
-/// Hard cap on the size of a single Mach-O file we will read into
-/// memory. Real production dSYMs (large iOS apps + Swift stdlib +
-/// extensions) typically sit between 200 MB and 1 GB per slice. The
-/// cap is a generous-but-bounded safety net against a corrupt or
-/// adversarial input (a "dSYM" that is actually a 10 GB random file
-/// would otherwise drive the build host into swap). Skip rather than
-/// fail — the empty-fallback contract still applies.
-const MAX_MACHO_FILE_BYTES: u64 = 1024 * 1024 * 1024; // 1 GiB
-
 fn push_slices_from_macho(path: &Path, out: &mut Vec<DsymSliceView>) {
-    // Stat the file first so a runaway-size input is rejected without
-    // allocating gigabytes. `std::fs::read` would otherwise sequentially
-    // grow the Vec until the kernel says no.
-    if let Ok(md) = std::fs::metadata(path) {
-        if md.len() > MAX_MACHO_FILE_BYTES {
-            return;
-        }
-    }
+    // No size cap: the file is memory-mapped and only its headers are read, so a
+    // 2 GB DWARF slice costs the same few pages as a small one. (A cap used to guard
+    // `std::fs::read` growing a multi-GB Vec; it also made `dsym uuid` report `[]`,
+    // silently, for a legitimate slice over 1 GiB that `debug-files upload` accepted.)
     let data = match crate::symbols::mapped::map_file(path) {
         Ok(d) => d,
         Err(_) => return,
@@ -241,6 +228,32 @@ mod tests {
                 "len {len}: {out:?}"
             );
         }
+    }
+
+    /// A DWARF slice over 1 GiB (large games) is identified like any other: there is no
+    /// size cap, since only the headers of the mapping are read. The file is sparse, so
+    /// this costs no disk and the parse touches a few pages.
+    #[cfg(unix)]
+    #[test]
+    fn extract_uuids_has_no_size_cap() {
+        use std::io::Write;
+        let tmp = TempDir::new().unwrap();
+        let p = tmp.path().join("huge");
+        let mut f = std::fs::File::create(&p).unwrap();
+        f.write_all(&crate::symbols::test_macho::thin_macho(
+            0x0100_000c,
+            0,
+            [4; 16],
+        ))
+        .unwrap();
+        f.set_len(1024 * 1024 * 1024 + 4096).unwrap(); // just over 1 GiB, sparse
+        drop(f);
+        assert_eq!(
+            extract_uuids(&p),
+            [format_uuid(DebugId::from_uuid(uuid::Uuid::from_bytes(
+                [4; 16]
+            )))]
+        );
     }
 
     #[test]
