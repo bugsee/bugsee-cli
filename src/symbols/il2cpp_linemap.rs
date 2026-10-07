@@ -19,6 +19,9 @@ pub const LINE_NUMBER_MAPPINGS: &str = "LineNumberMappings.json";
 pub const METHOD_MAP: &str = "MethodMap.tsv";
 pub const FILE_ROOT: &str = "il2cppFileRoot.txt";
 pub const MANIFEST: &str = "manifest.json";
+/// Optional top-level key the mappings document may carry; parsers ignore it
+/// (docs/unity-il2cpp-linenumber-mappings.md, section 2.1).
+const DEBUG_ID_SENTINEL: &str = "__debug-id__";
 
 /// A discovered IL2CPP line-map directory (or a direct path to the JSON).
 #[derive(Debug, Clone)]
@@ -155,6 +158,12 @@ pub fn validate_mappings(path: &Path) -> anyhow::Result<MappingsStats> {
     r.begin_object().map_err(from_reader)?;
     while r.has_next().map_err(from_reader)? {
         let cpp = r.next_name().map_err(from_reader)?.to_owned();
+        if cpp == DEBUG_ID_SENTINEL {
+            // The documented optional sentinel (the build's debug id): parsers ignore it,
+            // whatever it holds. Still read through, so syntax errors in it are caught.
+            r.skip_value().map_err(from_reader)?;
+            continue;
+        }
         expect(
             &mut r,
             ValueType::Object,
@@ -365,6 +374,29 @@ mod tests {
         assert_eq!(stats.cpp_files, 2);
         assert_eq!(stats.cs_files, 3);
         assert_eq!(stats.lines, 7);
+    }
+
+    /// The optional `__debug-id__` sentinel is ignored whatever it holds; it is not an entry.
+    #[test]
+    fn the_debug_id_sentinel_is_ignored_but_still_syntax_checked() {
+        for sentinel in [r#""3f2a-uuid""#, "7", "null", r#"{"x":[1,2]}"#] {
+            let doc = format!(r#"{{"__debug-id__":{sentinel},"a.cpp":{{"A.cs":{{"1":2}}}}}}"#);
+            let (_d, p) = write_json(doc.as_bytes());
+            assert_eq!(
+                validate_mappings(&p).unwrap(),
+                MappingsStats {
+                    cpp_files: 1,
+                    cs_files: 1,
+                    lines: 1
+                },
+                "{sentinel}"
+            );
+        }
+        let (_d, p) = write_json(br#"{"__debug-id__":"unterminated,"a.cpp":{}}"#);
+        assert!(validate_mappings(&p).is_err());
+        // Only that exact key is special: another scalar entry is still a shape error.
+        let (_d, p) = write_json(br#"{"__other__":"x","a.cpp":{"A.cs":{"1":2}}}"#);
+        assert!(invalid(&p).contains("__other__"));
     }
 
     #[test]
