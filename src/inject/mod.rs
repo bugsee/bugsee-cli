@@ -570,9 +570,10 @@ fn write_map_debug_id(
         }
     }
     if !dry_run {
-        // Pass 2: stream the map into a sibling temp file with the ids set, then
-        // copy it over the original (not rename: that would swap the inode and
-        // drop the permissions / symlink / hard-link the build gave the map).
+        // Pass 2: stream the map into a sibling temp file with the ids set, then write
+        // its CONTENT into the original (not rename: that would swap the inode and
+        // drop the symlink / hard link the build gave the map; and not `fs::copy`:
+        // it also copies the temp file's metadata, i.e. its 0o600 mode, onto the map).
         let dir = map_path.parent().filter(|p| !p.as_os_str().is_empty());
         let tmp = match dir {
             Some(d) => tempfile::NamedTempFile::new_in(d)?,
@@ -590,7 +591,11 @@ fn write_map_debug_id(
             })?;
             std::io::Write::flush(&mut out)?;
         }
-        std::fs::copy(tmp.path(), map_path)?;
+        let mut dest = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(map_path)?;
+        std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut dest)?;
     }
     Ok(true)
 }
@@ -648,6 +653,41 @@ mod tests {
             );
             assert_eq!(compute_debug_id_with_map(bundle, Some(&map)), expected);
         }
+    }
+
+    /// The rewrite must leave the map's mode, inode and links as the bundler made them. A
+    /// sibling temp file is 0o600, so any step that carries ITS metadata over (as
+    /// `fs::copy` does) silently tightens a 0o644 map to owner-only. Distinct modes on
+    /// the map and the bundle make that visible.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_map_keeps_its_mode_inode_and_hard_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let map = dir.path().join("a.js.map");
+        let link = dir.path().join("a.js.map.link");
+        std::fs::write(&js, "a()\n").unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAAA"}"#).unwrap();
+        std::fs::hard_link(&map, &link).unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ino = std::fs::metadata(&map).unwrap().ino();
+
+        inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+
+        let after = std::fs::metadata(&map).unwrap();
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o644,
+            "the mode must not be tightened"
+        );
+        assert_eq!(after.ino(), ino, "same inode: rewritten in place");
+        assert!(std::fs::read_to_string(&map).unwrap().contains("debug_id"));
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            std::fs::read(&map).unwrap(),
+            "a hard link sees the new content"
+        );
     }
 
     #[test]
