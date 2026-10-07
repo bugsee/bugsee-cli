@@ -29,6 +29,8 @@ use std::path::{Path, PathBuf};
 use symbolic_debuginfo::Archive;
 use walkdir::WalkDir;
 
+use super::suffix::ExtraSuffixes;
+
 /// Cargo-internal directories skipped during a walk.
 ///
 /// `target/<profile>/` is mostly *intermediates*: `deps/` alone holds a
@@ -122,10 +124,26 @@ fn sniff(path: &Path) -> Option<Magic> {
 }
 
 /// Structural test for an Apple `.dSYM` bundle (a directory, not a file).
-fn is_dsym_bundle(p: &Path) -> bool {
+fn is_dsym_bundle(p: &Path, extra: &ExtraSuffixes) -> bool {
     p.is_dir()
-        && p.extension().and_then(|e| e.to_str()) == Some("dSYM")
+        && has_dsym_name(p, extra)
         && p.join("Contents").join("Resources").join("DWARF").is_dir()
+}
+
+/// Whether `p` is NAMED like a `.dSYM` bundle: the built-in suffix, or one of
+/// the caller's `--extension` suffixes. Files are classified by content, so
+/// these suffixes only ever widen which DIRECTORIES count as bundles.
+fn has_dsym_name(p: &Path, extra: &ExtraSuffixes) -> bool {
+    p.extension().and_then(|e| e.to_str()) == Some("dSYM") || extra.matches_path(p)
+}
+
+/// Whether the walk treats `p` as a bundle (the upload unit, never descended
+/// into). A `.dSYM` name is enough, as before — even a malformed one is not
+/// walked. A caller-chosen `--extension` suffix is broader, so a directory
+/// matching only that must ALSO be structurally a bundle; otherwise it is an
+/// ordinary directory and is walked.
+fn is_bundle_like(p: &Path, extra: &ExtraSuffixes) -> bool {
+    has_dsym_name(p, &ExtraSuffixes::default()) || is_dsym_bundle(p, extra)
 }
 
 /// Parse an ELF's identity: `(build_id, arch, has_debug_info)`.
@@ -150,20 +168,20 @@ fn parse_elf(path: &Path) -> Option<(Option<String>, String, bool)> {
 /// An explicitly-passed file or `.dSYM` is trusted as-is (so a caller pointing
 /// at one specific artifact gets a clear parse error rather than a silent
 /// skip); directories are walked with the Cargo intermediates filtered out.
-pub fn discover(paths: &[PathBuf]) -> Findings {
+pub fn discover(paths: &[PathBuf], extra: &ExtraSuffixes) -> Findings {
     let mut f = Findings::default();
     let mut seen = std::collections::HashSet::new();
 
     for p in paths {
         // Explicit `.dSYM` bundle — take it even if malformed.
-        if p.is_dir() && p.extension().and_then(|e| e.to_str()) == Some("dSYM") {
+        if p.is_dir() && has_dsym_name(p, extra) {
             if seen.insert(p.clone()) {
                 f.dsyms.push(p.clone());
             }
             continue;
         }
         if p.is_file() {
-            classify_file(p, &mut f, &mut seen, true);
+            classify_file(p, &mut f, &mut seen, true, extra);
             continue;
         }
         if !p.is_dir() {
@@ -193,8 +211,8 @@ pub fn discover(paths: &[PathBuf]) -> Findings {
             // misfires the preflight in the worst direction: telling a correctly
             // configured project to set `split-debuginfo`, which it already has.
             if ft.is_dir() || ft.is_symlink() {
-                if ep.extension().and_then(|x| x.to_str()) == Some("dSYM") {
-                    if is_dsym_bundle(ep) && seen.insert(ep.to_path_buf()) {
+                if is_bundle_like(ep, extra) {
+                    if is_dsym_bundle(ep, extra) && seen.insert(ep.to_path_buf()) {
                         f.dsyms.push(ep.to_path_buf());
                     }
                     // The bundle is the upload unit. Descending into it would
@@ -215,12 +233,12 @@ pub fn discover(paths: &[PathBuf]) -> Findings {
                 }
                 // A symlink to a regular file — classify what it points at.
                 if ep.is_file() {
-                    classify_file(ep, &mut f, &mut seen, false);
+                    classify_file(ep, &mut f, &mut seen, false, extra);
                 }
                 continue;
             }
             if ft.is_file() {
-                classify_file(ep, &mut f, &mut seen, false);
+                classify_file(ep, &mut f, &mut seen, false, extra);
             }
         }
     }
@@ -230,20 +248,27 @@ pub fn discover(paths: &[PathBuf]) -> Findings {
     // visited before its bundle.
     if !f.macho_without_dsym.is_empty() && !f.dsyms.is_empty() {
         let have: std::collections::HashSet<PathBuf> = f.dsyms.iter().cloned().collect();
-        f.macho_without_dsym
-            .retain(|bin| !have.contains(&dsym_sibling(bin)));
+        f.macho_without_dsym.retain(|bin| {
+            !dsym_siblings(bin, extra)
+                .iter()
+                .any(|sibling| have.contains(sibling))
+        });
     }
     f
 }
 
-/// The `.dSYM` path Cargo/dsymutil would emit for a binary: a sibling
-/// directory with `.dSYM` appended to the full filename (`app` → `app.dSYM`).
-fn dsym_sibling(binary: &Path) -> PathBuf {
+/// The bundle paths that count as a binary's `.dSYM`: the sibling Cargo /
+/// dsymutil emits, with `.dSYM` appended to the full filename (`app` →
+/// `app.dSYM`), plus the same with each `--extension` suffix (`app.dsymx`).
+fn dsym_siblings(binary: &Path, extra: &ExtraSuffixes) -> Vec<PathBuf> {
     let name = binary
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
-    binary.with_file_name(format!("{name}.dSYM"))
+    std::iter::once(".dSYM")
+        .chain(extra.as_slice().iter().map(String::as_str))
+        .map(|suffix| binary.with_file_name(format!("{name}{suffix}")))
+        .collect()
 }
 
 /// Classify one regular file into `f`.
@@ -256,6 +281,7 @@ fn classify_file(
     f: &mut Findings,
     seen: &mut std::collections::HashSet<PathBuf>,
     explicit: bool,
+    extra: &ExtraSuffixes,
 ) {
     let magic = sniff(path);
 
@@ -278,7 +304,7 @@ fn classify_file(
         Some(Magic::MachO) => {
             // The upload unit on Apple is the .dSYM, never the binary; a
             // Mach-O is only interesting as evidence that a bundle is missing.
-            if !seen.contains(path) && !is_dsym_inner_binary(path) {
+            if !seen.contains(path) && !is_dsym_inner_binary(path, extra) {
                 f.macho_without_dsym.push(path.to_path_buf());
             }
         }
@@ -311,9 +337,10 @@ fn classify_file(
 }
 
 /// Whether this Mach-O lives inside a `.dSYM` bundle (its DWARF payload).
-fn is_dsym_inner_binary(path: &Path) -> bool {
-    path.ancestors()
-        .any(|a| a.extension().and_then(|e| e.to_str()) == Some("dSYM"))
+/// Only ANCESTOR directories count: a binary that is itself named with an
+/// extra suffix is not inside anything.
+fn is_dsym_inner_binary(path: &Path, extra: &ExtraSuffixes) -> bool {
+    path.ancestors().skip(1).any(|a| is_bundle_like(a, extra))
 }
 
 /// Build-configuration advice derived from a walk.
@@ -462,7 +489,7 @@ mod tests {
         touch(root, "incremental/foo/bar.o", &elf);
         touch(root, ".fingerprint/x/y", &elf);
 
-        let f = discover(&[root.to_path_buf()]);
+        let f = discover(&[root.to_path_buf()], &ExtraSuffixes::default());
         let names: Vec<_> = f
             .elves
             .iter()
@@ -490,7 +517,7 @@ mod tests {
             ),
         );
 
-        let f = discover(&[root.to_path_buf()]);
+        let f = discover(&[root.to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(f.elves.len(), 1);
         assert_eq!(f.dsyms.len(), 1);
         assert_eq!(f.pdbs.len(), 1);
@@ -508,7 +535,7 @@ mod tests {
     fn a_dsym_bundle_suppresses_its_own_macho() {
         let tmp = tempfile::tempdir().unwrap();
         make_dsym(tmp.path(), "app");
-        let f = discover(&[tmp.path().to_path_buf()]);
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(f.dsyms.len(), 1);
         assert!(
             f.macho_without_dsym.is_empty(),
@@ -521,7 +548,7 @@ mod tests {
     fn macho_without_a_sibling_dsym_is_flagged_with_advice() {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "app", b"\xcf\xfa\xed\xfe stub macho binary");
-        let f = discover(&[tmp.path().to_path_buf()]);
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert!(f.is_empty(), "a bare Mach-O is not uploadable");
         assert_eq!(f.macho_without_dsym.len(), 1);
 
@@ -537,7 +564,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         touch(tmp.path(), "app", b"\xcf\xfa\xed\xfe stub macho binary");
         make_dsym(tmp.path(), "app");
-        let f = discover(&[tmp.path().to_path_buf()]);
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(f.dsyms.len(), 1);
         assert!(
             f.macho_without_dsym.is_empty(),
@@ -563,7 +590,7 @@ mod tests {
         hdr[18] = 0x3e; // EM_X86_64
         touch(tmp.path(), "noid", &hdr);
 
-        let f = discover(&[tmp.path().to_path_buf()]);
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert!(f.elves.is_empty(), "unmatchable ELF is never uploaded");
         assert_eq!(f.elf_without_build_id.len(), 1);
         assert!(preflight_advice(&f).join("\n").contains("--build-id"));
@@ -599,7 +626,7 @@ mod tests {
         )
         .unwrap();
 
-        let f = discover(&[root.to_path_buf()]);
+        let f = discover(&[root.to_path_buf()], &ExtraSuffixes::default());
         assert_eq!(f.dsyms.len(), 1, "the symlinked bundle is discovered");
         assert_eq!(f.dsyms[0], root.join("app.dSYM"));
         assert!(
@@ -621,7 +648,7 @@ mod tests {
             tmp.path().join("app.dSYM"),
         )
         .unwrap();
-        let f = discover(&[tmp.path().to_path_buf()]);
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
         assert!(f.is_empty());
     }
 
@@ -629,7 +656,7 @@ mod tests {
     fn explicit_file_paths_are_trusted_without_a_walk() {
         let tmp = tempfile::tempdir().unwrap();
         let elf = touch(tmp.path(), "app", &real_elf_bytes());
-        let f = discover(std::slice::from_ref(&elf));
+        let f = discover(std::slice::from_ref(&elf), &ExtraSuffixes::default());
         assert_eq!(f.elves.len(), 1);
         assert_eq!(f.elves[0].path, elf);
     }
@@ -638,7 +665,7 @@ mod tests {
     fn an_artifact_reachable_twice_is_reported_once() {
         let tmp = tempfile::tempdir().unwrap();
         let elf = touch(tmp.path(), "app", &real_elf_bytes());
-        let f = discover(&[tmp.path().to_path_buf(), elf]);
+        let f = discover(&[tmp.path().to_path_buf(), elf], &ExtraSuffixes::default());
         assert_eq!(f.elves.len(), 1);
     }
 
@@ -652,8 +679,79 @@ mod tests {
     }
 
     #[test]
+    fn extra_suffix_widens_dsym_bundle_names_and_their_inner_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bundle = tmp.path().join("app.dsymx");
+        let dwarf = bundle.join("Contents").join("Resources").join("DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join("app"), b"\xcf\xfa\xed\xfe stub macho").unwrap();
+
+        // Without the suffix the bundle is an ordinary directory, and its
+        // DWARF payload looks like a binary whose .dSYM is missing.
+        let f = discover(&[tmp.path().to_path_buf()], &ExtraSuffixes::default());
+        assert!(f.dsyms.is_empty());
+        assert_eq!(f.macho_without_dsym.len(), 1);
+
+        let extra = ExtraSuffixes::parse(&[".dsymx".to_string()]).unwrap();
+        let f = discover(&[tmp.path().to_path_buf()], &extra);
+        assert_eq!(f.dsyms, vec![bundle.clone()]);
+        assert!(
+            f.macho_without_dsym.is_empty(),
+            "the bundle was not descended into"
+        );
+
+        // An explicit path to the inner binary is recognized as bundle payload too.
+        let f = discover(&[dwarf.join("app")], &extra);
+        assert!(f.macho_without_dsym.is_empty());
+    }
+
+    /// The shipped binary next to a custom-suffix bundle is NOT a near-miss: the
+    /// bundle is its `.dSYM`, so no `split-debuginfo` advice may fire.
+    #[test]
+    fn extra_suffix_bundle_counts_as_the_binarys_sibling() {
+        let tmp = tempfile::tempdir().unwrap();
+        touch(tmp.path(), "app", b"\xcf\xfa\xed\xfe stub macho");
+        let bundle = tmp.path().join("app.dsymx");
+        let dwarf = bundle.join("Contents").join("Resources").join("DWARF");
+        std::fs::create_dir_all(&dwarf).unwrap();
+        std::fs::write(dwarf.join("app"), b"\xcf\xfa\xed\xfe stub macho").unwrap();
+
+        let extra = ExtraSuffixes::parse(&[".dsymx".to_string()]).unwrap();
+        let f = discover(&[tmp.path().to_path_buf()], &extra);
+        assert_eq!(f.dsyms, vec![bundle]);
+        assert!(
+            f.macho_without_dsym.is_empty(),
+            "{:?}",
+            f.macho_without_dsym
+        );
+        assert!(preflight_advice(&f).is_empty());
+    }
+
+    /// A directory matching only an extra suffix but with no DWARF payload is an
+    /// ordinary directory: it is walked, so a binary inside it is still found.
+    #[test]
+    fn extra_suffix_directory_that_is_not_a_bundle_is_walked() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("out.dsymx");
+        std::fs::create_dir_all(&dir).unwrap();
+        let elf = std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so"),
+        )
+        .unwrap();
+        touch(&dir, "libapp.so", &elf);
+
+        let extra = ExtraSuffixes::parse(&[".dsymx".to_string()]).unwrap();
+        let f = discover(&[tmp.path().to_path_buf()], &extra);
+        assert!(f.dsyms.is_empty());
+        assert_eq!(f.elves.len(), 1, "the walk descended into the directory");
+    }
+
+    #[test]
     fn a_nonexistent_path_yields_nothing_without_panicking() {
-        let f = discover(&[PathBuf::from("/definitely/not/here")]);
+        let f = discover(
+            &[PathBuf::from("/definitely/not/here")],
+            &ExtraSuffixes::default(),
+        );
         assert!(f.is_empty());
         assert!(preflight_advice(&f).is_empty());
     }

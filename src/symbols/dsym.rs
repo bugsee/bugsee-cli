@@ -60,12 +60,9 @@ pub fn identify(dsym_path: &Path) -> Result<DsymIdentity> {
             dsym_path.display()
         )));
     }
-    if !ends_with_dsym(dsym_path) {
-        return Err(Error::InputInvalid(format!(
-            "path does not end in `.dSYM`: {}",
-            dsym_path.display()
-        )));
-    }
+    // No name check here: which names count as a bundle is discovery's policy
+    // (`.dSYM`, plus any `--extension` suffix). The DWARF directory below is
+    // the structural test every bundle must pass whatever it is called.
 
     let dwarf_dir = dsym_path.join("Contents").join("Resources").join("DWARF");
     if !dwarf_dir.is_dir() {
@@ -160,13 +157,6 @@ fn walk_dir_collect(dir: &Path, root: &Path, out: &mut Vec<(String, PathBuf)>) -
     Ok(())
 }
 
-fn ends_with_dsym(path: &Path) -> bool {
-    path.file_name()
-        .and_then(|n| n.to_str())
-        .map(|s| s.ends_with(".dSYM"))
-        .unwrap_or(false)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,13 +164,27 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn rejects_non_dsym_paths() {
+    fn rejects_plain_directory_without_dwarf_dir() {
+        // Any NAME is accepted here (discovery owns the name policy, so a
+        // `--extension` bundle reaches this point), but a directory that is
+        // not structurally a bundle is still rejected.
         let dir = tempfile::tempdir().unwrap();
         let plain_dir = dir.path().join("not-a-dsym");
         fs::create_dir(&plain_dir).unwrap();
         let err = identify(&plain_dir).unwrap_err();
         match err {
-            Error::InputInvalid(msg) => assert!(msg.contains(".dSYM")),
+            Error::InputInvalid(msg) => assert!(msg.contains("Contents/Resources/DWARF")),
+            other => panic!("expected InputInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("Foo.dSYM");
+        fs::write(&file, b"x").unwrap();
+        match identify(&file).unwrap_err() {
+            Error::InputInvalid(msg) => assert!(msg.contains("bundle directory")),
             other => panic!("expected InputInvalid, got {other:?}"),
         }
     }

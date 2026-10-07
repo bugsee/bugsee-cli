@@ -174,3 +174,154 @@ async fn elf_force_overwrites_a_library_already_on_the_server() {
     assert_eq!(posts[1]["overwrite"], true);
     assert_eq!(posts[1]["uuid"], FIXTURE_BUILD_ID);
 }
+
+/// `--extension` lets a caller pick up a symbol spelling the CLI does not know
+/// yet: the entry is keyed by its real build-id exactly like a `.so`. Without
+/// the flag the same archive uploads nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_picks_up_an_extra_suffix_entry() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so.debug");
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .and(body_string_contains(FIXTURE_BUILD_ID))
+        .and(body_string_contains("breakpad"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(1) // only the run WITH --extension registers anything
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let zip = zip_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let run = |extra: &[&str]| {
+            let mut c = common::cli();
+            c.args([
+                "--endpoint",
+                &endpoint,
+                "--app-token",
+                "TKN",
+                "debug-files",
+                "upload",
+                "--type",
+                "elf",
+                "--version",
+                "1.0",
+                "--build",
+                "1",
+                "--uuid",
+                "00000000-0000-0000-0000-000000000000",
+            ]);
+            c.args(extra).arg(&zip).assert().success();
+        };
+        run(&[]);
+        run(&["--extension", "so.debug"]);
+    })
+    .await
+    .unwrap();
+}
+
+/// GNU split-debug companions — a `libfoo.so` and its `libfoo.so.debug`, same
+/// build-id — are ONE symbol. With `--extension so.debug` both match by name;
+/// registering both raced two POSTs for one id. Exactly one is registered and PUT.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_sends_one_library_per_build_id() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let elf = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let bytes = std::fs::read(&elf).unwrap();
+    let zip_path = tmp.path().join("native-debug-symbols.zip");
+    {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+        for name in ["arm64-v8a/libsymbol1.so", "arm64-v8a/libsymbol1.so.debug"] {
+            zw.start_file(name, zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&bytes).unwrap();
+        }
+        zw.finish().unwrap();
+    }
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .and(body_string_contains(FIXTURE_BUILD_ID))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let zip = zip_path.to_string_lossy().into_owned();
+    tokio::task::spawn_blocking(move || {
+        let mut c = common::cli();
+        c.args([
+            "--endpoint",
+            &endpoint,
+            "--app-token",
+            "TKN",
+            "debug-files",
+            "upload",
+            "--type",
+            "elf",
+            "--version",
+            "1.0",
+            "--build",
+            "1",
+            "--uuid",
+            "00000000-0000-0000-0000-000000000000",
+            "--extension",
+            "so.debug",
+            &zip,
+        ])
+        .assert()
+        .success()
+        .stderr(predicates::str::contains("uploading only the richer one"));
+    })
+    .await
+    .unwrap();
+}
+
+/// A dry run is how a caller checks whether an archive will upload anything, so
+/// an archive with no name-matching entry must point at `--extension` there too.
+#[test]
+fn elf_dry_run_with_no_matching_entries_suggests_extension() {
+    let tmp = tempfile::tempdir().unwrap();
+    let zip_path = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so.debug");
+    let mut c = common::cli();
+    c.args([
+        "--app-token",
+        "TKN",
+        "debug-files",
+        "upload",
+        "--type",
+        "elf",
+        "--version",
+        "1.0",
+        "--build",
+        "1",
+        "--uuid",
+        "00000000-0000-0000-0000-000000000000",
+        "--dry-run",
+    ])
+    .arg(&zip_path)
+    .assert()
+    .success()
+    .stderr(predicates::str::contains("pass it with --extension"));
+}

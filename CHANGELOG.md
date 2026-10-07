@@ -6,6 +6,33 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`debug-files upload --extension <SUFFIX>`** picks up files under a spelling the CLI does not
+  know yet, for any `--type` — so a toolchain change no longer needs a CLI release before its
+  symbols upload. Repeat the flag or comma-separate values; the leading `.` is optional. Suffixes
+  ADD to each type's built-in names and match the end of the whole name (`.so.sym` works).
+  Content checks still apply (ELF build-id, PDB container, dSYM `DWARF`), and stylesheet /
+  type-declaration source maps are still skipped under the new spelling. An empty, dot-only or
+  path-like value is exit 20. See [#63].
+
+### Fixed
+- **`--type elf` uploads AGP `SYMBOL_TABLE` symbols.** With `ndk.debugSymbolLevel =
+  'SYMBOL_TABLE'` (what the React Native config plugin sets), `native-debug-symbols.zip` holds only
+  `lib*.so.sym`; every entry was dropped and the upload exited 0 having sent nothing. `.so.sym` is
+  now keyed by its GNU build-id like `.so`. It carries function names only — `file:line` frames
+  still need `FULL`. See [#61], [#62].
+- **`--force` is honoured by `--type elf` and Rust ELF uploads.** It was dropped on both paths, so
+  switching a library from `SYMBOL_TABLE` to `FULL` (same build-id) was silently skipped as already
+  on the server. When full-debug libraries are skipped that way, the run now says to pass `--force`.
+  See [#62].
+- **`--type elf` uploads one file per GNU build-id**, preferring the one with DWARF, then a symbol
+  table, then the larger file. Two entries for one library (a stripped `.so` beside its split-debug
+  companion) were registered concurrently, and the stripped one could win. See [#63].
+
+[#61]: https://github.com/bugsee/bugsee-cli/issues/61
+[#62]: https://github.com/bugsee/bugsee-cli/pull/62
+[#63]: https://github.com/bugsee/bugsee-cli/pull/63
+
 ## [0.7.12] - 2026-09-23
 
 ### Added

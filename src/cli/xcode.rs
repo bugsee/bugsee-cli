@@ -50,6 +50,7 @@ use crate::cli::{
 };
 use crate::compress::Strategy;
 use crate::error::{config_invalid, input_invalid, Error};
+use crate::symbols::suffix::ExtraSuffixes;
 use crate::upload::build;
 use crate::upload::http::RetryPolicy;
 
@@ -1358,6 +1359,7 @@ async fn upload_dsyms(
         build,
         Strategy::default(),
         /* force */ false,
+        &ExtraSuffixes::default(),
         /* dry_run */ false,
     )
     .await
@@ -1492,7 +1494,8 @@ async fn upload_dsyms_strict(
         .into());
     }
 
-    let candidates = debug_files::discover_dsyms(std::slice::from_ref(&folder));
+    let candidates =
+        debug_files::discover_dsyms(std::slice::from_ref(&folder), &ExtraSuffixes::default());
 
     // A `*.dSYM` we can see but discovery rejected was almost certainly
     // unreadable rather than malformed: `is_dsym_bundle` tests
@@ -1573,6 +1576,7 @@ async fn upload_dsyms_strict(
         build,
         Strategy::default(),
         /* force */ false,
+        &ExtraSuffixes::default(),
         /* dry_run */ false,
     )
     .await?;

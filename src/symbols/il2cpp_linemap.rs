@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 
 use walkdir::WalkDir;
 
+use super::suffix::ExtraSuffixes;
 use crate::error::{config_invalid, input_not_found};
 
 pub const LINE_NUMBER_MAPPINGS: &str = "LineNumberMappings.json";
@@ -27,11 +28,14 @@ pub struct LinemapBundle {
 }
 
 /// Discover `LineNumberMappings.json` under `paths` (file or directory walk).
-pub fn discover(paths: &[PathBuf]) -> Vec<LinemapBundle> {
+/// A file whose name ends in one of `extra` is taken as the mappings JSON too;
+/// its `MethodMap.tsv` / `il2cppFileRoot.txt` siblings are looked up the same
+/// way.
+pub fn discover(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<LinemapBundle> {
     let mut found = Vec::new();
     for path in paths {
         if path.is_file() {
-            if is_linemap_json(path) {
+            if is_linemap_json(path) || extra.matches_path(path) {
                 if let Some(bundle) = bundle_from_json(path) {
                     found.push(bundle);
                 }
@@ -43,7 +47,7 @@ pub fn discover(paths: &[PathBuf]) -> Vec<LinemapBundle> {
         }
         for entry in WalkDir::new(path).into_iter().filter_map(|e| e.ok()) {
             let p = entry.path();
-            if p.is_file() && is_linemap_json(p) {
+            if p.is_file() && (is_linemap_json(p) || extra.matches_path(p)) {
                 if let Some(bundle) = bundle_from_json(p) {
                     found.push(bundle);
                 }
@@ -180,10 +184,31 @@ mod tests {
     fn discovers_json_and_siblings() {
         let root =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/il2cpp-linemap/android");
-        let found = discover(&[root]);
+        let found = discover(&[root], &ExtraSuffixes::default());
         assert_eq!(found.len(), 1);
         assert!(found[0].method_map.is_some());
         assert!(found[0].file_root.is_some());
+    }
+
+    #[test]
+    fn extra_suffix_discovers_renamed_json_with_its_siblings() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("linemaps");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("Game.linemap.json"), b"{}").unwrap();
+        fs::write(dir.join(METHOD_MAP), b"").unwrap();
+        fs::write(dir.join("unrelated.json"), b"{}").unwrap();
+        let root = tmp.path().to_path_buf();
+
+        assert!(
+            discover(std::slice::from_ref(&root), &ExtraSuffixes::default()).is_empty(),
+            "without the suffix the renamed JSON is not a linemap"
+        );
+        let extra = ExtraSuffixes::parse(&[".linemap.json".to_string()]).unwrap();
+        let found = discover(&[root], &extra);
+        assert_eq!(found.len(), 1);
+        assert!(found[0].json_path.ends_with("Game.linemap.json"));
+        assert!(found[0].method_map.is_some(), "siblings resolve next to it");
     }
 
     #[test]

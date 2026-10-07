@@ -13,6 +13,8 @@
 //!     target's symbols are a `.dSYM`, a `.pdb`, or the ELF itself depending on
 //!     the triple, so this classifies by container magic (not host OS) and
 //!     diagnoses the build settings that silently produce unusable symbols
+//!   - `suffix`      — caller-supplied file-name suffixes (`--extension`)
+//!     that every type above accepts IN ADDITION to its built-in names
 //!   - `portable_pdb` — Portable PDB (.NET / MAUI managed code)            [TODO]
 //!   - `breakpad`    — Breakpad ASCII symbols                              [TODO]
 //!   - `jvm`         — JVM source-context bundles                          [TODO]
@@ -28,6 +30,7 @@ pub mod pdb;
 pub mod proguard;
 pub mod rust;
 pub mod sourcemap;
+pub mod suffix;
 
 // Hand-assembled Mach-O fixtures shared by the dSYM + IPA unit tests.
 #[cfg(test)]
