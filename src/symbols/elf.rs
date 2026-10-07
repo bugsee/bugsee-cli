@@ -32,14 +32,21 @@ use symbolic_debuginfo::Archive;
 
 use super::suffix::ExtraSuffixes;
 
-fn sha1_hex(bytes: &[u8]) -> String {
-    let digest: [u8; 20] = Sha1::digest(bytes).into();
-    hex::encode(digest)
-}
-
 /// SHA-1 hex of a file's bytes — the wire `hash` for a per-`.so` upload.
 pub fn sha1_hex_of_file(path: &Path) -> std::io::Result<String> {
-    Ok(sha1_hex(&std::fs::read(path)?))
+    // Streamed: the hashed file is the packed archive, which can be tens of MB.
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest: [u8; 20] = hasher.finalize().into();
+    Ok(hex::encode(digest))
 }
 
 /// One native library found in an AGP `native-debug-symbols.zip` or a scanned directory.
@@ -163,9 +170,10 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         if !(is_native_lib_entry(&file_name) || extra.matches(&file_name)) {
             continue;
         }
-        let bytes = std::fs::read(entry.path()).map_err(|e| {
+        let with_path = |e: std::io::Error| {
             std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
-        })?;
+        };
+        let bytes = std::fs::read(entry.path()).map_err(with_path)?;
         let ElfIdentity {
             build_id,
             arch,
@@ -291,6 +299,24 @@ mod tests {
         assert_eq!(
             sha1_hex_of_file(&path).unwrap(),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
+        );
+    }
+
+    #[test]
+    fn sha1_hex_of_file_streams_across_buffer_boundaries() {
+        // Larger than the 64 KiB read buffer and not a multiple of it, so a
+        // chunking bug (dropped or repeated tail) changes the digest.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let data: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let expected: [u8; 20] = Sha1::digest(&data).into();
+        assert_eq!(sha1_hex_of_file(&path).unwrap(), hex::encode(expected));
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            sha1_hex_of_file(&path).unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "SHA-1 of the empty input"
         );
     }
 
