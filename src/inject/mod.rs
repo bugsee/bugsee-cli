@@ -643,18 +643,17 @@ fn write_map_debug_id(
         }
     }
     if !dry_run {
-        // Pass 2: stream the map into a sibling temp file with the ids set, then write
-        // its CONTENT into the original (not rename: that would swap the inode and
-        // drop the symlink / hard link the build gave the map; and not `fs::copy`:
-        // it also copies the temp file's metadata, i.e. its 0o600 mode, onto the map).
-        let dir = map_path.parent().filter(|p| !p.as_os_str().is_empty());
-        let tmp = match dir {
-            Some(d) => tempfile::NamedTempFile::new_in(d)?,
-            None => tempfile::NamedTempFile::new_in(".")?,
-        };
+        // Pass 2: stream the map into a scratch file with the ids set, then write its
+        // CONTENT into the original (not rename: that would swap the inode and drop the
+        // symlink / hard link the build gave the map; and not `fs::copy`: it also copies
+        // the scratch file's metadata, i.e. its 0o600 mode, onto the map).
+        // The scratch file is anonymous and lives in the OS temp dir, so rewriting a map
+        // needs no write access to the map's directory and a killed run leaves no stray
+        // `.tmpXXXX` beside it.
+        let mut scratch = tempfile::tempfile()?;
         {
             let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
-            let mut out = std::io::BufWriter::new(tmp.as_file());
+            let mut out = std::io::BufWriter::new(&scratch);
             mapjson::set_debug_ids(input, &mut out, debug_id).map_err(|e| match e {
                 mapjson::MapJsonError::Io(e) => Error::Io(e),
                 mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
@@ -668,7 +667,8 @@ fn write_map_debug_id(
             .write(true)
             .truncate(true)
             .open(map_path)?;
-        std::io::copy(&mut std::fs::File::open(tmp.path())?, &mut dest)?;
+        std::io::Seek::seek(&mut scratch, std::io::SeekFrom::Start(0))?;
+        std::io::copy(&mut scratch, &mut dest)?;
     }
     Ok(true)
 }
@@ -2150,6 +2150,32 @@ mod file_edits {
                 ["real.js", "real.js.map"],
                 "no temp file"
             );
+        }
+
+        /// Rewriting a map needs no write access to its DIRECTORY (editing existing files in
+        /// place never did): a read-only `dist/` holding writable files must still inject, and
+        /// nothing may be created beside them.
+        #[test]
+        fn files_in_a_read_only_directory_are_still_rewritten() {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.js"), "a()\n").unwrap();
+            std::fs::write(dir.path().join("a.js.map"), MAP).unwrap();
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+            let can_create = std::fs::File::create(dir.path().join("probe")).is_ok();
+            let result = inject_dir(dir.path());
+            let listing = names(dir.path());
+            std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+            if can_create {
+                return; // running as root: directory permissions are not enforced
+            }
+            result.unwrap();
+            assert_eq!(listing, ["a.js", "a.js.map"]);
+            assert!(std::fs::read_to_string(dir.path().join("a.js.map"))
+                .unwrap()
+                .contains("debug_id"));
+            assert!(std::fs::read_to_string(dir.path().join("a.js"))
+                .unwrap()
+                .contains("//# debugId="));
         }
 
         #[test]

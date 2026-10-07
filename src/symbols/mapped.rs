@@ -3,8 +3,9 @@
 //! Identifying a debug file (ELF build-id, Mach-O UUID, PDB GUID) touches only
 //! its headers, yet the files are routinely 100+ MB and `std::fs::read` copies
 //! every byte onto the heap. Mapping instead keeps the cost to the pages the
-//! parser actually reads. This is the ONLY place the crate maps a file, so the
-//! `unsafe` lives here.
+//! parser actually reads. This is the ONLY place the crate memory-maps a file, so
+//! that `unsafe` lives here (the crate has two other, unrelated `unsafe` uses: the
+//! `fork` in `daemon.rs` and `gethostname` in `build_env.rs`).
 
 use std::ops::Deref;
 use std::path::Path;

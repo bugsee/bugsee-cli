@@ -12,7 +12,7 @@
 
 use std::io::{Read, Write};
 
-use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ValueType};
+use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ReaderSettings, ValueType};
 use struson::writer::{JsonStreamWriter, JsonWriter};
 
 /// Why a streaming pass over a map failed.
@@ -61,6 +61,22 @@ impl From<std::io::Error> for MapJsonError {
 
 type Res<T> = std::result::Result<T, MapJsonError>;
 
+/// A reader that does NOT apply struson's default "restrict number values" (it rejects
+/// an exponent beyond ±99 and any number over 100 characters). That guard protects code
+/// that PARSES numbers into big integers; this module never parses one, it only skips or
+/// copies the number's text. Left on, valid JSON such as `1e100` made a copy fail, and
+/// `--strip-sources-content` then fell back to uploading the unstripped map: the very
+/// source the flag exists to keep off the wire.
+fn reader<R: Read>(input: R) -> JsonStreamReader<R> {
+    JsonStreamReader::new_custom(
+        input,
+        ReaderSettings {
+            restrict_number_values: false,
+            ..Default::default()
+        },
+    )
+}
+
 /// What [`top_level_strings`] found.
 pub struct TopLevel {
     /// Whether the document's top-level value is an object.
@@ -75,7 +91,7 @@ pub struct TopLevel {
 /// document. A top-level value that is not an object yields `is_object: false`
 /// and no values (it is still syntax-checked).
 pub fn top_level_strings<R: Read>(input: R, keys: &[&str]) -> Res<TopLevel> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut values: Vec<Option<String>> = vec![None; keys.len()];
     let is_object = r.peek()? == ValueType::Object;
     if is_object {
@@ -109,7 +125,7 @@ pub fn top_level_strings<R: Read>(input: R, keys: &[&str]) -> Res<TopLevel> {
 ///
 /// Errors with [`MapJsonError::Json`] when the input is not a JSON object.
 pub fn strip_sources_content<R: Read, W: Write>(input: R, output: W) -> Res<bool> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut w = JsonStreamWriter::new(output);
     if r.peek()? != ValueType::Object {
         return Err(MapJsonError::Json("not a JSON object".into()));
@@ -178,7 +194,7 @@ fn strip_section<R: JsonReader, W: JsonWriter>(r: &mut R, w: &mut W) -> Res<bool
 ///
 /// Errors with [`MapJsonError::Json`] when the input is not a JSON object.
 pub fn set_debug_ids<R: Read, W: Write>(input: R, output: W, debug_id: &str) -> Res<()> {
-    let mut r = JsonStreamReader::new(input);
+    let mut r = reader(input);
     let mut w = JsonStreamWriter::new(output);
     if r.peek()? != ValueType::Object {
         return Err(MapJsonError::Json("not a JSON object".into()));
@@ -282,6 +298,27 @@ mod tests {
         );
     }
 
+    /// Numbers are copied as TEXT, however unusual: a large exponent or a very long integer
+    /// is valid JSON, and refusing to copy it must never make a strip give up (which would
+    /// upload the sources it was asked to drop).
+    #[test]
+    fn unusual_numbers_are_copied_verbatim_and_sources_are_still_stripped() {
+        let long_int = "9".repeat(101);
+        for n in ["1e100", "1e-100", "-2.5E+150", "1e999999", long_int.as_str(), "0.000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000001"] {
+            let doc = format!(r#"{{"n":{n},"sourcesContent":["secret"],"mappings":"AA"}}"#);
+            let (removed, out) = strip(&doc).unwrap_or_else(|e| panic!("{n}: {e}"));
+            assert!(removed, "{n}: the sources must still be stripped");
+            assert_eq!(out, format!(r#"{{"n":{n},"mappings":"AA"}}"#), "{n}");
+            let mut ids = Vec::new();
+            set_debug_ids(doc.as_bytes(), &mut ids, "id").unwrap_or_else(|e| panic!("{n}: {e}"));
+            assert!(String::from_utf8(ids).unwrap().contains(&format!(r#""n":{n}"#)), "{n}");
+            assert_eq!(
+                top_level_strings(doc.as_bytes(), &["mappings"]).unwrap().values,
+                [Some("AA".to_string())]
+            );
+        }
+    }
+
     #[test]
     fn strip_rejects_non_objects_and_bad_json() {
         assert!(matches!(strip("[]"), Err(MapJsonError::Json(_))));
@@ -374,6 +411,9 @@ mod differential {
         "2e10",
         "-0.5E-3",
         "100000000000000000000",
+        "1e100",
+        "-2.5E-150",
+        "99999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999999",
     ];
 
     fn scalar(r: &mut Rng) -> String {
@@ -600,27 +640,39 @@ mod differential {
         assert_eq!(got["debug_id"], "d");
     }
 
-    /// A number no double can hold (`1e999999`) is valid JSON grammar. Reading ids
-    /// skips it; copying it is refused as a JSON error — which the strip path treats
-    /// as "not the map we expect" and uploads the original, as the tree parser's
-    /// "number out of range" always led it to.
+    /// Numbers no double can hold, exponents beyond +-99 and very long integers are valid JSON
+    /// grammar. They are skipped when reading ids and COPIED VERBATIM by the rewrites: the
+    /// stream never parses a number, so it must not refuse one (a refusal made
+    /// `--strip-sources-content` give up and upload the sources it was asked to drop).
     #[test]
-    fn out_of_range_numbers_are_skippable_but_not_copyable() {
-        let doc = br#"{"n":1e999999,"sourcesContent":["x"],"debug_id":"d"}"#;
-        assert_eq!(
-            top_level_strings(doc.as_slice(), &["debug_id"])
-                .unwrap()
-                .values,
-            [Some("d".to_string())]
-        );
-        assert!(matches!(
-            strip_sources_content(doc.as_slice(), Vec::new()),
-            Err(MapJsonError::Json(_))
-        ));
-        assert!(matches!(
-            set_debug_ids(doc.as_slice(), Vec::new(), "x"),
-            Err(MapJsonError::Json(_))
-        ));
+    fn out_of_range_and_huge_numbers_copy_verbatim() {
+        let long = "7".repeat(150);
+        for n in ["1e999999", "1e100", "-3E-120", long.as_str()] {
+            let doc = format!(r#"{{"n":{n},"sourcesContent":["x"],"debug_id":"d"}}"#);
+            assert_eq!(
+                top_level_strings(doc.as_bytes(), &["debug_id"])
+                    .unwrap()
+                    .values,
+                [Some("d".to_string())]
+            );
+            let mut out = Vec::new();
+            assert!(
+                strip_sources_content(doc.as_bytes(), &mut out).unwrap(),
+                "{n}"
+            );
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                format!(r#"{{"n":{n},"debug_id":"d"}}"#)
+            );
+            let mut ids = Vec::new();
+            set_debug_ids(doc.as_bytes(), &mut ids, "x").unwrap();
+            assert!(
+                String::from_utf8(ids)
+                    .unwrap()
+                    .contains(&format!(r#""n":{n}"#)),
+                "{n}"
+            );
+        }
     }
 
     /// 200 000 randomly corrupted documents (byte replaced / deleted / inserted):
@@ -628,7 +680,7 @@ mod differential {
     /// copies out re-parses — it never launders invalid JSON into an upload.
     #[test]
     fn random_corruption_is_accepted_exactly_when_serde_accepts_it() {
-        let base = br#"{"version":3,"file":"a\u00e9.js","sources":["a.ts","b\"q"],"sourcesContent":["x\ny","\ud83d\ude00"],"names":["n1"],"mappings":"AAAA;AACA","x":[1,2.5e3,-0,true,null,{"k":"v"}]}"#;
+        let base = br#"{"version":3,"file":"a\u00e9.js","sources":["a.ts","b\"q"],"sourcesContent":["x\ny","\ud83d\ude00"],"names":["n1"],"mappings":"AAAA;AACA","x":[1,2.5e3,-0,true,null,{"k":"v"}],"y":[1e100,-2.5E-150]}"#;
         let mut r = Rng(0x1234_5678_9ABC_DEF1);
         for case in 0..200_000 {
             let mut b = base.to_vec();
@@ -642,16 +694,21 @@ mod differential {
                     _ => b.insert(at, r.next() as u8),
                 }
             }
-            let serde_ok = serde_json::from_slice::<Value>(&b).is_ok();
+            let serde_res = serde_json::from_slice::<Value>(&b);
+            // The one deliberate difference: a number no f64 holds is rejected by serde
+            // ("number out of range") but is valid JSON the stream copies verbatim.
+            let range_only = serde_res
+                .as_ref()
+                .err()
+                .is_some_and(|e| e.to_string().contains("number out of range"));
             let mut out = Vec::new();
             let streamed_ok = strip_sources_content(b.as_slice(), &mut out).is_ok();
-            assert_eq!(
-                streamed_ok,
-                serde_ok,
+            assert!(
+                streamed_ok == serde_res.is_ok() || (streamed_ok && range_only),
                 "case {case} disagrees on {:?}",
                 String::from_utf8_lossy(&b)
             );
-            if streamed_ok {
+            if streamed_ok && !range_only {
                 assert!(
                     serde_json::from_slice::<Value>(&out).is_ok(),
                     "case {case}: output is not valid JSON: {}",

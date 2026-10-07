@@ -336,14 +336,35 @@ pub fn read_plist_to_json(path: &std::path::Path) -> serde_json::Map<String, Val
         Ok(m) if m.len() <= MAX_PLIST_BYTES => {}
         _ => return serde_json::Map::new(),
     }
-    let path = path.to_path_buf();
-    std::thread::Builder::new()
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let owned = path.to_path_buf();
+    match std::thread::Builder::new()
         .name("plist-parse".into())
         .stack_size(PLIST_PARSE_STACK_BYTES)
-        .spawn(move || parse_plist_to_json(&path))
-        .ok()
-        .and_then(|handle| handle.join().ok())
-        .unwrap_or_default()
+        .spawn(move || parse_plist_to_json(&owned))
+    {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            tracing::warn!(path = %path.display(), "plist parser panicked; treating the plist as empty");
+            serde_json::Map::new()
+        }),
+        // A 256 MiB stack is reserved up front, which a tight `ulimit -v`, cgroup or
+        // `vm.overcommit_memory=2` can refuse. A small plist is parsed right here instead
+        // (at most ~1k nesting levels: far inside even a 2 MiB worker-thread stack); a
+        // large one is not, because only the big stack makes its depth safe.
+        Err(e) => {
+            const INLINE_PLIST_BYTES: u64 = 16 * 1024;
+            if size <= INLINE_PLIST_BYTES {
+                tracing::warn!(error = %e, "cannot spawn the plist parser thread; parsing inline");
+                parse_plist_to_json(path)
+            } else {
+                tracing::warn!(
+                    error = %e, path = %path.display(),
+                    "cannot spawn the plist parser thread; a {size}-byte plist is too large to parse inline"
+                );
+                serde_json::Map::new()
+            }
+        }
+    }
 }
 
 fn parse_plist_to_json(path: &std::path::Path) -> serde_json::Map<String, Value> {
@@ -626,24 +647,28 @@ mod tests {
     // ── read_plist_to_json on broken / hostile files ──────────────
 
     /// A binary plist whose objects form one chain of `n` nested arrays (4-byte refs).
-    fn nested_bplist(n: u32) -> Vec<u8> {
+    fn nested_bplist(n: u32, width: usize) -> Vec<u8> {
+        // `width` (3 or 4) is both the object-ref size and the offset-table entry size.
+        // 3 bytes is the densest encoding that still addresses >65 535 objects: ~7 bytes
+        // per nesting level, i.e. the deepest chain that fits under the size cap.
+        let be = |v: u64| v.to_be_bytes()[8 - width..].to_vec();
         let mut body = b"bplist00".to_vec();
         let mut offsets = Vec::new();
         for i in 0..n {
-            offsets.push(body.len() as u32);
+            offsets.push(body.len() as u64);
             if i + 1 < n {
                 body.push(0xa1); // array of 1
-                body.extend_from_slice(&(i + 1).to_be_bytes());
+                body.extend_from_slice(&be(i as u64 + 1));
             } else {
                 body.push(0x50); // empty string
             }
         }
         let table = body.len() as u64;
         for o in offsets {
-            body.extend_from_slice(&o.to_be_bytes());
+            body.extend_from_slice(&be(o));
         }
         body.extend_from_slice(&[0; 6]);
-        body.extend_from_slice(&[4, 4]); // offset size, object-ref size
+        body.extend_from_slice(&[width as u8, width as u8]); // offset size, object-ref size
         body.extend_from_slice(&(n as u64).to_be_bytes());
         body.extend_from_slice(&0u64.to_be_bytes()); // top object
         body.extend_from_slice(&table.to_be_bytes());
@@ -677,10 +702,14 @@ mod tests {
         assert!(plist_map(&xml(69_000)).is_empty());
         assert!(plist_map(&xml(200_000)).is_empty(), "over the cap");
         // Binary: ~9 bytes per level, so ~110k levels fit under the cap.
-        assert!(nested_bplist(110_000).len() < 1024 * 1024);
-        assert!(plist_map(&nested_bplist(110_000)).is_empty());
+        assert!(nested_bplist(110_000, 4).len() < 1024 * 1024);
+        assert!(plist_map(&nested_bplist(110_000, 4)).is_empty());
+        // The true worst case under the cap: 3-byte refs, ~149k levels.
+        let densest = nested_bplist(149_000, 3);
+        assert!(densest.len() < 1024 * 1024, "{}", densest.len());
+        assert!(plist_map(&densest).is_empty());
         assert!(
-            plist_map(&nested_bplist(300_000)).is_empty(),
+            plist_map(&nested_bplist(300_000, 4)).is_empty(),
             "over the cap"
         );
     }

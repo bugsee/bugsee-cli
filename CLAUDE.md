@@ -118,7 +118,7 @@ rule, or entry name requires a major version bump and a coordinated rollout.
   whole file onto the heap (`fs::read`, `read_to_string`, `tokio::fs::read`, or a `.clone()` of a
   body per retry). Hash and copy through a 64 KiB buffer; send request bodies with
   `upload::http::file_body` + an explicit `Content-Length` (a presigned S3 PUT rejects chunked);
-  read identity out of headers with `symbols::mapped::map_file` (the crate's only `unsafe`); walk
+  read identity out of headers with `symbols::mapped::map_file` (the one place a file is memory-mapped, so that `unsafe` lives only there); walk
   JSON with `inject::mapjson` (struson), not a `serde_json::Value` tree. `scripts/e2e_flows.py`
   enforces a peak-RSS budget on ~96 MB inputs for every large-input flow, so a regression fails CI.
 - Return a typed `error::Error` (or `anyhow` wrapping one) so `main`'s `classify`

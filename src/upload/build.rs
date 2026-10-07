@@ -188,13 +188,14 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
         // reading it whole and cloning it per attempt held two copies in memory.
         let body_len = http::file_len(&zip_path).await?;
         tracing::debug!(endpoint = %http::redact_url(&reg.artifact_endpoint), body_len, "PUT artefact");
-        let put = http::send_with_retry(policy, "artefact PUT", true, || {
-            client
-                .put(&reg.artifact_endpoint)
-                .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-                .header(reqwest::header::CONTENT_LENGTH, body_len)
-                .body(http::file_body(&zip_path))
-        })
+        let put = http::put_file(
+            &client,
+            policy,
+            "artefact PUT",
+            &reg.artifact_endpoint,
+            &zip_path,
+            Some("application/octet-stream"),
+        )
         .await?;
         if !put.status().is_success() {
             let s = put.status().as_u16();

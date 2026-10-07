@@ -95,14 +95,21 @@ fn json_cases() -> Vec<(&'static str, Vec<u8>, i32, i32, i32)> {
         c("number at the top level", "3", 0, 0, 11),
         c("null at the top level", "null", 0, 0, 11),
         c("string at the top level", "\"s\"", 0, 0, 11),
-        // A number no double holds is grammatical JSON: reading ids skips it, but
-        // inject cannot copy it faithfully, so it refuses.
+        // Numbers no double holds (or with a 3-digit exponent) are valid JSON: they are
+        // skipped when reading ids and copied verbatim when rewriting, never refused.
         c(
-            "out-of-range number",
+            "number beyond any double",
             r#"{"version":3,"n":1e999999,"mappings":""}"#,
             0,
             0,
-            11,
+            0,
+        ),
+        c(
+            "three-digit exponent",
+            r#"{"version":3,"n":1e100,"mappings":""}"#,
+            0,
+            0,
+            0,
         ),
         // Duplicate keys are legal; the last one wins, as in any JSON parser.
         c(
@@ -238,11 +245,7 @@ async fn an_unidentifiable_source_map_sends_nothing_to_the_server() {
     .unwrap();
 }
 
-/// `--strip-sources-content` over a map it cannot parse uploads the ORIGINAL
-/// (a privacy preference is not a reason to fail), but one that is valid JSON with
-/// sources still has them removed.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn strip_over_an_unparseable_map_falls_back_to_the_original_bytes() {
+async fn mock_symbol_server() -> MockServer {
     let server = MockServer::start().await;
     let put_url = format!("{}/put", server.uri());
     Mock::given(method("POST"))
@@ -256,14 +259,35 @@ async fn strip_over_an_unparseable_map_falls_back_to_the_original_bytes() {
         .respond_with(ResponseTemplate::new(200))
         .mount(&server)
         .await;
+    server
+}
+
+/// The bytes of the single entry of the (only) uploaded ZIP.
+async fn uploaded_entry(server: &MockServer) -> Vec<u8> {
+    let reqs = server.received_requests().await.unwrap();
+    let put = reqs
+        .iter()
+        .find(|r| r.method.as_str() == "PUT")
+        .expect("uploaded");
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
+    let mut body = Vec::new();
+    std::io::Read::read_to_end(&mut archive.by_index(0).unwrap(), &mut body).unwrap();
+    body
+}
+
+/// `--strip-sources-content` over a map it cannot process (not a JSON object) uploads the
+/// ORIGINAL (a privacy preference is not a reason to fail the upload) — and says so
+/// loudly, because the sources then go out unstripped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strip_over_an_unprocessable_map_uploads_the_original_and_warns() {
+    let server = mock_symbol_server().await;
     let tmp = tempfile::tempdir().unwrap();
-    // Valid JSON with a debug id (so it can be keyed) but a number the stream cannot
-    // copy: strip cannot produce a copy, so the original is uploaded.
-    let odd = br#"{"version":3,"debug_id":"55555555-5555-5555-5555-555555555555","n":1e999999,"sourcesContent":["secret"],"mappings":""}"#;
+    // Valid JSON, but an array: it has no `sourcesContent` to strip. `--uuid` supplies its key.
+    let odd = br#"[{"sourcesContent":["secret"]}]"#;
     write(tmp.path(), "m/app.js.map", odd);
     let endpoint = server.uri();
     let dir = tmp.path().join("m");
-    tokio::task::spawn_blocking(move || {
+    let warned = tokio::task::spawn_blocking(move || {
         let out = common::cli()
             .args(["--endpoint", &endpoint, "--app-token", "TKN"])
             .args([
@@ -274,22 +298,70 @@ async fn strip_over_an_unparseable_map_falls_back_to_the_original_bytes() {
                 "--strip-sources-content",
             ])
             .args(["--version", "1", "--build", "1"])
+            .args(["--uuid", "55555555-5555-5555-5555-555555555555"])
             .arg(&dir)
             .output()
             .unwrap();
         assert_eq!(code_of(&out), 0, "{}", stderr(&out));
+        stderr(&out).contains("UNSTRIPPED")
     })
     .await
     .unwrap();
-    let reqs = server.received_requests().await.unwrap();
-    let put = reqs
-        .iter()
-        .find(|r| r.method.as_str() == "PUT")
-        .expect("uploaded");
-    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
-    let mut body = Vec::new();
-    std::io::Read::read_to_end(&mut archive.by_index(0).unwrap(), &mut body).unwrap();
-    assert_eq!(body, odd.to_vec(), "the original bytes, untouched");
+    assert!(
+        warned,
+        "the unstripped fallback must be announced, not silent"
+    );
+    assert_eq!(
+        uploaded_entry(&server).await,
+        odd.to_vec(),
+        "the original bytes, untouched"
+    );
+}
+
+/// REGRESSION: numbers that are valid JSON but unusual (`1e100`, beyond any double, 150
+/// digits) used to make the strip give up and upload the UNSTRIPPED map, silently. The sources
+/// must be gone from what is uploaded, and every number's text preserved.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn strip_removes_sources_from_maps_with_unusual_numbers() {
+    let long = "7".repeat(150);
+    for n in ["1e100", "-3E-120", "1e999999", long.as_str()] {
+        let server = mock_symbol_server().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let map = format!(
+            r#"{{"version":3,"debug_id":"66666666-6666-6666-6666-666666666666","n":{n},"sourcesContent":["secret source"],"mappings":"AAAA"}}"#
+        );
+        write(tmp.path(), "m/app.js.map", map.as_bytes());
+        let endpoint = server.uri();
+        let dir = tmp.path().join("m");
+        tokio::task::spawn_blocking(move || {
+            let out = common::cli()
+                .args(["--endpoint", &endpoint, "--app-token", "TKN"])
+                .args([
+                    "debug-files",
+                    "upload",
+                    "--type",
+                    "sourcemaps",
+                    "--strip-sources-content",
+                ])
+                .args(["--version", "1", "--build", "1"])
+                .arg(&dir)
+                .output()
+                .unwrap();
+            assert_eq!(code_of(&out), 0, "{}", stderr(&out));
+            assert!(!stderr(&out).contains("UNSTRIPPED"), "{}", stderr(&out));
+        })
+        .await
+        .unwrap();
+        let uploaded = String::from_utf8(uploaded_entry(&server).await).unwrap();
+        assert!(
+            !uploaded.contains("secret source"),
+            "{n}: the source leaked: {uploaded}"
+        );
+        assert!(
+            uploaded.contains(&format!(r#""n":{n}"#)),
+            "{n}: number text changed: {uploaded}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

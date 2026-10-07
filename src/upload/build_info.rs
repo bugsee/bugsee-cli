@@ -148,13 +148,14 @@ pub async fn run(params: Params<'_>, policy: RetryPolicy) -> Result<Outcome> {
     // Omitting it makes S3 recompute a different signature → 403
     // SignatureDoesNotMatch. The artefact (`build.rs`) and chunk (`chunked.rs`)
     // PUTs set the same header for the same reason.
-    let put = http::send_with_retry(policy, "build-info PUT", true, || {
-        client
-            .put(&presigned)
-            .header(reqwest::header::CONTENT_TYPE, "application/octet-stream")
-            .header(reqwest::header::CONTENT_LENGTH, body_len)
-            .body(http::file_body(&zip_path))
-    })
+    let put = http::put_file(
+        &client,
+        policy,
+        "build-info PUT",
+        &presigned,
+        &zip_path,
+        Some("application/octet-stream"),
+    )
     .await?;
 
     let put_status = put.status();
