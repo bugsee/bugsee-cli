@@ -13,7 +13,7 @@
 //! | 1      | Unexpected / unhandled error.                                        | **yes**                  |
 //! | 2      | Usage / argv error (likely a plugin↔CLI version mismatch).           | **yes**                  |
 //! | 10–19  | Input / discovery problems (file not found, unparseable format).      | no                       |
-//! | 20–29  | Configuration problems (bad token, unreachable endpoint).            | no                       |
+//! | 20–29  | Configuration problems (missing/rejected token, bad flag combo).     | no                       |
 //! | 30–39  | Upload problems (network, server 4xx/5xx).                            | no                       |
 //! | 40     | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
 //! | 41+    | Reserved.                                                            | no                       |

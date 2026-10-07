@@ -268,23 +268,36 @@ pub fn resolve_machine_label(env: &HashMap<String, String>) -> Option<String> {
 }
 
 fn local_hostname() -> Option<String> {
-    // Absolute path `/usr/bin/hostname` (POSIX standard location on
-    // both macOS and Linux). The rest of this codebase already uses
-    // absolute paths for system utilities (`/usr/bin/xcodebuild`,
-    // `/usr/bin/otool`); the previously-bare `Command::new("hostname")`
-    // was a PATH-hijack outlier — an attacker who can drop a `hostname`
-    // shim earlier on PATH (CI workspace, direnv-prepended project
-    // bin/, etc.) would have escalated to "run as the build user".
-    let output = Command::new("/usr/bin/hostname").output().ok()?;
-    if !output.status.success() {
+    let host = os_hostname()?;
+    let host = host.trim();
+    (!host.is_empty()).then(|| host.to_string())
+}
+
+/// The kernel's hostname, read directly rather than by shelling out to
+/// `hostname`. A bare `Command::new("hostname")` is a PATH-hijack risk (a
+/// `hostname` shim earlier on PATH runs as the build user), and an absolute
+/// path is not portable: `/usr/bin/hostname` does not exist on macOS, which
+/// has `/bin/hostname`, so the fallback silently returned nothing there.
+#[cfg(unix)]
+fn os_hostname() -> Option<String> {
+    // 256 covers both Linux's HOST_NAME_MAX (64) and macOS's MAXHOSTNAMELEN
+    // (256); the extra byte guarantees a terminating NUL even if a platform
+    // truncates without writing one.
+    let mut buf = [0u8; 257];
+    // SAFETY: `buf` is valid for writes of `buf.len() - 1` bytes, and the last
+    // byte stays 0, so the result is always NUL-terminated within `buf`.
+    let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast(), buf.len() - 1) };
+    if rc != 0 {
         return None;
     }
-    let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if s.is_empty() {
-        None
-    } else {
-        Some(s)
-    }
+    let len = buf.iter().position(|&b| b == 0)?;
+    Some(String::from_utf8_lossy(&buf[..len]).into_owned())
+}
+
+/// Windows sets `COMPUTERNAME` for every process.
+#[cfg(not(unix))]
+fn os_hostname() -> Option<String> {
+    std::env::var("COMPUTERNAME").ok()
 }
 
 /// Truthy-token check matching the Android Gradle plugin's set.
@@ -541,6 +554,29 @@ mod tests {
             resolve_machine_label(&env).as_deref(),
             Some("ci:ci-runner-42"),
         );
+    }
+
+    /// Every Unix host has a hostname, so the fallback must find it. The
+    /// previous `/usr/bin/hostname` shell-out returned `None` on macOS (the
+    /// binary lives at `/bin/hostname` there), and the test below accepts
+    /// `None`, so nothing caught it.
+    #[test]
+    #[cfg(unix)]
+    fn local_hostname_resolves_on_unix() {
+        let host = local_hostname().expect("a Unix host always has a hostname");
+        assert!(!host.is_empty());
+        assert_eq!(host, host.trim(), "no trailing newline / NUL");
+        assert!(!host.contains('\0'));
+    }
+
+    /// Windows counterpart of the Unix pin: `COMPUTERNAME` is set for every
+    /// process, so the fallback must find it rather than pass as `None`.
+    #[test]
+    #[cfg(windows)]
+    fn local_hostname_resolves_on_windows() {
+        let host = local_hostname().expect("Windows always sets COMPUTERNAME");
+        assert!(!host.is_empty());
+        assert_eq!(host, host.trim());
     }
 
     #[test]
