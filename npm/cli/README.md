@@ -1,7 +1,7 @@
 # @bugsee/cli
 
 The [Bugsee CLI](https://github.com/bugsee/bugsee-cli) — a cross-platform Rust
-binary that collects debug information files (dSYM, ELF, PE/PDB, R8/ProGuard
+binary that collects debug information files (dSYM, ELF, Windows PDB, R8/ProGuard
 mappings, JS source maps), resolves build-environment metadata, and uploads
 symbols to Bugsee.
 
