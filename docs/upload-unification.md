@@ -1,6 +1,6 @@
 # Build-time upload unification
 
-**Status:** Implemented. `bugsee-cli` ships `upload build` (single PUT, or `--chunked`), `upload build-info` and zstd mapping packing, and the producers delegate to it: the Android Gradle plugin and the fastlane BugseeAgent (CLI floor 0.6.0) and the iOS SDK BugseeAgent (floor 0.3.0). Still open: the cross-platform items under [Cross-platform readiness](#cross-platform-readiness). Go-live steps: [`upload-unification-activation.md`](./upload-unification-activation.md).
+**Status:** Original design (2026-06), kept in its original tense — "today" and "Future:" below describe the platform *before* this work. Most of it has since shipped in `bugsee-cli` (`upload build`, `upload build-info`, zstd mapping packing); what is live now is in the status note at the top of [`upload-unification-activation.md`](./upload-unification-activation.md). Still open: [Cross-platform readiness](#cross-platform-readiness).
 **Affects:** `bugsee-cli`, `worker`, `appserver`, `android/gradle-plugin`, `ios/fastlane-plugin-bugsee`, `ios/sdk` BugseeAgent
 **Out of scope:** Runtime SDK telemetry uploads (crashes, sessions, attributes — those use a different transport via the SDKs themselves)
 

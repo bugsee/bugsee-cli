@@ -2,18 +2,23 @@
 
 Companion to [`upload-unification.md`](./upload-unification.md). That doc is the
 design; this is the **ordered go-live procedure** for turning on the
-build-time upload unification (build-info bundle + zstd mapping packing) that is
-currently built, tested, and **dormant behind activation gates**.
+build-time upload unification (build-info bundle + zstd mapping packing), which
+was built, tested and **dormant behind activation gates** when this runbook was
+written.
 
-> **Update (2026-10-07):** the CLI-side gates below are met. `bugsee-cli` is
-> published (0.7.12 on GitHub Releases, npm and `download.bugsee.com/cli`), and
-> the producers pin CLI floors that include `upload build` / `upload build-info`
-> — the Gradle plugin's `CliBinaryResolver.DEFAULT_VERSION` and the fastlane
-> BugseeAgent at 0.6.0, the iOS SDK BugseeAgent at 0.3.0 — so their
-> CLI-delegated paths are active. The rest of this page is the original
-> procedure, kept for the per-track server-side gates and the verification steps.
+> **Current status (2026-10-07).** Gate (a) is met: `bugsee-cli` is published
+> (0.7.12 on GitHub Releases, npm and `download.bugsee.com/cli`). Gate (b) is met
+> in the producers' source: the Gradle plugin's `CliBinaryResolver.DEFAULT_VERSION`
+> and the fastlane BugseeAgent pin CLI 0.6.0, the iOS SDK BugseeAgent requires
+> 0.3.0 — all include `pack`, `upload build` and `upload build-info`. **Not tracked
+> here, so verify before relying on them:** whether a plugin release carrying that
+> floor has reached customers (the mapping-zstd track's adoption gate), and gates
+> (c) appserver + worker deployed and (d) the per-org
+> `BUGSEE_FEATURE_BUILD_INFO_BUNDLE_ENABLED` flag for the build-info track.
+> Everything below is the original procedure; its version numbers (0.2.0, 0.1.0)
+> are historical.
 
-Status at time of writing (2026-06-15): all code is committed on
+**Historical** — status when this runbook was written (2026-06-15): all code is committed on
 `build-info-bundle` branches across `bugsee-cli`, `android/gradle-plugin`,
 `appserver`, `worker` (+ iOS agents). Nothing is live. `bugsee-cli` is at
 `0.2.0` (unpublished); the Gradle plugin still pins `DEFAULT_VERSION = "0.1.0"`,

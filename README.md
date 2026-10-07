@@ -128,7 +128,7 @@ Pass `--dry-run` to verify discovery and see the preflight warnings without uplo
 bugsee-cli vcs-metadata [--working-dir <PATH>]
 ```
 
-Resolves VCS metadata (provider, commit SHA, base SHA, branch, base branch, PR number, repo) from CI provider env vars (GitHub Actions, GitLab CI, Bitbucket Pipelines). On any other CI, or locally, it falls back to `git` in `--working-dir` (default: the current directory), which yields only `commit_sha` and `branch`. Output shape pinned by `tests/cross_language_contract.rs`:
+Resolves VCS metadata (provider, commit SHA, branch, base branch, PR number, repo) from CI provider env vars (GitHub Actions, GitLab CI, Bitbucket Pipelines). On any other CI, or locally, it falls back to `git` in `--working-dir` (default: the current directory), which yields only `commit_sha` and `branch`. Output shape pinned by `tests/cross_language_contract.rs`:
 
 ```json
 {
@@ -516,7 +516,7 @@ An unknown or malformed flag is clap's usage error, exit 2; exit 20 is a valid f
 
 The fallback rule: codes ≤ 2 mean the CLI never got a fair chance to run; codes ≥ 10 are substantive failures the in-language uploader would hit the same way. See `src/exit_code.rs` for the source-of-truth enum.
 
-Note: subcommands that emit JSON (vcs-metadata, ios-deps collect, build-env *, dsym *) return exit **0** even when no useful result is found — callers distinguish "no result" from "tool error" by checking the JSON shape (empty list / empty object / specific field absence), not the exit code. This lets Python integrators use `check=False` + `json.loads(stdout)` without branching on returncode.
+Note: the metadata subcommands return exit **0** even when no useful result is found. The JSON emitters (`vcs-metadata`, `ios-deps collect`, `build-env read-plist`, `dsym *`) signal "no result" through the JSON shape (empty list / empty object / specific field absence), so Python integrators can use `check=False` + `json.loads(stdout)` without branching on returncode. `build-env xcode-version` and `build-env machine-label` print **plain text**, not JSON — an empty line when unresolved — so read their stdout as a string; `json.loads` fails on a successful `16.2.0`.
 
 ## Telemetry header
 
