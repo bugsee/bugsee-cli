@@ -21,7 +21,9 @@ pub enum DebugFilesCommand {
         /// is walked recursively for native libraries (e.g. AGP's
         /// `merged_native_libs`; directory symlinks are not descended, an I/O error
         /// fails the run, and no match exits 10), and a file is a
-        /// `native-debug-symbols.zip`.
+        /// `native-debug-symbols.zip`. The libraries are memory-mapped while scanned, so
+        /// they must be finished build outputs: do not run this while a linker is still
+        /// writing into the directory.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
