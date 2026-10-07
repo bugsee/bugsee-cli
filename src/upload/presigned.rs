@@ -232,16 +232,10 @@ pub async fn put_payload(
     // attempt) held two-plus copies of the archive in memory per upload. The
     // length is sent explicitly because a streamed body would otherwise go out
     // chunked, which a presigned S3 PUT rejects.
-    let len = http::file_len(payload).await?;
     // The PUT is idempotent (overwrite of the same key) — retry on transport
     // AND retriable status. Each attempt re-opens the file from the start.
-    let put_resp = http::send_with_retry(policy, "symbol PUT", true, || {
-        client
-            .put(presigned_url)
-            .header(reqwest::header::CONTENT_LENGTH, len)
-            .body(http::file_body(payload))
-    })
-    .await?;
+    let put_resp =
+        http::put_file(client, policy, "symbol PUT", presigned_url, payload, None).await?;
 
     let put_status = put_resp.status();
     if !put_status.is_success() {
@@ -622,6 +616,40 @@ mod tests {
     }
 
     /// A payload that vanished is a reported error, not a panic or a hang.
+    /// A freshly created S3 bucket answers the presigned URL with a temporary 307 to the
+    /// regional endpoint; the symbol PUT must follow it (a streamed body is not replayed by
+    /// reqwest on its own).
+    #[tokio::test]
+    async fn put_payload_follows_a_temporary_redirect() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/bucket/key"))
+            .respond_with(
+                ResponseTemplate::new(307)
+                    .insert_header("Location", format!("{}/regional/key", server.uri())),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/regional/key"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let (payload, data) = patterned_payload(150_001);
+        let client = http::build_client().unwrap();
+        put_payload(
+            &client,
+            RetryPolicy::none(),
+            &format!("{}/bucket/key", server.uri()),
+            payload.path(),
+        )
+        .await
+        .unwrap();
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2);
+        assert_eq!(reqs[1].body, data);
+    }
+
     #[tokio::test]
     async fn put_payload_reports_a_missing_payload_file() {
         let server = MockServer::start().await;
