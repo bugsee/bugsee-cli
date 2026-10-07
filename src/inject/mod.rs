@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::error::{Error, Result};
 
+pub mod mapjson;
 pub mod sri;
 
 /// Fixed namespace for Bugsee sourcemap debug-ids — keeps UUIDv5 generation
@@ -54,15 +55,48 @@ pub fn compute_debug_id(content: &[u8]) -> Uuid {
 /// server while the upload reported the new one as already there. The bundle's
 /// length is hashed ahead of it, so the boundary between the two inputs cannot
 /// shift without changing the id.
+#[cfg(test)]
 pub fn compute_debug_id_with_map(bundle: &[u8], map: Option<&[u8]>) -> Uuid {
     let Some(map) = map else {
         return compute_debug_id(bundle);
     };
-    let mut input = Vec::with_capacity(8 + bundle.len() + map.len());
-    input.extend_from_slice(&(bundle.len() as u64).to_le_bytes());
-    input.extend_from_slice(bundle);
-    input.extend_from_slice(map);
-    Uuid::new_v5(&DEBUG_ID_NAMESPACE, &input)
+    // Reading a slice cannot fail.
+    hash_with_map(bundle, map).expect("reading from a slice cannot fail")
+}
+
+/// [`compute_debug_id_with_map`] with the map STREAMED from `map_path` instead of
+/// held in memory: a map is tens of MB, and concatenating it with the bundle
+/// into one buffer just to hash it was a second full copy.
+pub fn compute_debug_id_with_map_file(bundle: &[u8], map_path: &Path) -> std::io::Result<Uuid> {
+    hash_with_map(
+        bundle,
+        std::io::BufReader::new(std::fs::File::open(map_path)?),
+    )
+}
+
+/// UUIDv5 over `len(bundle) as u64 LE || bundle || map`, computed incrementally.
+///
+/// A v5 UUID is the first 16 bytes of SHA-1(namespace || name) with the
+/// version/variant bits set, so feeding the pieces to the hasher one at a time
+/// gives the same id as `Uuid::new_v5` over their concatenation.
+fn hash_with_map(bundle: &[u8], mut map: impl std::io::Read) -> std::io::Result<Uuid> {
+    use sha1::{Digest as _, Sha1};
+    let mut hasher = Sha1::new();
+    hasher.update(DEBUG_ID_NAMESPACE.as_bytes());
+    hasher.update((bundle.len() as u64).to_le_bytes());
+    hasher.update(bundle);
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = map.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut first16 = [0u8; 16];
+    first16.copy_from_slice(&digest[..16]);
+    Ok(uuid::Builder::from_sha1_bytes(first16).into_uuid())
 }
 
 /// The runtime stub appended to each JS bundle. On load it registers
@@ -352,8 +386,10 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
             }
         },
         None => {
-            let map_bytes = map_path.as_deref().map(std::fs::read).transpose()?;
-            let id = compute_debug_id_with_map(content.as_bytes(), map_bytes.as_deref());
+            let id = match map_path.as_deref() {
+                Some(m) => compute_debug_id_with_map_file(content.as_bytes(), m)?,
+                None => compute_debug_id(content.as_bytes()),
+            };
             if !dry_run {
                 std::fs::write(js_path, format!("{content}{}", runtime_stub(&id)))?;
             }
@@ -392,19 +428,18 @@ fn restamp_id<'a>(
     let Some(original) = content.strip_suffix(runtime_stub(&id).as_str()) else {
         return Ok(None);
     };
-    let map_bytes = std::fs::read(map_path)?;
+    let file = std::fs::File::open(map_path)?;
     // A map that is not JSON is not re-keyed here: writing the id into it fails
     // next, and it must fail BEFORE the bundle is rewritten, as it always did.
-    let Ok(map) = serde_json::from_slice::<serde_json::Value>(&map_bytes) else {
+    let Ok(top) =
+        mapjson::top_level_strings(std::io::BufReader::new(file), &["debug_id", "debugId"])
+    else {
         return Ok(None);
     };
-    let carries_id = ["debug_id", "debugId"]
-        .iter()
-        .any(|k| map.get(*k).and_then(serde_json::Value::as_str).is_some());
-    if carries_id {
+    if top.values.iter().any(Option::is_some) {
         return Ok(None);
     }
-    let fresh = compute_debug_id_with_map(original.as_bytes(), Some(&map_bytes));
+    let fresh = compute_debug_id_with_map_file(original.as_bytes(), map_path)?;
     Ok((fresh.to_string() != id).then_some((original, fresh)))
 }
 
@@ -500,25 +535,15 @@ fn write_map_debug_id(
     freshly_computed: bool,
     dry_run: bool,
 ) -> Result<bool> {
-    let raw = std::fs::read_to_string(map_path)?;
-    let mut value: serde_json::Value = serde_json::from_str(&raw).map_err(|e| {
-        Error::InputInvalid(format!(
-            "sourcemap is not valid JSON: {e} ({})",
-            map_path.display()
-        ))
-    })?;
-    let obj = value.as_object_mut().ok_or_else(|| {
-        Error::InputInvalid(format!(
+    // Pass 1 (streamed, also validates the whole file): what ids does it carry?
+    let top = map_top_level(map_path, &["debug_id", "debugId"])?;
+    if !top.is_object {
+        return Err(Error::InputInvalid(format!(
             "sourcemap is not a JSON object: {}",
             map_path.display()
-        ))
-    })?;
-    let current = |k: &str| {
-        obj.get(k)
-            .and_then(serde_json::Value::as_str)
-            .map(str::to_string)
-    };
-    let (snake, camel) = (current("debug_id"), current("debugId"));
+        )));
+    }
+    let (snake, camel) = (top.values[0].clone(), top.values[1].clone());
     match map_id_action(
         snake.as_deref(),
         camel.as_deref(),
@@ -544,18 +569,39 @@ fn write_map_debug_id(
             return Ok(false);
         }
     }
-    obj.insert(
-        "debug_id".into(),
-        serde_json::Value::String(debug_id.to_string()),
-    );
-    obj.insert(
-        "debugId".into(),
-        serde_json::Value::String(debug_id.to_string()),
-    );
     if !dry_run {
-        let serialized = serde_json::to_string(&value)
-            .map_err(|e| Error::InputInvalid(format!("failed to serialize sourcemap JSON: {e}")))?;
-        std::fs::write(map_path, serialized)?;
+        // Pass 2: stream the map into a scratch file with the ids set, then write its
+        // CONTENT into the original (not rename: that would swap the inode and drop the
+        // symlink / hard link the build gave the map; and not `fs::copy`: it also copies
+        // the scratch file's metadata, i.e. its 0o600 mode, onto the map).
+        // The scratch file is anonymous (a killed run leaves no stray `.tmpXXXX`). It lives
+        // beside the map, on the volume that already holds one copy of it: a tens-of-MB map
+        // must not need that much free space in `$TMPDIR`, which in CI containers is often a
+        // small tmpfs. Only when the directory refuses a file (it is read-only: editing the
+        // map in place never needed it writable) does it fall back to the OS temp dir.
+        let dir = map_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let mut scratch = tempfile::tempfile_in(dir).or_else(|_| tempfile::tempfile())?;
+        {
+            let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
+            let mut out = std::io::BufWriter::new(&scratch);
+            mapjson::set_debug_ids(input, &mut out, debug_id).map_err(|e| match e {
+                mapjson::MapJsonError::Io(e) => Error::Io(e),
+                mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
+                    "failed to rewrite sourcemap JSON: {m} ({})",
+                    map_path.display()
+                )),
+            })?;
+            std::io::Write::flush(&mut out)?;
+        }
+        let mut dest = std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(map_path)?;
+        std::io::Seek::seek(&mut scratch, std::io::SeekFrom::Start(0))?;
+        std::io::copy(&mut scratch, &mut dest)?;
     }
     Ok(true)
 }
@@ -564,22 +610,24 @@ fn write_map_debug_id(
 /// / legacy `uuid`, in that precedence. Mirrors the worker's
 /// `symbolfiles/sourcemap.py:parse`.
 pub fn read_debug_id(map_path: &Path) -> Result<Option<String>> {
-    // Mapped rather than read into a String: the JSON tree below is the only
-    // copy this needs. UTF-8 is checked up front so a non-UTF-8 map still fails
-    // as an I/O `InvalidData` error, exactly as `read_to_string` did.
-    let bytes = crate::symbols::mapped::map_file(map_path)?;
-    let raw = std::str::from_utf8(&bytes)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-    let value: serde_json::Value = serde_json::from_str(raw).map_err(|e| {
-        Error::InputInvalid(format!(
-            "sourcemap is not valid JSON: {e} ({})",
+    // Walked as a stream: no copy of the map and no JSON tree, so a 100 MB map
+    // costs a few KB. Invalid UTF-8 inside a string stays an I/O `InvalidData`
+    // error, as it was with `read_to_string`.
+    let top = map_top_level(map_path, &["debug_id", "debugId", "uuid"])?;
+    Ok(top.values.into_iter().flatten().next())
+}
+
+/// Stream-read the string values of top-level `keys` of the map at `map_path`.
+/// Not-JSON becomes `InputInvalid` (naming the file); an I/O failure stays `Io`.
+fn map_top_level(map_path: &Path, keys: &[&str]) -> Result<mapjson::TopLevel> {
+    let file = std::io::BufReader::new(std::fs::File::open(map_path)?);
+    mapjson::top_level_strings(file, keys).map_err(|e| match e {
+        mapjson::MapJsonError::Io(e) => Error::Io(e),
+        mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
+            "sourcemap is not valid JSON: {m} ({})",
             map_path.display()
-        ))
-    })?;
-    Ok(["debug_id", "debugId", "uuid"]
-        .iter()
-        .find_map(|k| value.get(*k).and_then(serde_json::Value::as_str))
-        .map(str::to_string))
+        )),
+    })
 }
 
 #[cfg(test)]
@@ -589,6 +637,64 @@ mod tests {
     /// `set_current_dir` is process-global and the test harness is threaded: the tests that check a
     /// RELATIVE root have to take turns, or they change the directory out from under each other.
     static CWD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn streamed_map_hash_equals_the_concatenated_uuid_v5_formula() {
+        // The id is a public key (it is embedded in shipped bundles): the
+        // incremental hash must reproduce `Uuid::new_v5` over `len || bundle ||
+        // map` bit for bit, including across the 64 KiB read-buffer boundary.
+        let dir = tempfile::tempdir().unwrap();
+        for map_len in [0usize, 1, 65_535, 65_536, 65_537, 300_001] {
+            let bundle = b"console.log('x')";
+            let map: Vec<u8> = (0..map_len).map(|i| (i % 251) as u8).collect();
+            let mut input = (bundle.len() as u64).to_le_bytes().to_vec();
+            input.extend_from_slice(bundle);
+            input.extend_from_slice(&map);
+            let expected = Uuid::new_v5(&DEBUG_ID_NAMESPACE, &input);
+            let p = dir.path().join("m.map");
+            std::fs::write(&p, &map).unwrap();
+            assert_eq!(
+                compute_debug_id_with_map_file(bundle, &p).unwrap(),
+                expected
+            );
+            assert_eq!(compute_debug_id_with_map(bundle, Some(&map)), expected);
+        }
+    }
+
+    /// The rewrite must leave the map's mode, inode and links as the bundler made them. A
+    /// sibling temp file is 0o600, so any step that carries ITS metadata over (as
+    /// `fs::copy` does) silently tightens a 0o644 map to owner-only. Distinct modes on
+    /// the map and the bundle make that visible.
+    #[cfg(unix)]
+    #[test]
+    fn rewriting_a_map_keeps_its_mode_inode_and_hard_links() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let map = dir.path().join("a.js.map");
+        let link = dir.path().join("a.js.map.link");
+        std::fs::write(&js, "a()\n").unwrap();
+        std::fs::write(&map, r#"{"version":3,"mappings":"AAAA"}"#).unwrap();
+        std::fs::hard_link(&map, &link).unwrap();
+        std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let ino = std::fs::metadata(&map).unwrap().ino();
+
+        inject_paths(&[dir.path().to_path_buf()], &[], true, false).unwrap();
+
+        let after = std::fs::metadata(&map).unwrap();
+        assert_eq!(
+            after.permissions().mode() & 0o777,
+            0o644,
+            "the mode must not be tightened"
+        );
+        assert_eq!(after.ino(), ino, "same inode: rewritten in place");
+        assert!(std::fs::read_to_string(&map).unwrap().contains("debug_id"));
+        assert_eq!(
+            std::fs::read(&link).unwrap(),
+            std::fs::read(&map).unwrap(),
+            "a hard link sees the new content"
+        );
+    }
 
     #[test]
     fn is_contained_relative_rejects_traversal_and_absolute() {

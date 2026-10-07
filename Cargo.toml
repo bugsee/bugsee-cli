@@ -172,6 +172,10 @@ tempfile = "3"
 # [dependencies] table (NOT a cfg(target) table).
 self-replace = "1"
 
+# Streaming JSON reader/writer: lets the source-map paths read or rewrite a few
+# top-level keys of a tens-of-MB map without building a serde_json::Value tree.
+struson = "0.7"
+
 # Unix double-fork for `xcode post-action`'s background (daemon) mode. This is a
 # TARGET-specific table, so it MUST come AFTER the main [dependencies] table —
 # placed mid-table, TOML would capture every following key into the unix-only
