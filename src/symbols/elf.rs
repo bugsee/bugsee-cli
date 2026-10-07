@@ -32,14 +32,21 @@ use symbolic_debuginfo::Archive;
 
 use super::suffix::ExtraSuffixes;
 
-fn sha1_hex(bytes: &[u8]) -> String {
-    let digest: [u8; 20] = Sha1::digest(bytes).into();
-    hex::encode(digest)
-}
-
 /// SHA-1 hex of a file's bytes — the wire `hash` for a per-`.so` upload.
 pub fn sha1_hex_of_file(path: &Path) -> std::io::Result<String> {
-    Ok(sha1_hex(&std::fs::read(path)?))
+    // Streamed: the hashed file is the packed archive, which can be tens of MB.
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha1::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest: [u8; 20] = hasher.finalize().into();
+    Ok(hex::encode(digest))
 }
 
 /// One native library found in an AGP `native-debug-symbols.zip` or a scanned directory.
@@ -163,15 +170,32 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         if !(is_native_lib_entry(&file_name) || extra.matches(&file_name)) {
             continue;
         }
-        let bytes = std::fs::read(entry.path()).map_err(|e| {
+        let with_path = |e: std::io::Error| {
             std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
-        })?;
+        };
+        let file = std::fs::File::open(entry.path()).map_err(with_path)?;
+        let len = file.metadata().map_err(with_path)?.len();
+        // Map instead of reading: identity needs only the headers and notes, so
+        // a 100+ MB unstripped library costs a few KB of resident memory, not a
+        // full copy. (An empty file cannot be mapped; it has no build-id anyway.)
+        //
+        // SAFETY: the map is read-only and dropped at the end of this iteration.
+        // The contract (memmap2's): nothing may truncate or rewrite the library while
+        // it is mapped (SIGBUS / undefined behaviour otherwise). It holds for
+        // build-finalized outputs; a directory still being written by a linker is
+        // NOT a supported input (documented on `paths` in `--help`).
+        let map = if len == 0 {
+            None
+        } else {
+            Some(unsafe { memmap2::Mmap::map(&file) }.map_err(with_path)?)
+        };
+        let bytes: &[u8] = map.as_deref().unwrap_or(&[]);
         let ElfIdentity {
             build_id,
             arch,
             has_debug_info,
             has_symbols,
-        } = parse_elf_identity(&bytes);
+        } = parse_elf_identity(bytes);
         let name = entry
             .path()
             .strip_prefix(dir)
@@ -183,7 +207,7 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
             build_id,
             arch,
             path: entry.path().to_path_buf(),
-            richness: (has_debug_info, has_symbols, bytes.len() as u64),
+            richness: (has_debug_info, has_symbols, len),
         });
     }
     Ok(libs)
@@ -292,6 +316,35 @@ mod tests {
             sha1_hex_of_file(&path).unwrap(),
             "a9993e364706816aba3e25717850c26c9cd0d89d"
         );
+    }
+
+    #[test]
+    fn sha1_hex_of_file_streams_across_buffer_boundaries() {
+        // Larger than the 64 KiB read buffer and not a multiple of it, so a
+        // chunking bug (dropped or repeated tail) changes the digest.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big");
+        let data: Vec<u8> = (0..300_001u32).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &data).unwrap();
+        let expected: [u8; 20] = Sha1::digest(&data).into();
+        assert_eq!(sha1_hex_of_file(&path).unwrap(), hex::encode(expected));
+        std::fs::write(&path, b"").unwrap();
+        assert_eq!(
+            sha1_hex_of_file(&path).unwrap(),
+            "da39a3ee5e6b4b0d3255bfef95601890afd80709",
+            "SHA-1 of the empty input"
+        );
+    }
+
+    #[test]
+    fn scan_dir_handles_an_empty_library_file() {
+        // Mapping a zero-length file fails; it must come out as "no build-id"
+        // (warn + skip upstream), not as a scan error.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("libempty.so"), b"").unwrap();
+        let libs = scan_dir(dir.path(), &ExtraSuffixes::default()).unwrap();
+        assert_eq!(names(&libs), ["libempty.so"]);
+        assert_eq!(libs[0].build_id, None);
     }
 
     #[test]

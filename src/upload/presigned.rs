@@ -228,11 +228,20 @@ pub async fn put_payload(
     payload: &Path,
 ) -> Result<()> {
     tracing::debug!(url = %http::redact_url(presigned_url), "PUT payload");
-    let payload_bytes = tokio::fs::read(payload).await?;
+    // Stream the payload from disk: reading it whole (and cloning it per retry
+    // attempt) held two-plus copies of the archive in memory per upload. The
+    // length is sent explicitly because a streamed body would otherwise go out
+    // chunked, which a presigned S3 PUT rejects.
+    let len = tokio::fs::metadata(payload).await?.len();
     // The PUT is idempotent (overwrite of the same key) — retry on transport
-    // AND retriable status.
+    // AND retriable status. Each attempt re-opens the file from the start.
     let put_resp = http::send_with_retry(policy, "symbol PUT", true, || {
-        client.put(presigned_url).body(payload_bytes.clone())
+        client
+            .put(presigned_url)
+            .header(reqwest::header::CONTENT_LENGTH, len)
+            .body(reqwest::Body::wrap_stream(file_chunks(
+                payload.to_path_buf(),
+            )))
     })
     .await?;
 
@@ -246,6 +255,38 @@ pub async fn put_payload(
     }
 
     Ok(())
+}
+
+/// The file's bytes in 64 KiB chunks. The file is opened lazily on first poll so
+/// an open error surfaces as a failed (retriable) request, not a panic.
+fn file_chunks(
+    path: std::path::PathBuf,
+) -> impl futures_util::Stream<Item = std::io::Result<Vec<u8>>> + Send + 'static {
+    use tokio::io::AsyncReadExt;
+    enum St {
+        Unopened(std::path::PathBuf),
+        Open(tokio::fs::File),
+        Done,
+    }
+    futures_util::stream::unfold(St::Unopened(path), |st| async move {
+        let mut file = match st {
+            St::Unopened(p) => match tokio::fs::File::open(p).await {
+                Ok(f) => f,
+                Err(e) => return Some((Err(e), St::Done)),
+            },
+            St::Open(f) => f,
+            St::Done => return None,
+        };
+        let mut buf = vec![0u8; 64 * 1024];
+        match file.read(&mut buf).await {
+            Ok(0) => None,
+            Ok(n) => {
+                buf.truncate(n);
+                Some((Ok(buf), St::Open(file)))
+            }
+            Err(e) => Some((Err(e), St::Done)),
+        }
+    })
 }
 
 /// Run the two-stage presigned upload for a single symbol artifact
@@ -533,6 +574,101 @@ mod tests {
         .await
         .unwrap();
         assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+    }
+
+    /// A payload bigger than the 64 KiB stream chunk and not a multiple of it.
+    fn patterned_payload(len: usize) -> (tempfile::NamedTempFile, Vec<u8>) {
+        use std::io::Write;
+        let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&data).unwrap();
+        (f, data)
+    }
+
+    /// The PUT streams the file but must still go out with an exact
+    /// `Content-Length` (a presigned S3 PUT rejects a chunked body) and every byte.
+    #[tokio::test]
+    async fn put_payload_streams_the_whole_file_with_an_exact_content_length() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .and(path("/put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let (payload, data) = patterned_payload(300_001);
+        let client = http::build_client().unwrap();
+        put_payload(
+            &client,
+            RetryPolicy::none(),
+            &format!("{}/put", server.uri()),
+            payload.path(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(
+            reqs[0]
+                .headers
+                .get("content-length")
+                .map(|v| v.to_str().unwrap().to_owned()),
+            Some(data.len().to_string())
+        );
+        assert!(
+            reqs[0].headers.get("transfer-encoding").is_none(),
+            "must not be chunked"
+        );
+        assert_eq!(reqs[0].body, data);
+    }
+
+    /// Each retry re-opens the file: the second attempt must carry the full body,
+    /// not whatever a shared cursor had left over.
+    #[tokio::test]
+    async fn put_payload_retry_resends_the_complete_body() {
+        let server = MockServer::start().await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(503))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+        let (payload, data) = patterned_payload(200_000);
+        let client = http::build_client().unwrap();
+        put_payload(
+            &client,
+            RetryPolicy::fast(3),
+            &format!("{}/put", server.uri()),
+            payload.path(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = server.received_requests().await.unwrap();
+        assert_eq!(reqs.len(), 2, "one 503 then one success");
+        for r in &reqs {
+            assert_eq!(r.body, data, "every attempt sends the whole payload");
+        }
+    }
+
+    /// A payload that vanished is a reported error, not a panic or a hang.
+    #[tokio::test]
+    async fn put_payload_reports_a_missing_payload_file() {
+        let server = MockServer::start().await;
+        let client = http::build_client().unwrap();
+        let err = put_payload(
+            &client,
+            RetryPolicy::none(),
+            &format!("{}/put", server.uri()),
+            Path::new("/nonexistent/payload.zip"),
+        )
+        .await
+        .unwrap_err();
+        assert!(!err.to_string().is_empty());
     }
 
     #[tokio::test]

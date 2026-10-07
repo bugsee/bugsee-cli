@@ -20,6 +20,13 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`--type elf` collects every input before uploading anything.** A corrupt second zip now aborts
   (exit 11) before the first zip uploads, instead of after. A path that does not exist now exits
   10 (input not found) rather than 11; both are in the no-fallback range.
+- **Presigned symbol uploads no longer hold the whole archive in memory.** The PUT body and the
+  SHA-1 are streamed from disk in 64 KiB chunks (the PUT keeps an exact `Content-Length` and
+  re-opens the file per retry), and the ELF identity scan memory-maps libraries instead of reading
+  them. Peak RSS for four 100 MB libraries dropped from 564 MB to 36 MB. Wire format unchanged.
+  The one new constraint: a directory passed to `--type elf` must not be written to while it is
+  scanned (a library truncated under its mapping is undefined behaviour, in practice SIGBUS), so
+  run it after the native build task has finished, as the Gradle task graph does.
 
 ## [0.7.13] - 2026-10-07
 
