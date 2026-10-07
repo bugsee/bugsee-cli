@@ -140,25 +140,19 @@ pub fn collect_libs(
 
 /// Walk `dir` recursively for native libraries (same name rules as the zip
 /// entries), reading each one's identity in place. `name` is the path relative
-/// to `dir`. Directory symlinks are not descended, file symlinks are read; unreadable entries are
-/// skipped with a warning rather than failing the whole scan. Sorted by path so
-/// the "first entry wins" tie-break in [`keep_richest_per_build_id`] is stable.
+/// to `dir`. Directory symlinks are not descended, file symlinks are read. Any
+/// I/O error (unreadable subdirectory, unreadable library, dangling link) fails
+/// the scan: skipping would upload a partial set (a whole ABI missing) and let
+/// the build go green, the same way the zip path fails on a read error. Sorted
+/// by path so the "first entry wins" tie-break in [`keep_richest_per_build_id`]
+/// is stable.
 pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib>> {
     let mut libs = Vec::new();
     for entry in walkdir::WalkDir::new(dir)
         .follow_links(false)
         .sort_by_file_name()
     {
-        let entry = match entry {
-            Ok(e) => e,
-            // An unreadable root means nothing was scanned: fail, never exit 0 with
-            // a misleading "pass --extension" hint.
-            Err(e) if e.depth() == 0 => return Err(e.into()),
-            Err(e) => {
-                tracing::warn!(error = %e, "skipping unreadable path while scanning for native libraries");
-                continue;
-            }
-        };
+        let entry = entry?;
         // Directory symlinks are never descended (a walk must stay under the
         // root); a symlink to a FILE is a candidate and `read` follows it.
         let ft = entry.file_type();
@@ -169,13 +163,9 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         if !(is_native_lib_entry(&file_name) || extra.matches(&file_name)) {
             continue;
         }
-        let bytes = match std::fs::read(entry.path()) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %entry.path().display(), error = %e, "skipping unreadable native library");
-                continue;
-            }
-        };
+        let bytes = std::fs::read(entry.path()).map_err(|e| {
+            std::io::Error::new(e.kind(), format!("{}: {e}", entry.path().display()))
+        })?;
         let ElfIdentity {
             build_id,
             arch,

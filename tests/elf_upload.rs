@@ -486,24 +486,87 @@ async fn elf_upload_keeps_same_named_entries_of_different_zips_apart() {
 }
 
 /// An unreadable/nonexistent directory root must not exit 0.
+/// Any I/O error while scanning a directory fails the run (exit 11): skipping
+/// would upload a partial set — a whole ABI missing — behind a green build.
 #[cfg(unix)]
 #[test]
-fn elf_upload_fails_on_an_unreadable_directory() {
+fn elf_upload_fails_on_unreadable_directory_content() {
     use std::os::unix::fs::PermissionsExt;
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let lock = |p: &Path| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root bypasses permission checks; nothing to assert then.
+        std::fs::read_dir(p).is_err() && std::fs::read(p).is_err()
+    };
+    let unlock = |p: &Path| {
+        std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    let run = |root: &Path| {
+        let inputs = vec![root.to_string_lossy().into_owned()];
+        common::cli()
+            .args(elf_args("http://127.0.0.1:1", &inputs))
+            .assert()
+            .code(11)
+    };
+
+    // unreadable root
     let tmp = tempfile::tempdir().unwrap();
-    let locked = tmp.path().join("locked");
-    std::fs::create_dir_all(&locked).unwrap();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
-    // Root bypasses permission checks; nothing to assert then.
-    let readable = std::fs::read_dir(&locked).is_ok();
-    let inputs = vec![locked.to_string_lossy().into_owned()];
-    let assert = common::cli()
-        .args(elf_args("http://127.0.0.1:1", &inputs))
-        .assert();
-    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
-    if !readable {
-        assert.failure();
+    let root = tmp.path().join("locked");
+    std::fs::create_dir_all(&root).unwrap();
+    if lock(&root) {
+        run(&root);
     }
+    unlock(&root);
+
+    // a good library plus an unreadable ABI subdirectory
+    let root = tmp.path().join("r2");
+    std::fs::create_dir_all(root.join("x86_64")).unwrap();
+    std::fs::copy(&fixture, root.join("libok.so")).unwrap();
+    if lock(&root.join("x86_64")) {
+        run(&root);
+    }
+    unlock(&root.join("x86_64"));
+
+    // a good library plus an unreadable library file
+    let root = tmp.path().join("r3");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(&fixture, root.join("libok.so")).unwrap();
+    std::fs::copy(&fixture, root.join("libbad.so")).unwrap();
+    if lock(&root.join("libbad.so")) {
+        run(&root);
+    }
+    unlock(&root.join("libbad.so"));
+
+    // a dangling symlink named like a library
+    let root = tmp.path().join("r4");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::copy(&fixture, root.join("libok.so")).unwrap();
+    std::os::unix::fs::symlink(tmp.path().join("gone"), root.join("libdangling.so")).unwrap();
+    run(&root);
+}
+
+/// A directory holding only a zip, and a bare `.so`, get pointed at the right input.
+#[test]
+fn elf_upload_hints_for_a_zip_in_a_directory_and_a_bare_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("native-debug-symbols");
+    std::fs::create_dir_all(&dir).unwrap();
+    pack_native_zip(&dir, "arm64-v8a/libsymbol1.so");
+    let inputs = vec![dir.to_string_lossy().into_owned()];
+    common::cli()
+        .args(elf_args("http://127.0.0.1:1", &inputs))
+        .assert()
+        .code(10)
+        .stderr(predicates::str::contains("pass the zip itself"));
+
+    let so = tmp.path().join("libx.so");
+    std::fs::write(&so, b"x").unwrap();
+    let inputs = vec![so.to_string_lossy().into_owned()];
+    common::cli()
+        .args(elf_args("http://127.0.0.1:1", &inputs))
+        .assert()
+        .code(11)
+        .stderr(predicates::str::contains("pass its directory"));
 }
 
 /// A directory that exists but holds no libraries is a miswired path / too-early
@@ -519,7 +582,20 @@ fn elf_upload_empty_directory_is_input_not_found() {
         .stderr(predicates::str::contains("no .so"));
 }
 
+/// The fixture with its GNU build-id's first byte flipped: same ELF, different identity.
+fn fixture_with_other_build_id() -> (Vec<u8>, String) {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let mut bytes = std::fs::read(&fixture).unwrap();
+    let id = hex::decode(FIXTURE_BUILD_ID).unwrap();
+    let pos = bytes.windows(id.len()).position(|w| w == id).unwrap();
+    bytes[pos] ^= 0xff;
+    let other = hex::encode(&bytes[pos..pos + id.len()]);
+    (bytes, other)
+}
+
 /// Directory symlinks are not descended; a symlink to a library file is read.
+/// The escaped library has its OWN build-id, so following the link would make it
+/// 2 libraries (same-id copies would be collapsed by dedup and prove nothing).
 #[cfg(unix)]
 #[test]
 fn elf_dry_run_does_not_descend_directory_symlinks_but_reads_file_symlinks() {
@@ -527,7 +603,11 @@ fn elf_dry_run_does_not_descend_directory_symlinks_but_reads_file_symlinks() {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
     let outside = tmp.path().join("outside");
     std::fs::create_dir_all(&outside).unwrap();
-    std::fs::copy(&fixture, outside.join("libescaped.so")).unwrap();
+    std::fs::write(
+        outside.join("libescaped.so"),
+        fixture_with_other_build_id().0,
+    )
+    .unwrap();
     let root = tmp.path().join("root");
     std::fs::create_dir_all(&root).unwrap();
     std::os::unix::fs::symlink(&outside, root.join("linkdir")).unwrap();

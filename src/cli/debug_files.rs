@@ -19,7 +19,9 @@ pub enum DebugFilesCommand {
     Upload {
         /// One or more directories or files to scan. For `--type elf`, a directory
         /// is walked recursively for native libraries (e.g. AGP's
-        /// `merged_native_libs`), and a file is a `native-debug-symbols.zip`.
+        /// `merged_native_libs`; directory symlinks are not descended, an I/O error
+        /// fails the run, and no match exits 10), and a file is a
+        /// `native-debug-symbols.zip`.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
@@ -1190,14 +1192,19 @@ async fn run_elf_upload(
         let input_dir = work_dir.path().join(n.to_string());
         std::fs::create_dir_all(&input_dir)?;
         let found = elf::collect_libs(input, &input_dir, extra).map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
+            if e.kind() == std::io::ErrorKind::NotFound && !input.exists() {
                 input_not_found(format!("{} does not exist", input.display()))
             } else if input.is_dir() {
                 input_invalid(format!("cannot scan {}: {e}", input.display()))
             } else {
+                let hint = if input.extension().is_some_and(|x| x == "so") {
+                    " (a single library is not accepted: pass its directory)"
+                } else {
+                    ""
+                };
                 input_invalid(format!(
                     "--type elf expects a directory or a native-debug-symbols zip; \
-                     cannot read {}: {e}",
+                     cannot read {}: {e}{hint}",
                     input.display()
                 ))
             }
@@ -1207,8 +1214,16 @@ async fn run_elf_upload(
             // miswired path or a task that ran before the libraries were merged,
             // and exit 0 would let the build go green with no native symbols.
             // (An empty ZIP stays a warning, as it always was.)
+            let has_zip = std::fs::read_dir(input).is_ok_and(|mut d| {
+                d.any(|e| e.is_ok_and(|e| e.path().extension().is_some_and(|x| x == "zip")))
+            });
+            let hint = if has_zip {
+                " (it contains a .zip: zips inside a directory are not opened; pass the zip itself)"
+            } else {
+                ""
+            };
             return Err(input_not_found(format!(
-                "no .so / .so.dbg / .so.sym files (or --extension suffix) under {}",
+                "no .so / .so.dbg / .so.sym files (or --extension suffix) under {}{hint}",
                 input.display()
             )));
         }
@@ -1224,68 +1239,67 @@ async fn run_elf_upload(
         }
         libs.extend(found);
     }
-    {
-        let libs = elf::keep_richest_per_build_id(libs);
-        let total = libs.len();
 
-        // A `.so` with no GNU build-id can never be matched at crash time, so
-        // warn + skip rather than fake an identity (never the build UUID).
-        let mut uploadable: Vec<elf::ElfLib> = Vec::new();
-        for lib in libs {
-            if lib.build_id.is_some() {
-                uploadable.push(lib);
-            } else {
-                skipped_no_build_id += 1;
-                tracing::warn!(
-                    lib = %lib.name,
-                    arch = %lib.arch,
-                    "native library has no GNU build-id; skipping — it cannot be \
-                     symbolicated. Build the library with -Wl,--build-id."
-                );
-            }
-        }
-        tracing::info!(
-            libraries = total,
-            uploadable = uploadable.len(),
-            "collected native libraries"
-        );
+    let libs = elf::keep_richest_per_build_id(libs);
+    let total = libs.len();
 
-        if total == 0 {
-            // Already warned per input above.
-        } else if dry_run {
-            tracing::info!(
-                "dry-run: would register + upload {} libraries",
-                uploadable.len()
-            );
-        } else if uploadable.is_empty() {
-            tracing::warn!("no native libraries with a GNU build-id — nothing to upload");
+    // A `.so` with no GNU build-id can never be matched at crash time, so
+    // warn + skip rather than fake an identity (never the build UUID).
+    let mut uploadable: Vec<elf::ElfLib> = Vec::new();
+    for lib in libs {
+        if lib.build_id.is_some() {
+            uploadable.push(lib);
         } else {
-            let client = client.as_ref().expect("client constructed when !dry_run");
+            skipped_no_build_id += 1;
+            tracing::warn!(
+                lib = %lib.name,
+                arch = %lib.arch,
+                "native library has no GNU build-id; skipping — it cannot be \
+                 symbolicated. Build the library with -Wl,--build-id."
+            );
+        }
+    }
+    tracing::info!(
+        libraries = total,
+        uploadable = uploadable.len(),
+        "collected native libraries"
+    );
 
-            // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
-            let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
-                futures_util::stream::iter(uploadable.into_iter().enumerate())
-                    .map(|(i, lib)| {
-                        let client = client.clone();
-                        let work = work_dir.path().to_path_buf();
-                        async move {
-                            let symbol_table_only = lib.name.ends_with(".so.sym");
-                            let outcome = upload_one_so(&client, ctx, &lib, i, &work).await;
-                            (symbol_table_only, outcome)
-                        }
-                    })
-                    .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
-                    .collect()
-                    .await;
+    if total == 0 {
+        // Already warned per input above.
+    } else if dry_run {
+        tracing::info!(
+            "dry-run: would register + upload {} libraries",
+            uploadable.len()
+        );
+    } else if uploadable.is_empty() {
+        tracing::warn!("no native libraries with a GNU build-id — nothing to upload");
+    } else {
+        let client = client.as_ref().expect("client constructed when !dry_run");
 
-            for (symbol_table_only, outcome) in outcomes {
-                match outcome? {
-                    presigned::Outcome::Uploaded => uploaded += 1,
-                    presigned::Outcome::AlreadyExists => {
-                        already_existed += 1;
-                        if !symbol_table_only {
-                            full_already_existed += 1;
-                        }
+        // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
+        let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
+            futures_util::stream::iter(uploadable.into_iter().enumerate())
+                .map(|(i, lib)| {
+                    let client = client.clone();
+                    let work = work_dir.path().to_path_buf();
+                    async move {
+                        let symbol_table_only = lib.name.ends_with(".so.sym");
+                        let outcome = upload_one_so(&client, ctx, &lib, i, &work).await;
+                        (symbol_table_only, outcome)
+                    }
+                })
+                .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
+                .collect()
+                .await;
+
+        for (symbol_table_only, outcome) in outcomes {
+            match outcome? {
+                presigned::Outcome::Uploaded => uploaded += 1,
+                presigned::Outcome::AlreadyExists => {
+                    already_existed += 1;
+                    if !symbol_table_only {
+                        full_already_existed += 1;
                     }
                 }
             }

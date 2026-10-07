@@ -241,6 +241,12 @@ def make_fixtures(fix):
     import zipfile as zf
     with zf.ZipFile(os.path.join(fix, "native-debug-symbols.zip"), "w") as z:
         z.writestr("arm64-v8a/libfoo.so", b"\x7fELF" + b"\x02\x01\x01\x00" + b"\x00" * 256)
+    # AGP's merged_native_libs layout: a directory of unstripped libraries (a REAL
+    # ELF with a GNU build-id, so the flow registers + uploads one symbol).
+    libdir = os.path.join(fix, "native_libs", "lib", "arm64-v8a")
+    os.makedirs(libdir, exist_ok=True)
+    shutil.copy(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..",
+                             "tests", "fixtures", "elf", "libsymbol1.so"), libdir)
     # A Rust MSVC build drops the PDB into target/<profile>/ next to unrelated
     # files, so the flow points at a directory, not the file.
     tgt = os.path.join(fix, "target", "release")
@@ -488,6 +494,17 @@ def main():
     results["elf"] = run(binpath, "elf", ["debug-files", "upload", "--type", "elf",
                                           os.path.join(fix, "native-debug-symbols.zip"),
                                           "--uuid", "11111111-2222-3333-4444-555555555555"] + v)
+    results["elf_dir"] = run(binpath, "elf_dir", ["debug-files", "upload", "--type", "elf",
+                                                  os.path.join(fix, "native_libs"),
+                                                  "--uuid", "11111111-2222-3333-4444-555555555555"] + v)
+    try:
+        posted = json.load(open(cappath("elf_dir__symbols_post.json")))
+        ok = (posted.get("uuid") == "bca64abfec40dbb631bb8f1c37414472"
+              and STATE["puts"].get("elf_dir") == 1)
+    except Exception as e:
+        print("  [FAIL] could not verify the elf_dir flow:", e)
+        ok = False
+    results["elf_dir_keyed_by_build_id"] = ok
     results["pdb"] = run(binpath, "pdb", ["debug-files", "upload", "--type", "pdb",
                                           os.path.join(fix, "target", "release")] + v)
     if os.path.isdir(os.path.join(fix, "App.dSYM")):
