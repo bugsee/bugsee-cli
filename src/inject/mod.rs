@@ -331,73 +331,146 @@ fn collect_targets(
 /// Mirrors `inject_one`'s decision, and `would_rewrite_agrees_with_what_inject_actually_writes`
 /// pins the two together so they cannot drift.
 fn would_rewrite(js_path: &Path) -> Result<bool> {
-    let content = std::fs::read_to_string(js_path)?;
-    let map_path = paired_map(js_path, &content);
-    Ok(match existing_debug_id(&content) {
+    let mapped = crate::symbols::mapped::map_file(js_path)?;
+    let content = bundle_text(&mapped)?;
+    let map_path = paired_map(js_path, content);
+    Ok(match existing_debug_id(content) {
         // A regenerated map re-keys the bundle; a foreign id still needs our runtime registration.
         Some(id) => {
-            restamp_id(&content, &id, map_path.as_deref())?.is_some()
+            restamp_id(content, &id, map_path.as_deref())?.is_some()
                 || !content.contains(&runtime_registration(&id))
         }
         None => true,
     })
 }
 
-fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {
-    let content = std::fs::read_to_string(js_path)?;
-    let map_path = paired_map(js_path, &content);
+/// A bundle's bytes as text. Invalid UTF-8 is an I/O `InvalidData` error, exactly
+/// as `read_to_string` reported it.
+fn bundle_text(bytes: &[u8]) -> Result<&str> {
+    std::str::from_utf8(bytes)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+}
 
-    let (debug_id, freshly_computed) = match existing_debug_id(&content) {
-        Some(id) => match restamp_id(&content, &id, map_path.as_deref())? {
-            // Our stub, over a map regenerated with different content: re-key the
-            // bundle, or the upload dedups against the STALE map (webpack keeps a
-            // `[contenthash]` JS file it considers unchanged but re-emits its map).
-            Some((original, fresh)) => {
-                if !dry_run {
-                    std::fs::write(js_path, format!("{original}{}", runtime_stub(&fresh)))?;
+/// How a bundle is to change. Bundles are only ever APPENDED to (or, to re-key, have
+/// our own trailing stub swapped), so the change is expressed as a tail rather
+/// than as a whole new file.
+struct JsEdit {
+    /// Cut the file back to this many bytes first (dropping a stale stub of ours).
+    truncate_to: Option<u64>,
+    /// Then append this.
+    append: String,
+}
+
+/// What `inject_one` decided for a bundle, for the stats and the log line.
+enum JsOutcome {
+    Restamped { stale: String, fresh: Uuid },
+    Registered { id: String },
+    Already,
+    Injected { id: Uuid },
+}
+
+/// Apply `edit` to the bundle IN PLACE: no copy of the bundle is made or held,
+/// and the file keeps its inode, permissions and any symlink (as `fs::write`
+/// did, which also truncated and rewrote through the same path).
+fn apply_js_edit(js_path: &Path, edit: &JsEdit) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new().write(true).open(js_path)?;
+    if let Some(len) = edit.truncate_to {
+        file.set_len(len)?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    file.write_all(edit.append.as_bytes())?;
+    Ok(())
+}
+
+fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<()> {
+    // Decide everything with the bundle mapped read-only (zero-copy `&str`), then
+    // DROP the mapping before touching the file: Windows refuses to truncate a
+    // file that has a mapped view open.
+    let (map_path, debug_id, freshly_computed, outcome, edit) = {
+        let mapped = crate::symbols::mapped::map_file(js_path)?;
+        let content = bundle_text(&mapped)?;
+        let map_path = paired_map(js_path, content);
+
+        match existing_debug_id(content) {
+            Some(id) => match restamp_id(content, &id, map_path.as_deref())? {
+                // Our stub, over a map regenerated with different content: re-key the
+                // bundle, or the upload dedups against the STALE map (webpack keeps a
+                // `[contenthash]` JS file it considers unchanged but re-emits its map).
+                Some((original, fresh)) => (
+                    map_path,
+                    fresh.to_string(),
+                    true,
+                    JsOutcome::Restamped { stale: id, fresh },
+                    Some(JsEdit {
+                        truncate_to: Some(original.len() as u64),
+                        append: runtime_stub(&fresh),
+                    }),
+                ),
+                // Another tool's id (Rollup 4 `sourcemapDebugIds` writes its own comment):
+                // keep the id — its map already carries it — but add our runtime
+                // registration, without which the SDK cannot attach it to a crash frame.
+                None if !content.contains(&runtime_registration(&id)) => {
+                    let edit = JsEdit {
+                        truncate_to: None,
+                        append: runtime_registration(&id),
+                    };
+                    (
+                        map_path,
+                        id.clone(),
+                        false,
+                        JsOutcome::Registered { id },
+                        Some(edit),
+                    )
                 }
-                stats.js_restamped += 1;
-                tracing::info!(
-                    path = %js_path.display(),
-                    stale = %id,
-                    debug_id = %fresh,
-                    "re-stamped debug-id: the bundle's map was regenerated"
-                );
-                (fresh.to_string(), true)
-            }
-            // Another tool's id (Rollup 4 `sourcemapDebugIds` writes its own comment):
-            // keep the id — its map already carries it — but add our runtime
-            // registration, without which the SDK cannot attach it to a crash frame.
-            None if !content.contains(&runtime_registration(&id)) => {
-                if !dry_run {
-                    std::fs::write(js_path, format!("{content}{}", runtime_registration(&id)))?;
-                }
-                stats.js_registered += 1;
-                tracing::info!(
-                    path = %js_path.display(),
-                    debug_id = %id,
-                    "registered an existing debug-id another tool wrote"
-                );
-                (id, false)
-            }
+                None => (map_path, id, false, JsOutcome::Already, None),
+            },
             None => {
-                stats.js_already += 1;
-                (id, false)
+                let id = match map_path.as_deref() {
+                    Some(m) => compute_debug_id_with_map_file(content.as_bytes(), m)?,
+                    None => compute_debug_id(content.as_bytes()),
+                };
+                (
+                    map_path,
+                    id.to_string(),
+                    true,
+                    JsOutcome::Injected { id },
+                    Some(JsEdit {
+                        truncate_to: None,
+                        append: runtime_stub(&id),
+                    }),
+                )
             }
-        },
-        None => {
-            let id = match map_path.as_deref() {
-                Some(m) => compute_debug_id_with_map_file(content.as_bytes(), m)?,
-                None => compute_debug_id(content.as_bytes()),
-            };
-            if !dry_run {
-                std::fs::write(js_path, format!("{content}{}", runtime_stub(&id)))?;
-            }
-            stats.js_injected += 1;
-            tracing::info!(path = %js_path.display(), debug_id = %id, "injected debug-id");
-            (id.to_string(), true)
         }
     };
+
+    if let (Some(edit), false) = (&edit, dry_run) {
+        apply_js_edit(js_path, edit)?;
+    }
+    match outcome {
+        JsOutcome::Restamped { stale, fresh } => {
+            stats.js_restamped += 1;
+            tracing::info!(
+                path = %js_path.display(),
+                stale = %stale,
+                debug_id = %fresh,
+                "re-stamped debug-id: the bundle's map was regenerated"
+            );
+        }
+        JsOutcome::Registered { id } => {
+            stats.js_registered += 1;
+            tracing::info!(
+                path = %js_path.display(),
+                debug_id = %id,
+                "registered an existing debug-id another tool wrote"
+            );
+        }
+        JsOutcome::Already => stats.js_already += 1,
+        JsOutcome::Injected { id } => {
+            stats.js_injected += 1;
+            tracing::info!(path = %js_path.display(), debug_id = %id, "injected debug-id");
+        }
+    }
 
     if let Some(map_path) = map_path {
         if write_map_debug_id(&map_path, &debug_id, freshly_computed, dry_run)? {
@@ -1762,5 +1835,291 @@ mod tests {
         assert_eq!(read_debug_id(&p).unwrap().as_deref(), Some("legacy"));
         std::fs::write(&p, r#"{"version":3}"#).unwrap();
         assert_eq!(read_debug_id(&p).unwrap(), None);
+    }
+}
+
+/// What `inject` does to files on disk: exact bytes, in-place edits, what survives
+/// (permissions, symlinks), what must NOT change (dry runs, rejected input) and
+/// what must not be left behind (temp files).
+#[cfg(test)]
+mod file_edits {
+    use super::*;
+
+    fn inject_dir(dir: &Path) -> Result<InjectStats> {
+        inject_paths(&[dir.to_path_buf()], &[], true, false)
+    }
+
+    fn names(dir: &Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    const MAP: &str = r#"{"version":3,"sources":["a.ts"],"names":["x"],"mappings":"AAAA"}"#;
+
+    /// Whatever the bundle ends with (or doesn't), injection is EXACTLY
+    /// `bundle || stub(id)` — nothing re-encoded, nothing normalised — and a second
+    /// run is a byte-for-byte no-op.
+    #[test]
+    fn appends_exactly_the_stub_to_awkward_bundles() {
+        let big = format!("{}\n", "var a=1;".repeat(30_000));
+        let cases: Vec<(&str, String)> = vec![
+            ("empty", String::new()),
+            ("no trailing newline", "a()".into()),
+            ("trailing newline", "a()\n".into()),
+            ("CRLF", "a()\r\nb()\r\n".into()),
+            ("multibyte", "var s = 'héllo ☃ 😀';\n".into()),
+            ("BOM first", "\u{feff}a()\n".into()),
+            ("one huge line", big),
+        ];
+        for (label, content) in cases {
+            let dir = tempfile::tempdir().unwrap();
+            let js = dir.path().join("a.js");
+            std::fs::write(&js, &content).unwrap();
+
+            inject_dir(dir.path()).unwrap();
+            let id = compute_debug_id(content.as_bytes());
+            assert_eq!(
+                std::fs::read(&js).unwrap(),
+                format!("{content}{}", runtime_stub(&id)).into_bytes(),
+                "{label}"
+            );
+
+            let once = std::fs::read(&js).unwrap();
+            inject_dir(dir.path()).unwrap();
+            assert_eq!(std::fs::read(&js).unwrap(), once, "{label}: not idempotent");
+        }
+    }
+
+    #[test]
+    fn with_a_map_the_id_covers_both_and_both_files_are_updated() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let map = dir.path().join("a.js.map");
+        let content = "a()\n//# sourceMappingURL=a.js.map\n";
+        std::fs::write(&js, content).unwrap();
+        std::fs::write(&map, MAP).unwrap();
+
+        let stats = inject_dir(dir.path()).unwrap();
+        assert_eq!((stats.js_injected, stats.maps_updated), (1, 1));
+
+        let id = compute_debug_id_with_map(content.as_bytes(), Some(MAP.as_bytes()));
+        assert_eq!(
+            std::fs::read_to_string(&js).unwrap(),
+            format!("{content}{}", runtime_stub(&id))
+        );
+        let got: serde_json::Value = serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_str(MAP).unwrap();
+        expected["debug_id"] = id.to_string().into();
+        expected["debugId"] = id.to_string().into();
+        assert_eq!(got, expected, "every other key survives the rewrite");
+        assert_eq!(names(dir.path()), ["a.js", "a.js.map"], "no temp file left");
+    }
+
+    #[test]
+    fn a_map_with_unicode_and_escapes_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let map = dir.path().join("a.js.map");
+        let original = r#"{"version":3,"sources":["src/héllo ☃.ts","q\"uote"],"sourcesContent":["line1\nline2\t\\ 😀"],"names":[],"mappings":"AAAA","x_google_ignoreList":[0],"n":1.50}"#;
+        std::fs::write(dir.path().join("a.js"), "a()\n").unwrap();
+        std::fs::write(&map, original).unwrap();
+        inject_dir(dir.path()).unwrap();
+
+        let got: serde_json::Value = serde_json::from_slice(&std::fs::read(&map).unwrap()).unwrap();
+        let mut expected: serde_json::Value = serde_json::from_str(original).unwrap();
+        let id = got["debug_id"].as_str().unwrap().to_string();
+        expected["debug_id"] = id.clone().into();
+        expected["debugId"] = id.into();
+        assert_eq!(got, expected);
+        assert!(
+            std::fs::read_to_string(&map).unwrap().contains("1.50"),
+            "number text is kept, not round-tripped through f64"
+        );
+    }
+
+    /// Re-keying swaps ONLY our own trailing stub: the bundle is cut back to the
+    /// original bytes and the new stub appended — no remnant of the old id.
+    #[test]
+    fn restamp_cuts_back_to_the_original_bytes_before_appending() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let map = dir.path().join("a.js.map");
+        let content = "function f(){return 1}\n//# sourceMappingURL=a.js.map\n";
+        std::fs::write(&js, content).unwrap();
+        std::fs::write(&map, MAP).unwrap();
+        inject_dir(dir.path()).unwrap();
+        let first = std::fs::read_to_string(&js).unwrap();
+        let old_id = existing_debug_id(&first).unwrap();
+
+        // The bundler regenerates the map with different content (and no ids).
+        let regenerated = r#"{"version":3,"sources":["b.ts"],"names":[],"mappings":"BBBB"}"#;
+        std::fs::write(&map, regenerated).unwrap();
+        let stats = inject_dir(dir.path()).unwrap();
+        assert_eq!(stats.js_restamped, 1);
+
+        let new_id = compute_debug_id_with_map(content.as_bytes(), Some(regenerated.as_bytes()));
+        assert_ne!(new_id.to_string(), old_id);
+        let after = std::fs::read_to_string(&js).unwrap();
+        assert_eq!(after, format!("{content}{}", runtime_stub(&new_id)));
+        assert!(!after.contains(&old_id), "no remnant of the stale id");
+        assert!(
+            std::fs::read_to_string(&map)
+                .unwrap()
+                .contains(&new_id.to_string()),
+            "the regenerated map carries the new id"
+        );
+    }
+
+    /// A bundle another tool already stamped keeps its bytes and only GAINS our registration.
+    #[test]
+    fn registering_a_foreign_id_only_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let id = "11111111-1111-1111-1111-111111111111";
+        let content = format!("a()\n//# debugId={id}\n//# sourceMappingURL=a.js.map\n");
+        std::fs::write(&js, &content).unwrap();
+        std::fs::write(
+            dir.path().join("a.js.map"),
+            format!(r#"{{"version":3,"debug_id":"{id}","debugId":"{id}","mappings":""}}"#),
+        )
+        .unwrap();
+        let stats = inject_dir(dir.path()).unwrap();
+        assert_eq!(stats.js_registered, 1);
+        assert_eq!(
+            std::fs::read_to_string(&js).unwrap(),
+            format!("{content}{}", runtime_registration(&id))
+        );
+    }
+
+    #[test]
+    fn a_dry_run_changes_no_byte_and_no_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        let map = dir.path().join("a.js.map");
+        std::fs::write(&js, "a()\n").unwrap();
+        std::fs::write(&map, MAP).unwrap();
+        let snap = |p: &Path| {
+            (
+                std::fs::read(p).unwrap(),
+                std::fs::metadata(p).unwrap().modified().unwrap(),
+            )
+        };
+        let (js0, map0) = (snap(&js), snap(&map));
+        let stats = inject_paths(&[dir.path().to_path_buf()], &[], true, true).unwrap();
+        assert_eq!(
+            (stats.js_injected, stats.maps_updated),
+            (1, 1),
+            "it still reports"
+        );
+        assert_eq!(snap(&js), js0);
+        assert_eq!(snap(&map), map0);
+        assert_eq!(
+            names(dir.path()),
+            ["a.js", "a.js.map"],
+            "dry run leaves no temp file"
+        );
+    }
+
+    #[test]
+    fn a_bundle_that_is_not_utf8_is_an_io_error_and_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        let js = dir.path().join("a.js");
+        std::fs::write(&js, b"a()\xff\xfe\n").unwrap();
+        let err = inject_dir(dir.path()).unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "{err:?}");
+        assert_eq!(std::fs::read(&js).unwrap(), b"a()\xff\xfe\n");
+    }
+
+    /// A map that is not a JSON object cannot take an id: the run fails and the map
+    /// is left exactly as it was, with no temp file beside it.
+    #[test]
+    fn an_unusable_map_is_left_untouched() {
+        for (label, map) in [
+            ("not json", "{not json"),
+            ("an array", "[]"),
+            ("truncated", r#"{"version":3,"mappings":"AA"#),
+            ("trailing junk", r#"{"version":3} x"#),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("a.js"), "a()\n").unwrap();
+            let mp = dir.path().join("a.js.map");
+            std::fs::write(&mp, map).unwrap();
+            let err = inject_dir(dir.path()).unwrap_err();
+            assert!(matches!(err, Error::InputInvalid(_)), "{label}: {err:?}");
+            assert_eq!(std::fs::read_to_string(&mp).unwrap(), map, "{label}");
+            assert_eq!(names(dir.path()), ["a.js", "a.js.map"], "{label}");
+        }
+    }
+
+    #[cfg(unix)]
+    mod unix {
+        use super::*;
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        fn mode(p: &Path) -> u32 {
+            std::fs::metadata(p).unwrap().permissions().mode() & 0o777
+        }
+
+        #[test]
+        fn permissions_survive_on_both_files() {
+            let dir = tempfile::tempdir().unwrap();
+            let js = dir.path().join("a.js");
+            let map = dir.path().join("a.js.map");
+            std::fs::write(&js, "a()\n").unwrap();
+            std::fs::write(&map, MAP).unwrap();
+            std::fs::set_permissions(&js, std::fs::Permissions::from_mode(0o640)).unwrap();
+            std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o600)).unwrap();
+            inject_dir(dir.path()).unwrap();
+            assert_eq!(mode(&js), 0o640);
+            assert_eq!(mode(&map), 0o600, "the map rewrite must not reset its mode");
+        }
+
+        #[test]
+        fn a_symlinked_bundle_and_map_stay_links_and_their_targets_change() {
+            let dir = tempfile::tempdir().unwrap();
+            let real = tempfile::tempdir().unwrap();
+            std::fs::write(real.path().join("real.js"), "a()\n").unwrap();
+            std::fs::write(real.path().join("real.js.map"), MAP).unwrap();
+            symlink(real.path().join("real.js"), dir.path().join("a.js")).unwrap();
+            symlink(real.path().join("real.js.map"), dir.path().join("a.js.map")).unwrap();
+
+            inject_dir(dir.path()).unwrap();
+            for l in ["a.js", "a.js.map"] {
+                assert!(
+                    std::fs::symlink_metadata(dir.path().join(l))
+                        .unwrap()
+                        .file_type()
+                        .is_symlink(),
+                    "{l} must still be a symlink"
+                );
+            }
+            assert!(std::fs::read_to_string(real.path().join("real.js"))
+                .unwrap()
+                .contains("//# debugId="));
+            assert!(std::fs::read_to_string(real.path().join("real.js.map"))
+                .unwrap()
+                .contains("\"debug_id\""));
+            assert_eq!(
+                names(real.path()),
+                ["real.js", "real.js.map"],
+                "no temp file"
+            );
+        }
+
+        #[test]
+        fn a_read_only_bundle_is_an_error_and_stays_as_it_was() {
+            let dir = tempfile::tempdir().unwrap();
+            let js = dir.path().join("a.js");
+            std::fs::write(&js, "a()\n").unwrap();
+            std::fs::set_permissions(&js, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&js).is_ok() {
+                return; // running as root: permissions are not enforced
+            }
+            assert!(matches!(inject_dir(dir.path()), Err(Error::Io(_))));
+            assert_eq!(std::fs::read(&js).unwrap(), b"a()\n");
+        }
     }
 }

@@ -311,3 +311,353 @@ mod tests {
         ));
     }
 }
+
+/// Differential tests: the streaming implementations must agree with the
+/// `serde_json::Value`-tree logic they replaced, over many generated documents
+/// (whitespace, escapes, surrogate pairs, exponent numbers, nested sections).
+#[cfg(test)]
+mod differential {
+    use super::*;
+    use serde_json::Value;
+
+    /// Deterministic xorshift: reproducible failures without a `rand` dependency.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 << 13;
+            self.0 ^= self.0 >> 7;
+            self.0 ^= self.0 << 17;
+            self.0
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+        fn pick<'a>(&mut self, xs: &[&'a str]) -> &'a str {
+            xs[self.below(xs.len() as u64) as usize]
+        }
+        fn ws(&mut self) -> &'static str {
+            ["", "", " ", "\n", "\t ", "\r\n  "][self.below(6) as usize]
+        }
+    }
+
+    const KEYS: &[&str] = &[
+        "version",
+        "sources",
+        "sourcesContent",
+        "mappings",
+        "debug_id",
+        "debugId",
+        "uuid",
+        "sections",
+        "map",
+        "names",
+        "file",
+        "offset",
+        "x\\u00e9y",
+        "k",
+    ];
+    const STRINGS: &[&str] = &[
+        r#""""#,
+        r#""a""#,
+        r#""h\u00e9llo""#,
+        "\"h\u{e9}llo \u{2603}\"",
+        r#""esc \n \" \\ \/ \t""#,
+        r#""\ud83d\ude00""#,
+        r#""AAAA;AACA,SAAS""#,
+        r#""11111111-1111-1111-1111-111111111111""#,
+    ];
+    const NUMBERS: &[&str] = &[
+        "0",
+        "-1",
+        "3",
+        "1.50",
+        "2e10",
+        "-0.5E-3",
+        "100000000000000000000",
+    ];
+
+    fn scalar(r: &mut Rng) -> String {
+        match r.below(5) {
+            0 => "null".into(),
+            1 => "true".into(),
+            2 => "false".into(),
+            3 => r.pick(NUMBERS).into(),
+            _ => r.pick(STRINGS).into(),
+        }
+    }
+
+    fn value(r: &mut Rng, depth: u32) -> String {
+        if depth == 0 || r.below(3) == 0 {
+            return scalar(r);
+        }
+        if r.below(2) == 0 {
+            let n = r.below(4);
+            let items: Vec<String> = (0..n).map(|_| value(r, depth - 1)).collect();
+            let sep = format!("{},{}", r.ws(), r.ws());
+            format!("[{}{}{}]", r.ws(), items.join(&sep), r.ws())
+        } else {
+            object(r, depth - 1, false)
+        }
+    }
+
+    /// An object over the map vocabulary. `maplike` biases towards the keys the
+    /// transforms care about and recurses into `sections[].map`. Keys are unique
+    /// within an object (duplicates have their own targeted test).
+    fn object(r: &mut Rng, depth: u32, maplike: bool) -> String {
+        let n = r.below(6);
+        let mut used = std::collections::HashSet::new();
+        let mut members = Vec::new();
+        for _ in 0..n {
+            let key = r.pick(KEYS);
+            if !used.insert(key) {
+                continue;
+            }
+            let v = match key {
+                "sections" if depth > 0 => {
+                    let m = r.below(3);
+                    let secs: Vec<String> = (0..m)
+                        .map(|_| {
+                            let mut parts = vec![format!(r#""offset":{}"#, value(r, 1))];
+                            if r.below(4) != 0 {
+                                parts.push(format!(r#""map":{}"#, object(r, depth - 1, true)));
+                            }
+                            if r.below(5) == 0 {
+                                parts.push(format!(r#""url":{}"#, scalar(r)));
+                            }
+                            format!("{{{}}}", parts.join(","))
+                        })
+                        .collect();
+                    format!("[{}]", secs.join(","))
+                }
+                "sourcesContent" if maplike || r.below(2) == 0 => {
+                    format!(r#"["{}","src2"]"#, "x".repeat(r.below(200) as usize))
+                }
+                _ => value(r, depth.saturating_sub(1)),
+            };
+            members.push(format!("{}\"{}\"{}:{}{}", r.ws(), key, r.ws(), r.ws(), v));
+        }
+        format!("{{{}{}}}", members.join(","), r.ws())
+    }
+
+    fn doc(r: &mut Rng) -> String {
+        format!("{}{}{}", r.ws(), object(r, 3, true), r.ws())
+    }
+
+    // --- the reference (old, tree-based) behaviour -------------------------------
+
+    fn ref_strip(map: &mut serde_json::Map<String, Value>) -> bool {
+        let mut removed = map.remove("sourcesContent").is_some();
+        if let Some(Value::Array(sections)) = map.get_mut("sections") {
+            for section in sections {
+                if let Some(Value::Object(inner)) = section.get_mut("map") {
+                    removed |= ref_strip(inner);
+                }
+            }
+        }
+        removed
+    }
+
+    fn ref_ids(v: &Value, keys: &[&str]) -> Vec<Option<String>> {
+        keys.iter()
+            .map(|k| v.get(*k).and_then(Value::as_str).map(str::to_string))
+            .collect()
+    }
+
+    const CASES: u64 = 600;
+
+    #[test]
+    fn strip_sources_content_agrees_with_the_tree_implementation() {
+        let mut r = Rng(0x9E37_79B9_7F4A_7C15);
+        let mut removed_some = 0;
+        for case in 0..CASES {
+            let text = doc(&mut r);
+            let mut expected: Value = serde_json::from_str(&text)
+                .unwrap_or_else(|e| panic!("generator produced invalid JSON ({e}): {text}"));
+            let expect_removed = ref_strip(expected.as_object_mut().unwrap());
+            let mut out = Vec::new();
+            let removed = strip_sources_content(text.as_bytes(), &mut out)
+                .unwrap_or_else(|e| panic!("case {case}: {e}\n{text}"));
+            let got: Value = serde_json::from_slice(&out).unwrap_or_else(|e| {
+                panic!(
+                    "case {case}: output not JSON ({e}): {}",
+                    String::from_utf8_lossy(&out)
+                )
+            });
+            assert_eq!(got, expected, "case {case}\ninput:  {text}");
+            assert_eq!(removed, expect_removed, "case {case}\ninput: {text}");
+            removed_some += removed as u32;
+        }
+        assert!(
+            removed_some > 50,
+            "the generator must exercise stripping ({removed_some})"
+        );
+    }
+
+    #[test]
+    fn top_level_strings_agrees_with_the_tree_implementation() {
+        let keys = ["debug_id", "debugId", "uuid"];
+        let mut r = Rng(0xD1B5_4A32_D192_ED03);
+        for case in 0..CASES {
+            let text = doc(&mut r);
+            let v: Value = serde_json::from_str(&text).unwrap();
+            let got = top_level_strings(text.as_bytes(), &keys).unwrap();
+            assert!(got.is_object);
+            assert_eq!(got.values, ref_ids(&v, &keys), "case {case}\ninput: {text}");
+        }
+    }
+
+    #[test]
+    fn set_debug_ids_agrees_with_the_tree_implementation() {
+        let mut r = Rng(0xA076_1D64_78BD_642F);
+        for case in 0..CASES {
+            let text = doc(&mut r);
+            let mut expected: Value = serde_json::from_str(&text).unwrap();
+            let obj = expected.as_object_mut().unwrap();
+            obj.insert("debug_id".into(), Value::String("new-id".into()));
+            obj.insert("debugId".into(), Value::String("new-id".into()));
+            let mut out = Vec::new();
+            set_debug_ids(text.as_bytes(), &mut out, "new-id").unwrap();
+            let got: Value = serde_json::from_slice(&out).unwrap();
+            assert_eq!(got, expected, "case {case}\ninput: {text}");
+            // Idempotent: applying it to its own output changes nothing semantically.
+            let mut again = Vec::new();
+            set_debug_ids(out.as_slice(), &mut again, "new-id").unwrap();
+            assert_eq!(serde_json::from_slice::<Value>(&again).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn duplicate_keys_resolve_like_a_parsed_value() {
+        // serde_json keeps the LAST of a duplicated key; so must the stream.
+        let text = r#"{"debug_id":"a","debug_id":"b","uuid":"u","uuid":7,"sourcesContent":["s"],"sourcesContent":["t"]}"#;
+        let v: Value = serde_json::from_str(text).unwrap();
+        let keys = ["debug_id", "uuid"];
+        assert_eq!(
+            top_level_strings(text.as_bytes(), &keys).unwrap().values,
+            ref_ids(&v, &keys)
+        );
+        let mut out = Vec::new();
+        assert!(strip_sources_content(text.as_bytes(), &mut out).unwrap());
+        assert!(!String::from_utf8(out).unwrap().contains("sourcesContent"));
+    }
+
+    #[test]
+    fn truncated_or_trailing_garbage_documents_are_rejected_everywhere() {
+        let mut r = Rng(0x1234_5678_9ABC_DEF1);
+        for case in 0..200 {
+            let text = doc(&mut r);
+            let text = text.trim_end();
+            // Any strict prefix of a top-level object is invalid JSON.
+            let cut = 1 + r.below(text.len() as u64 - 1) as usize;
+            let mut cut = cut;
+            while !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            let bad = &text[..cut];
+            assert!(
+                serde_json::from_str::<Value>(bad).is_err(),
+                "case {case}: {bad}"
+            );
+            assert!(
+                top_level_strings(bad.as_bytes(), &["uuid"]).is_err(),
+                "case {case}: {bad}"
+            );
+            assert!(
+                strip_sources_content(bad.as_bytes(), Vec::new()).is_err(),
+                "case {case}: {bad}"
+            );
+            assert!(
+                set_debug_ids(bad.as_bytes(), Vec::new(), "x").is_err(),
+                "case {case}: {bad}"
+            );
+            // Trailing garbage after a complete document.
+            let junk = format!("{text} x");
+            assert!(
+                top_level_strings(junk.as_bytes(), &["uuid"]).is_err(),
+                "case {case}"
+            );
+            assert!(
+                strip_sources_content(junk.as_bytes(), Vec::new()).is_err(),
+                "case {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_large_map_streams_through_with_its_big_values_intact() {
+        // Bigger than any internal buffer: a 3 MB mappings string must pass through
+        // `transfer_to` byte for byte while a 3 MB sourcesContent entry is dropped.
+        let mappings = "AAAA;".repeat(600_000);
+        let content = "z".repeat(3_000_000);
+        let text = format!(
+            r#"{{"version":3,"sourcesContent":["{content}"],"mappings":"{mappings}","debug_id":"d"}}"#
+        );
+        let mut out = Vec::new();
+        assert!(strip_sources_content(text.as_bytes(), &mut out).unwrap());
+        let got: Value = serde_json::from_slice(&out).unwrap();
+        assert_eq!(got["mappings"].as_str().unwrap(), mappings);
+        assert!(got.get("sourcesContent").is_none());
+        assert_eq!(got["debug_id"], "d");
+    }
+
+    /// A number no double can hold (`1e999999`) is valid JSON grammar. Reading ids
+    /// skips it; copying it is refused as a JSON error — which the strip path treats
+    /// as "not the map we expect" and uploads the original, as the tree parser's
+    /// "number out of range" always led it to.
+    #[test]
+    fn out_of_range_numbers_are_skippable_but_not_copyable() {
+        let doc = br#"{"n":1e999999,"sourcesContent":["x"],"debug_id":"d"}"#;
+        assert_eq!(
+            top_level_strings(doc.as_slice(), &["debug_id"])
+                .unwrap()
+                .values,
+            [Some("d".to_string())]
+        );
+        assert!(matches!(
+            strip_sources_content(doc.as_slice(), Vec::new()),
+            Err(MapJsonError::Json(_))
+        ));
+        assert!(matches!(
+            set_debug_ids(doc.as_slice(), Vec::new(), "x"),
+            Err(MapJsonError::Json(_))
+        ));
+    }
+
+    /// 200 000 randomly corrupted documents (byte replaced / deleted / inserted):
+    /// the stream accepts exactly what `serde_json` accepts, and everything it
+    /// copies out re-parses — it never launders invalid JSON into an upload.
+    #[test]
+    fn random_corruption_is_accepted_exactly_when_serde_accepts_it() {
+        let base = br#"{"version":3,"file":"a\u00e9.js","sources":["a.ts","b\"q"],"sourcesContent":["x\ny","\ud83d\ude00"],"names":["n1"],"mappings":"AAAA;AACA","x":[1,2.5e3,-0,true,null,{"k":"v"}]}"#;
+        let mut r = Rng(0x1234_5678_9ABC_DEF1);
+        for case in 0..200_000 {
+            let mut b = base.to_vec();
+            for _ in 0..1 + r.below(2) {
+                let at = r.below(b.len() as u64) as usize;
+                match r.below(3) {
+                    0 => b[at] = r.next() as u8,
+                    1 => {
+                        b.remove(at);
+                    }
+                    _ => b.insert(at, r.next() as u8),
+                }
+            }
+            let serde_ok = serde_json::from_slice::<Value>(&b).is_ok();
+            let mut out = Vec::new();
+            let streamed_ok = strip_sources_content(b.as_slice(), &mut out).is_ok();
+            assert_eq!(
+                streamed_ok,
+                serde_ok,
+                "case {case} disagrees on {:?}",
+                String::from_utf8_lossy(&b)
+            );
+            if streamed_ok {
+                assert!(
+                    serde_json::from_slice::<Value>(&out).is_ok(),
+                    "case {case}: output is not valid JSON: {}",
+                    String::from_utf8_lossy(&out)
+                );
+            }
+        }
+    }
+}
