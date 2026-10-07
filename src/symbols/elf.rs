@@ -2,7 +2,7 @@
 //!
 //! The caller hands the CLI an already-packaged `native-debug-symbols.zip`
 //! (the artifact AGP writes under `build/outputs/native-debug-symbols/
-//! <variant>/`). We open it and, for EACH `.so` (or the `.so.dbg` / `.so.sym`
+//! <variant>/`) or a directory of libraries. We open/walk it and, for EACH `.so` (or the `.so.dbg` / `.so.sym`
 //! variants, depending on `ndk.debugSymbolLevel`), read the GNU build-id
 //! (`code_id`) via `symbolic-debuginfo` — the SAME crate family (major 13) the
 //! worker uses, so the identifier is byte-identical producer↔consumer.
@@ -21,9 +21,9 @@
 //! matched at crash time, so it is warned about and skipped — never faked with
 //! the BUILD_UUID.
 //!
-//! Out of scope: walking a loose directory of unstripped `.so`s (AGP's
-//! intermediate-folder case) — the Gradle plugin pre-zips that before invoking
-//! the CLI.
+//! The input is either that zip or a directory, walked recursively for the same
+//! entry names (AGP's `merged_native_libs` intermediates folder) — libraries
+//! are read in place, so nothing is re-compressed just to be unpacked again.
 
 use sha1::{Digest as _, Sha1};
 use std::io::Read;
@@ -42,7 +42,7 @@ pub fn sha1_hex_of_file(path: &Path) -> std::io::Result<String> {
     Ok(sha1_hex(&std::fs::read(path)?))
 }
 
-/// One native library extracted from an AGP `native-debug-symbols.zip`.
+/// One native library found in an AGP `native-debug-symbols.zip` or a scanned directory.
 ///
 /// Each `.so` is its OWN symbol: one file → one symbol document → one S3
 /// object, keyed by its own GNU build-id. (`images[]` within a single document
@@ -59,7 +59,8 @@ pub struct ElfLib {
     /// Object architecture (e.g. `arm64`); diagnostic only — the worker
     /// reconciles the canonical arch from the ELF during processing.
     pub arch: String,
-    /// Temp file holding the extracted `.so` bytes, packed into its own upload.
+    /// File holding the library bytes, packed into its own upload: a temp copy
+    /// extracted from a zip, or the original file when scanned from a directory.
     pub path: PathBuf,
     /// How much this file can symbolicate: (DWARF debug info, symbol table,
     /// byte size), compared in that order by [`keep_richest_per_build_id`].
@@ -117,6 +118,79 @@ pub fn extract_libs(
             arch,
             path: out_path,
             richness,
+        });
+    }
+    Ok(libs)
+}
+
+/// Collect native libraries from `input`: a directory is walked recursively
+/// (see [`scan_dir`]), anything else is read as a `native-debug-symbols.zip`
+/// and extracted into `out_dir` (see [`extract_libs`]).
+pub fn collect_libs(
+    input: &Path,
+    out_dir: &Path,
+    extra: &ExtraSuffixes,
+) -> std::io::Result<Vec<ElfLib>> {
+    if input.is_dir() {
+        scan_dir(input, extra)
+    } else {
+        extract_libs(input, out_dir, extra)
+    }
+}
+
+/// Walk `dir` recursively for native libraries (same name rules as the zip
+/// entries), reading each one's identity in place. `name` is the path relative
+/// to `dir`. Symlinks are followed (loops are skipped); unreadable entries are
+/// skipped with a warning rather than failing the whole scan. Sorted by path so
+/// the "first entry wins" tie-break in [`keep_richest_per_build_id`] is stable.
+pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib>> {
+    let mut libs = Vec::new();
+    for entry in walkdir::WalkDir::new(dir)
+        .follow_links(true)
+        .sort_by_file_name()
+    {
+        let entry = match entry {
+            Ok(e) => e,
+            // An unreadable root means nothing was scanned: fail, never exit 0 with
+            // a misleading "pass --extension" hint.
+            Err(e) if e.depth() == 0 => return Err(e.into()),
+            Err(e) => {
+                tracing::warn!(error = %e, "skipping unreadable path while scanning for native libraries");
+                continue;
+            }
+        };
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        let file_name = entry.file_name().to_string_lossy();
+        if !(is_native_lib_entry(&file_name) || extra.matches(&file_name)) {
+            continue;
+        }
+        let bytes = match std::fs::read(entry.path()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %entry.path().display(), error = %e, "skipping unreadable native library");
+                continue;
+            }
+        };
+        let ElfIdentity {
+            build_id,
+            arch,
+            has_debug_info,
+            has_symbols,
+        } = parse_elf_identity(&bytes);
+        let name = entry
+            .path()
+            .strip_prefix(dir)
+            .unwrap_or(entry.path())
+            .to_string_lossy()
+            .replace('\\', "/");
+        libs.push(ElfLib {
+            name,
+            build_id,
+            arch,
+            path: entry.path().to_path_buf(),
+            richness: (has_debug_info, has_symbols, bytes.len() as u64),
         });
     }
     Ok(libs)
@@ -357,6 +431,80 @@ mod tests {
             "the .so bytes were extracted to disk"
         );
         assert_eq!(std::fs::read(&libs[0].path).unwrap(), b"not a real elf");
+    }
+
+    fn fixture_bytes() -> Vec<u8> {
+        std::fs::read(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so"),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn scan_dir_walks_recursively_in_place_and_skips_other_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fixture_bytes();
+        for rel in [
+            "lib/arm64-v8a/libsymbol1.so",
+            "lib/x86_64/libsymbol1.so.sym",
+            "lib/x86_64/readme.txt",
+        ] {
+            let p = dir.path().join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, &bytes).unwrap();
+        }
+        std::fs::write(dir.path().join("lib/x86_64/libbare.so"), b"not elf").unwrap();
+
+        let libs = scan_dir(dir.path(), &ExtraSuffixes::default()).unwrap();
+        assert_eq!(
+            names(&libs),
+            [
+                "lib/arm64-v8a/libsymbol1.so",
+                "lib/x86_64/libbare.so",
+                "lib/x86_64/libsymbol1.so.sym"
+            ]
+        );
+        assert_eq!(
+            libs[0].build_id.as_deref(),
+            Some("bca64abfec40dbb631bb8f1c37414472")
+        );
+        assert_eq!(libs[1].build_id, None, "non-ELF yields no build-id");
+        assert_eq!(
+            libs[0].path,
+            dir.path().join("lib/arm64-v8a/libsymbol1.so"),
+            "read in place, not copied"
+        );
+
+        let extra = ExtraSuffixes::parse(&["txt".to_string()]).unwrap();
+        assert_eq!(scan_dir(dir.path(), &extra).unwrap().len(), 4);
+    }
+
+    #[test]
+    fn collect_libs_dispatches_on_directory_vs_zip() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes = fixture_bytes();
+        let libdir = dir.path().join("libs");
+        std::fs::create_dir_all(&libdir).unwrap();
+        std::fs::write(libdir.join("libsymbol1.so"), &bytes).unwrap();
+        let zip_path = dir.path().join("n.zip");
+        {
+            let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+            zw.start_file("arm64-v8a/libsymbol1.so", SimpleFileOptions::default())
+                .unwrap();
+            zw.write_all(&bytes).unwrap();
+            zw.finish().unwrap();
+        }
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let x = ExtraSuffixes::default();
+        assert_eq!(
+            names(&collect_libs(&libdir, &out, &x).unwrap()),
+            ["libsymbol1.so"]
+        );
+        assert_eq!(
+            names(&collect_libs(&zip_path, &out, &x).unwrap()),
+            ["arm64-v8a/libsymbol1.so"]
+        );
     }
 
     fn lib(name: &str, build_id: Option<&str>, richness: (bool, bool, u64)) -> ElfLib {

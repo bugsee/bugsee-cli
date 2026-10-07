@@ -17,7 +17,9 @@ const DEFAULT_ENDPOINT: &str = "https://api.bugsee.com";
 pub enum DebugFilesCommand {
     /// Discover, package, and upload debug information files from one or more paths.
     Upload {
-        /// One or more directories or files to scan.
+        /// One or more directories or files to scan. For `--type elf`, a directory
+        /// is walked recursively for native libraries (e.g. AGP's
+        /// `merged_native_libs`), and a file is a `native-debug-symbols.zip`.
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
@@ -141,8 +143,9 @@ pub enum DebugFilesCommand {
         /// such as `.so.sym` work. It only widens the NAME match: each type's content check
         /// still applies to what it picks up.
         ///
-        /// Per type: `elf` — entries in the native-debug-symbols zip (built in: `.so`,
-        /// `.so.dbg`, `.so.sym`; each still needs a GNU build-id). `proguard` — files in a
+        /// Per type: `elf` — files in a scanned directory or entries in the
+        /// native-debug-symbols zip (built in: `.so`, `.so.dbg`, `.so.sym`; each still
+        /// needs a GNU build-id). `proguard` — files in a
         /// scanned directory (built in: `mapping*.txt`). `sourcemaps` — files in a scanned
         /// directory (built in: `.map`). `pdb` — files in a scanned directory, compared
         /// case-insensitively (built in: `.pdb`; each still needs the MSF container
@@ -1078,15 +1081,9 @@ pub(crate) fn discover_dsyms(paths: &[PathBuf], extra: &ExtraSuffixes) -> Vec<Pa
     out
 }
 
-/// Run the upload for one or more pre-packaged native-debug-symbols archives.
-///
-/// Phase 1 scope: each path must be a regular file (the AGP-produced
-/// `native-debug-symbols.zip`). The CLI hashes the bytes, POSTs metadata
-/// with `transform = breakpad`, then PUTs the file as-is — no Zstd
-/// re-compression in this phase. Walking a directory of `.so` files is
-/// the Gradle plugin's job (it pre-zips the
-/// `build/intermediates/native_debug_metadata/<variant>/out` directory
-/// before invoking the CLI).
+/// Upload native libraries from one or more inputs: AGP's
+/// `native-debug-symbols.zip` and/or directories walked recursively. Each
+/// library becomes its own symbol document keyed by its GNU build-id.
 #[allow(clippy::too_many_arguments)]
 /// Max concurrent per-`.so` register+upload pipelines. A native archive can hold
 /// dozens of libraries across ABIs; uploading them serially would dominate CI
@@ -1151,18 +1148,6 @@ async fn run_elf_upload(
     if paths.is_empty() {
         return Err(input_not_found("no input paths supplied"));
     }
-    for p in paths {
-        if !p.is_file() {
-            // Directory-walk + re-pack is out of scope — the Gradle plugin
-            // pre-zips the intermediate-folder case before invoking the CLI.
-            return Err(input_invalid(format!(
-                "--type elf expects a pre-built zip file (typically AGP's \
-                 native-debug-symbols.zip); got {}",
-                p.display()
-            )));
-        }
-    }
-
     // `build_uuid` (the SDK's runtime BUILD_UUID) is NO LONGER the native
     // symbol identity — each `.so` is keyed by its OWN GNU build-id (one file →
     // one symbol document → one S3 object). The BUILD_UUID belongs to the
@@ -1194,10 +1179,42 @@ async fn run_elf_upload(
     let mut full_already_existed = 0u32;
     let mut skipped_no_build_id = 0u32;
 
-    for archive in paths {
-        tracing::info!(path = %archive.display(), "processing native-debug-symbols archive");
-        let work_dir = tempfile::tempdir()?;
-        let libs = elf::extract_libs(archive, work_dir.path(), extra)?;
+    // Collect from EVERY input first so the one-per-build-id preference spans
+    // paths (e.g. the same library under two variant folders), then upload once.
+    let work_dir = tempfile::tempdir()?;
+    let mut libs: Vec<elf::ElfLib> = Vec::new();
+    for (n, input) in paths.iter().enumerate() {
+        tracing::info!(path = %input.display(), "scanning for native libraries");
+        // Own extraction dir per input: zip entries are staged as `<index>_<base>`,
+        // and indices restart at 0 in every archive.
+        let input_dir = work_dir.path().join(n.to_string());
+        std::fs::create_dir_all(&input_dir)?;
+        let found = elf::collect_libs(input, &input_dir, extra).map_err(|e| {
+            if e.kind() == std::io::ErrorKind::NotFound {
+                input_not_found(format!("{} does not exist", input.display()))
+            } else if input.is_dir() {
+                input_invalid(format!("cannot scan {}: {e}", input.display()))
+            } else {
+                input_invalid(format!(
+                    "--type elf expects a directory or a native-debug-symbols zip; \
+                     cannot read {}: {e}",
+                    input.display()
+                ))
+            }
+        })?;
+        if found.is_empty() {
+            // Nothing even matched by name — the one case `--extension` fixes.
+            // Ahead of the dry-run exit: a dry run is how a caller checks this.
+            tracing::warn!(
+                path = %input.display(),
+                "no files named .so / .so.dbg / .so.sym (or an --extension suffix) — \
+                 nothing to upload. If your toolchain emits another suffix, pass it \
+                 with --extension"
+            );
+        }
+        libs.extend(found);
+    }
+    {
         let libs = elf::keep_richest_per_build_id(libs);
         let total = libs.len();
 
@@ -1220,61 +1237,45 @@ async fn run_elf_upload(
         tracing::info!(
             libraries = total,
             uploadable = uploadable.len(),
-            "extracted native libraries"
+            "collected native libraries"
         );
 
         if total == 0 {
-            // Nothing even matched by name — the one case `--extension` fixes.
-            // Ahead of the dry-run exit: a dry run is how a caller checks this.
-            tracing::warn!(
-                archive = %archive.display(),
-                "no entries named .so / .so.dbg / .so.sym (or an --extension suffix) — \
-                 nothing to upload. If your toolchain emits another suffix, pass it \
-                 with --extension"
-            );
-            continue;
-        }
-        if dry_run {
+            // Already warned per input above.
+        } else if dry_run {
             tracing::info!(
-                "dry-run: would register + upload {} libraries from {}",
-                uploadable.len(),
-                archive.display()
+                "dry-run: would register + upload {} libraries",
+                uploadable.len()
             );
-            continue;
-        }
-        if uploadable.is_empty() {
-            tracing::warn!(
-                archive = %archive.display(),
-                "no native libraries with a GNU build-id — nothing to upload"
-            );
-            continue;
-        }
+        } else if uploadable.is_empty() {
+            tracing::warn!("no native libraries with a GNU build-id — nothing to upload");
+        } else {
+            let client = client.as_ref().expect("client constructed when !dry_run");
 
-        let client = client.as_ref().expect("client constructed when !dry_run");
+            // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
+            let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
+                futures_util::stream::iter(uploadable.into_iter().enumerate())
+                    .map(|(i, lib)| {
+                        let client = client.clone();
+                        let work = work_dir.path().to_path_buf();
+                        async move {
+                            let symbol_table_only = lib.name.ends_with(".so.sym");
+                            let outcome = upload_one_so(&client, ctx, &lib, i, &work).await;
+                            (symbol_table_only, outcome)
+                        }
+                    })
+                    .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
+                    .collect()
+                    .await;
 
-        // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
-        let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
-            futures_util::stream::iter(uploadable)
-                .map(|lib| {
-                    let client = client.clone();
-                    let work = work_dir.path().to_path_buf();
-                    async move {
-                        let symbol_table_only = lib.name.ends_with(".so.sym");
-                        let outcome = upload_one_so(&client, ctx, &lib, &work).await;
-                        (symbol_table_only, outcome)
-                    }
-                })
-                .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
-                .collect()
-                .await;
-
-        for (symbol_table_only, outcome) in outcomes {
-            match outcome? {
-                presigned::Outcome::Uploaded => uploaded += 1,
-                presigned::Outcome::AlreadyExists => {
-                    already_existed += 1;
-                    if !symbol_table_only {
-                        full_already_existed += 1;
+            for (symbol_table_only, outcome) in outcomes {
+                match outcome? {
+                    presigned::Outcome::Uploaded => uploaded += 1,
+                    presigned::Outcome::AlreadyExists => {
+                        already_existed += 1;
+                        if !symbol_table_only {
+                            full_already_existed += 1;
+                        }
                     }
                 }
             }
@@ -1314,6 +1315,7 @@ async fn upload_one_so(
     client: &reqwest::Client,
     ctx: ElfUploadCtx<'_>,
     lib: &elf::ElfLib,
+    index: usize,
     work_dir: &Path,
 ) -> anyhow::Result<presigned::Outcome> {
     let build_id = lib
@@ -1325,18 +1327,14 @@ async fn upload_one_so(
         .and_then(|n| n.to_str())
         .unwrap_or("lib.so");
 
-    // Name the staging ZIP after the extracted `.so`'s on-disk filename, which
-    // `elf::extract_libs` already made unique with an index prefix
-    // (`<i>_<basename>`). Keying it on `build_id` instead would collide under
-    // the concurrent `buffer_unordered` upload if two libraries shared a
-    // build-id — two tasks would `File::create` the same path and interleave
-    // writes into a corrupt ZIP with the wrong SHA-1.
-    let zip_stem = lib
-        .path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("lib.so");
-    let zip_path = work_dir.join(format!("{zip_stem}.zip"));
+    // Name the staging ZIP by the caller's per-library index, unique within the
+    // run. Keying it on `build_id` would collide under the concurrent
+    // `buffer_unordered` upload if two libraries shared a build-id, and the
+    // basename alone collides across ABIs (a directory scan reads libraries in
+    // place, so `lib/arm64-v8a/libfoo.so` and `lib/x86_64/libfoo.so` both end
+    // in `libfoo.so`) — two tasks would `File::create` the same path and
+    // interleave writes into a corrupt ZIP with the wrong SHA-1.
+    let zip_path = work_dir.join(format!("{index}_{entry_name}.zip"));
     compress::pack_single_entry(&lib.path, entry_name, &zip_path, ctx.strategy)?;
     let hash = elf::sha1_hex_of_file(&zip_path)?;
 

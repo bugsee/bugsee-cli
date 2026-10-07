@@ -325,3 +325,183 @@ fn elf_dry_run_with_no_matching_entries_suggests_extension() {
     .success()
     .stderr(predicates::str::contains("pass it with --extension"));
 }
+
+fn elf_args<'a>(endpoint: &'a str, inputs: &'a [String]) -> Vec<&'a str> {
+    let mut a = vec![
+        "--endpoint",
+        endpoint,
+        "--app-token",
+        "TKN",
+        "debug-files",
+        "upload",
+        "--type",
+        "elf",
+        "--version",
+        "1.0",
+        "--build",
+        "1",
+        "--uuid",
+        "00000000-0000-0000-0000-000000000000",
+    ];
+    a.extend(inputs.iter().map(String::as_str));
+    a
+}
+
+/// A directory (AGP's `merged_native_libs` layout) is walked recursively. The
+/// same library under two ABI folders, plus a zip of it, shares ONE build-id,
+/// so exactly one POST + PUT go out; the non-library file is ignored.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_walks_a_directory_and_dedups_by_build_id_across_paths() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let root = tmp.path().join("merged_native_libs/release/out/lib");
+    for abi in ["arm64-v8a", "x86_64"] {
+        std::fs::create_dir_all(root.join(abi)).unwrap();
+        std::fs::copy(&fixture, root.join(abi).join("libsymbol1.so")).unwrap();
+    }
+    std::fs::write(root.join("x86_64/notes.txt"), b"ignored").unwrap();
+    let zip_path = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so");
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .and(body_string_contains(FIXTURE_BUILD_ID))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let inputs = vec![
+        tmp.path()
+            .join("merged_native_libs")
+            .to_string_lossy()
+            .into_owned(),
+        zip_path.to_string_lossy().into_owned(),
+    ];
+    tokio::task::spawn_blocking(move || {
+        common::cli()
+            .args(elf_args(&endpoint, &inputs))
+            .assert()
+            .success();
+    })
+    .await
+    .unwrap();
+}
+
+/// An input path that exists as neither a directory nor a readable zip still
+/// fails (it is not silently skipped), with a message naming it.
+#[test]
+fn elf_upload_rejects_a_missing_path() {
+    let tmp = tempfile::tempdir().unwrap();
+    let missing = tmp.path().join("nope").to_string_lossy().into_owned();
+    let inputs = vec![missing];
+    common::cli()
+        .args(elf_args("http://127.0.0.1:1", &inputs))
+        .assert()
+        .code(10)
+        .stderr(predicates::str::contains("nope"));
+}
+
+/// Two zips whose entries share a basename and archive index but carry DIFFERENT
+/// build-ids must each upload their own bytes (extraction must not collide).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_keeps_same_named_entries_of_different_zips_apart() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf/libsymbol1.so");
+    let a = pack_native_zip(tmp.path(), "arm64-v8a/libsymbol1.so");
+    let a = {
+        let d = tmp.path().join("a");
+        std::fs::create_dir_all(&d).unwrap();
+        let t = d.join("a.zip");
+        std::fs::rename(a, &t).unwrap();
+        t
+    };
+    // Same fixture with the build-id's first byte flipped (found by value).
+    let mut other = std::fs::read(&fixture).unwrap();
+    let id = hex::decode(FIXTURE_BUILD_ID).unwrap();
+    let pos = other.windows(id.len()).position(|w| w == id).unwrap();
+    other[pos] ^= 0xff;
+    let other_id = hex::encode(&other[pos..pos + id.len()]);
+    let b = tmp.path().join("b.zip");
+    {
+        let mut zw = zip::ZipWriter::new(std::fs::File::create(&b).unwrap());
+        zw.start_file(
+            "x86_64/libsymbol1.so",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zw.write_all(&other).unwrap();
+        zw.finish().unwrap();
+    }
+
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(wm_path("/apps/TKN/symbols"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let endpoint = server.uri();
+    let inputs = vec![
+        a.to_string_lossy().into_owned(),
+        b.to_string_lossy().into_owned(),
+    ];
+    tokio::task::spawn_blocking(move || {
+        common::cli()
+            .args(elf_args(&endpoint, &inputs))
+            .assert()
+            .success();
+    })
+    .await
+    .unwrap();
+
+    let reqs = server.received_requests().await.unwrap();
+    let posts: Vec<String> = reqs
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+        .collect();
+    assert!(posts.iter().any(|p| p.contains(FIXTURE_BUILD_ID)));
+    assert!(posts.iter().any(|p| p.contains(&other_id)));
+    let puts = reqs.iter().filter(|r| r.method.as_str() == "PUT").count();
+    assert_eq!(puts, 2);
+}
+
+/// An unreadable/nonexistent directory root must not exit 0.
+#[cfg(unix)]
+#[test]
+fn elf_upload_fails_on_an_unreadable_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempfile::tempdir().unwrap();
+    let locked = tmp.path().join("locked");
+    std::fs::create_dir_all(&locked).unwrap();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Root bypasses permission checks; nothing to assert then.
+    let readable = std::fs::read_dir(&locked).is_ok();
+    let inputs = vec![locked.to_string_lossy().into_owned()];
+    let assert = common::cli()
+        .args(elf_args("http://127.0.0.1:1", &inputs))
+        .assert();
+    std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+    if !readable {
+        assert.failure();
+    }
+}
