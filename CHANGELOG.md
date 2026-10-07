@@ -6,6 +6,21 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- **`debug-files upload --type elf` accepts directories.** One or more directories (and/or
+  `native-debug-symbols.zip` files) are scanned; directories are walked recursively for `.so` /
+  `.so.dbg` / `.so.sym` (+ `--extension`) and read in place, so a Gradle build can point it at
+  `merged_native_libs/<variant>` without re-zipping. One upload per GNU build-id across all
+  paths. A directory with no matching libraries exits 10; an empty zip still only warns. Directory
+  symlinks are not descended (file symlinks are read), and any I/O error while scanning (an
+  unreadable subdirectory or library, a dangling link) fails with exit 11 rather than uploading a
+  partial set. See #69.
+
+### Changed
+- **`--type elf` collects every input before uploading anything.** A corrupt second zip now aborts
+  (exit 11) before the first zip uploads, instead of after. A path that does not exist now exits
+  10 (input not found) rather than 11; both are in the no-fallback range.
+
 ## [0.7.13] - 2026-10-07
 
 ### Added

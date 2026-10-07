@@ -2,8 +2,8 @@
 //!
 //! Submodules handle format-specific concerns:
 //!   - `proguard`    — R8 / ProGuard mapping files (v0.1)
-//!   - `elf`         — NDK native-debug-symbols zip pass-through
-//!     (v0.1 pass-through; per-`.so` build-id extraction TBD)
+//!   - `elf`         — NDK native libraries (a native-debug-symbols zip or a
+//!     directory), per-`.so` build-id keyed
 //!   - `dsym`        — Apple Mach-O dSYM bundles (v0.1: single bundle;
 //!     multi-bundle directory walk + BCSymbolMap support TBD)
 //!   - `pdb`         — Windows PDB (MSF container); identity is the debug id
