@@ -127,16 +127,43 @@ fn inject_dry_run_reports_but_writes_nothing() {
 
 #[test]
 fn inject_rejects_an_unusable_map_and_leaves_it_alone() {
+    use predicates::prelude::PredicateBooleanExt;
     let tmp = tempfile::tempdir().unwrap();
-    write(tmp.path(), "app.js", b"a()\n");
+    let js = write(tmp.path(), "app.js", b"a()\n");
     let map = write(tmp.path(), "app.js.map", b"{ not json");
     common::cli()
         .args(["sourcemaps", "inject"])
         .arg(tmp.path())
         .assert()
         .code(11) // InputInvalid
-        .stderr(predicates::str::contains("not valid JSON"));
+        .stderr(predicates::str::contains("not valid JSON"))
+        .stderr(predicates::str::contains("injected debug-id").not());
     assert_eq!(std::fs::read(&map).unwrap(), b"{ not json");
+    assert_eq!(
+        std::fs::read(&js).unwrap(),
+        b"a()\n",
+        "a failed inject must not leave a stamped bundle behind"
+    );
+}
+
+/// Rewriting a map must not depend on `$TMPDIR` having room (or existing): in CI containers
+/// it is often a tiny tmpfs. The scratch file lives beside the map.
+#[test]
+fn inject_does_not_need_tmpdir() {
+    let tmp = tempfile::tempdir().unwrap();
+    write(tmp.path(), "app.js", b"a()\n");
+    let map = write(tmp.path(), "app.js.map", MAP.as_bytes());
+    common::cli()
+        .args(["sourcemaps", "inject"])
+        .arg(tmp.path())
+        .env("TMPDIR", "/nonexistent/tmp")
+        .env("TMP", "/nonexistent/tmp")
+        .env("TEMP", "/nonexistent/tmp")
+        .assert()
+        .success();
+    assert!(String::from_utf8(std::fs::read(&map).unwrap())
+        .unwrap()
+        .contains("debug_id"));
 }
 
 // ---------------------------------------------------------------------------

@@ -47,6 +47,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **`sourcemaps inject` edits bundles in place.** The debug-id stub is appended (or, to re-key, our
   own trailing stub is swapped) without copying the bundle: a 150 MB bundle's dirty memory went
   from 317 MB to 2.4 MB. Output bytes are identical, and permissions and symlinks survive as before.
+  A map that cannot take the id (not a JSON object, invalid, read-only) is now refused BEFORE the
+  bundle is touched, so a failed run no longer leaves a stamped bundle beside an un-keyed map.
 
 ### Fixed
 - **`dsym uuid` and `debug-files upload --type dsym` no longer report a Mach-O with no `LC_UUID`

@@ -444,9 +444,28 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
         }
     };
 
+    // EVERYTHING that can fail on the map happens BEFORE the first byte of the bundle
+    // changes: the map is validated (a JSON object), its rewrite is staged in a scratch
+    // file, and the original is opened for writing (a read-only map is refused here).
+    // A map that cannot take the id then leaves the bundle exactly as the bundler wrote
+    // it, instead of a bundle stamped with an id its map never got (which a retry would
+    // not repair: `restamp_id` leaves our own stub alone).
+    let map_plan = match map_path.as_deref() {
+        Some(m) => Some(plan_map_rewrite(m, &debug_id, freshly_computed, dry_run)?),
+        None => None,
+    };
+
     if let (Some(edit), false) = (&edit, dry_run) {
         apply_js_edit(js_path, edit)?;
     }
+    let mut map_updated = false;
+    if let Some(MapPlan::Rewrite(rewrite)) = map_plan {
+        map_updated = true;
+        if let Some(rewrite) = rewrite {
+            apply_map_rewrite(rewrite)?;
+        }
+    }
+
     match outcome {
         JsOutcome::Restamped { stale, fresh } => {
             stats.js_restamped += 1;
@@ -471,11 +490,10 @@ fn inject_one(js_path: &Path, dry_run: bool, stats: &mut InjectStats) -> Result<
             tracing::info!(path = %js_path.display(), debug_id = %id, "injected debug-id");
         }
     }
-
-    if let Some(map_path) = map_path {
-        if write_map_debug_id(&map_path, &debug_id, freshly_computed, dry_run)? {
-            stats.maps_updated += 1;
-            tracing::debug!(path = %map_path.display(), debug_id = %debug_id, "wrote debug_id into map");
+    if map_updated {
+        stats.maps_updated += 1;
+        if let Some(m) = map_path.as_deref() {
+            tracing::debug!(path = %m.display(), debug_id = %debug_id, "wrote debug_id into map");
         }
     }
     Ok(())
@@ -509,7 +527,9 @@ fn restamp_id<'a>(
     else {
         return Ok(None);
     };
-    if top.values.iter().any(Option::is_some) {
+    // A map the id cannot be written into (not a JSON object) is not re-keyed either: the
+    // rewrite would refuse it, and the bundle must not change when it does.
+    if !top.is_object || top.values.iter().any(Option::is_some) {
         return Ok(None);
     }
     let fresh = compute_debug_id_with_map_file(original.as_bytes(), map_path)?;
@@ -600,14 +620,32 @@ fn map_id_action(
     }
 }
 
-/// Make a `.map` JSON carry `debug_id` AND `debugId` equal to the bundle's id,
-/// as [`map_id_action`] decides. Returns whether the map was changed.
-fn write_map_debug_id(
+/// A map rewrite staged in full but not yet applied (see [`plan_map_rewrite`]).
+struct MapRewrite {
+    /// The original map, already OPENED for writing (so a read-only map fails at plan time).
+    dest: std::fs::File,
+    /// The complete new content.
+    scratch: std::fs::File,
+}
+
+/// What the paired map needs.
+enum MapPlan {
+    /// Already carries the right id, or must be left alone (shared with another bundle).
+    Unchanged,
+    /// To be rewritten. `None` in a dry run: validated and counted, never staged.
+    Rewrite(Option<MapRewrite>),
+}
+
+/// Decide, and STAGE, making a `.map` JSON carry `debug_id` AND `debugId` equal to the
+/// bundle's id, as [`map_id_action`] decides. Nothing on disk changes here: all the ways this
+/// can fail (not a JSON object, invalid JSON, unreadable, not writable, no scratch space)
+/// surface now, so the caller can refuse before touching the bundle.
+fn plan_map_rewrite(
     map_path: &Path,
     debug_id: &str,
     freshly_computed: bool,
     dry_run: bool,
-) -> Result<bool> {
+) -> Result<MapPlan> {
     // Pass 1 (streamed, also validates the whole file): what ids does it carry?
     let top = map_top_level(map_path, &["debug_id", "debugId"])?;
     if !top.is_object {
@@ -623,7 +661,7 @@ fn write_map_debug_id(
         debug_id,
         freshly_computed,
     ) {
-        MapIdAction::Keep => return Ok(false),
+        MapIdAction::Keep => return Ok(MapPlan::Unchanged),
         MapIdAction::Fill => {}
         MapIdAction::Replace { stale } => tracing::warn!(
             path = %map_path.display(),
@@ -639,44 +677,52 @@ fn write_map_debug_id(
                 "source map carries a different debug id than its bundle, which already had one; left as is \
                  (is this map shared by more than one bundle?)"
             );
-            return Ok(false);
+            return Ok(MapPlan::Unchanged);
         }
     }
-    if !dry_run {
-        // Pass 2: stream the map into a scratch file with the ids set, then write its
-        // CONTENT into the original (not rename: that would swap the inode and drop the
-        // symlink / hard link the build gave the map; and not `fs::copy`: it also copies
-        // the scratch file's metadata, i.e. its 0o600 mode, onto the map).
-        // The scratch file is anonymous (a killed run leaves no stray `.tmpXXXX`). It lives
-        // beside the map, on the volume that already holds one copy of it: a tens-of-MB map
-        // must not need that much free space in `$TMPDIR`, which in CI containers is often a
-        // small tmpfs. Only when the directory refuses a file (it is read-only: editing the
-        // map in place never needed it writable) does it fall back to the OS temp dir.
-        let dir = map_path
-            .parent()
-            .filter(|p| !p.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new("."));
-        let mut scratch = tempfile::tempfile_in(dir).or_else(|_| tempfile::tempfile())?;
-        {
-            let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
-            let mut out = std::io::BufWriter::new(&scratch);
-            mapjson::set_debug_ids(input, &mut out, debug_id).map_err(|e| match e {
-                mapjson::MapJsonError::Io(e) => Error::Io(e),
-                mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
-                    "failed to rewrite sourcemap JSON: {m} ({})",
-                    map_path.display()
-                )),
-            })?;
-            std::io::Write::flush(&mut out)?;
-        }
-        let mut dest = std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(map_path)?;
-        std::io::Seek::seek(&mut scratch, std::io::SeekFrom::Start(0))?;
-        std::io::copy(&mut scratch, &mut dest)?;
+    if dry_run {
+        return Ok(MapPlan::Rewrite(None));
     }
-    Ok(true)
+
+    // The original is opened for writing (NOT truncated yet) up front: a read-only map is
+    // an error now, not after the bundle was already stamped.
+    let dest = std::fs::OpenOptions::new().write(true).open(map_path)?;
+
+    // Pass 2: stream the map into a scratch file with the ids set. Its CONTENT will later go
+    // into the original (not rename: that would swap the inode and drop the symlink / hard
+    // link the build gave the map; and not `fs::copy`: it also copies the scratch file's
+    // metadata, i.e. its 0o600 mode, onto the map).
+    // The scratch file is anonymous (a killed run leaves no stray `.tmpXXXX`). It lives
+    // beside the map, on the volume that already holds one copy of it: a tens-of-MB map
+    // must not need that much free space in `$TMPDIR`, which in CI containers is often a
+    // small tmpfs. Only when the directory refuses a file (it is read-only: editing the
+    // map in place never needed it writable) does it fall back to the OS temp dir.
+    let dir = map_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let scratch = tempfile::tempfile_in(dir).or_else(|_| tempfile::tempfile())?;
+    {
+        let input = std::io::BufReader::new(std::fs::File::open(map_path)?);
+        let mut out = std::io::BufWriter::new(&scratch);
+        mapjson::set_debug_ids(input, &mut out, debug_id).map_err(|e| match e {
+            mapjson::MapJsonError::Io(e) => Error::Io(e),
+            mapjson::MapJsonError::Json(m) => Error::InputInvalid(format!(
+                "failed to rewrite sourcemap JSON: {m} ({})",
+                map_path.display()
+            )),
+        })?;
+        std::io::Write::flush(&mut out)?;
+    }
+    Ok(MapPlan::Rewrite(Some(MapRewrite { dest, scratch })))
+}
+
+/// Write a staged rewrite into the original map: truncate it and copy the new content in.
+fn apply_map_rewrite(mut rewrite: MapRewrite) -> Result<()> {
+    std::io::Seek::seek(&mut rewrite.scratch, std::io::SeekFrom::Start(0))?;
+    rewrite.dest.set_len(0)?;
+    std::io::copy(&mut rewrite.scratch, &mut rewrite.dest)?;
+    Ok(())
 }
 
 /// Read the keying id from a `.map` for upload: `debug_id` (modern) / `debugId`
@@ -2079,10 +2125,11 @@ mod file_edits {
         assert_eq!(std::fs::read(&js).unwrap(), b"a()\xff\xfe\n");
     }
 
-    /// A map that is not a JSON object cannot take an id: the run fails and the map
-    /// is left exactly as it was, with no temp file beside it.
+    /// A map that is not a JSON object cannot take an id: the run fails and NOTHING is
+    /// touched. In particular the bundle must not be stamped first: it would then carry an id
+    /// its map never got, and a retry would not repair it (our own stub is left alone).
     #[test]
-    fn an_unusable_map_is_left_untouched() {
+    fn an_unusable_map_leaves_both_files_untouched() {
         for (label, map) in [
             ("not json", "{not json"),
             ("an array", "[]"),
@@ -2090,13 +2137,42 @@ mod file_edits {
             ("trailing junk", r#"{"version":3} x"#),
         ] {
             let dir = tempfile::tempdir().unwrap();
-            std::fs::write(dir.path().join("a.js"), "a()\n").unwrap();
+            let js = dir.path().join("a.js");
+            std::fs::write(&js, "a()\n").unwrap();
             let mp = dir.path().join("a.js.map");
             std::fs::write(&mp, map).unwrap();
             let err = inject_dir(dir.path()).unwrap_err();
             assert!(matches!(err, Error::InputInvalid(_)), "{label}: {err:?}");
             assert_eq!(std::fs::read_to_string(&mp).unwrap(), map, "{label}");
+            assert_eq!(
+                std::fs::read_to_string(&js).unwrap(),
+                "a()\n",
+                "{label}: the bundle was stamped before the map was found unusable"
+            );
             assert_eq!(names(dir.path()), ["a.js", "a.js.map"], "{label}");
+        }
+    }
+
+    /// Same guarantee on a RE-run: a stamped bundle whose map was replaced by something
+    /// unusable is not re-keyed (that rewrite would be refused), so it is not changed either.
+    #[test]
+    fn an_unusable_regenerated_map_does_not_restamp_the_bundle() {
+        for (label, map) in [("an array", "[]"), ("not json", "{nope")] {
+            let dir = tempfile::tempdir().unwrap();
+            let js = dir.path().join("a.js");
+            std::fs::write(&js, "a()\n//# sourceMappingURL=a.js.map\n").unwrap();
+            std::fs::write(dir.path().join("a.js.map"), MAP).unwrap();
+            inject_dir(dir.path()).unwrap();
+            let stamped = std::fs::read(&js).unwrap();
+
+            std::fs::write(dir.path().join("a.js.map"), map).unwrap();
+            let err = inject_dir(dir.path()).unwrap_err();
+            assert!(matches!(err, Error::InputInvalid(_)), "{label}: {err:?}");
+            assert_eq!(
+                std::fs::read(&js).unwrap(),
+                stamped,
+                "{label}: bundle changed"
+            );
         }
     }
 
@@ -2161,6 +2237,27 @@ mod file_edits {
         /// Rewriting a map needs no write access to its DIRECTORY (editing existing files in
         /// place never did): a read-only `dist/` holding writable files must still inject, and
         /// nothing may be created beside them.
+        /// A map that cannot be written (read-only) is refused BEFORE the bundle is stamped.
+        #[test]
+        fn a_read_only_map_is_an_error_and_the_bundle_stays_unstamped() {
+            let dir = tempfile::tempdir().unwrap();
+            let js = dir.path().join("a.js");
+            let map = dir.path().join("a.js.map");
+            std::fs::write(&js, "a()\n").unwrap();
+            std::fs::write(&map, MAP).unwrap();
+            std::fs::set_permissions(&map, std::fs::Permissions::from_mode(0o444)).unwrap();
+            if std::fs::OpenOptions::new().write(true).open(&map).is_ok() {
+                return; // running as root: permissions are not enforced
+            }
+            assert!(matches!(inject_dir(dir.path()), Err(Error::Io(_))));
+            assert_eq!(
+                std::fs::read(&js).unwrap(),
+                b"a()\n",
+                "the bundle was stamped"
+            );
+            assert_eq!(std::fs::read_to_string(&map).unwrap(), MAP);
+        }
+
         #[test]
         fn files_in_a_read_only_directory_are_still_rewritten() {
             let dir = tempfile::tempdir().unwrap();

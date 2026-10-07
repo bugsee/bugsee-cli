@@ -181,6 +181,11 @@ fn broken_source_maps_never_crash_and_exit_with_stable_codes() {
                 bytes,
                 "inject rewrote a map it rejected: {label}"
             );
+            assert_eq!(
+                std::fs::read(dir.join("app.js")).unwrap(),
+                b"a()\n",
+                "inject stamped the bundle although it rejected the map: {label}"
+            );
             let left: Vec<_> = std::fs::read_dir(&dir)
                 .unwrap()
                 .map(|e| e.unwrap().file_name())
