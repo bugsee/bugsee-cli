@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ReaderSettings, ValueType};
+use struson::reader::{JsonReader, JsonStreamReader, ReaderError, ValueType};
 use walkdir::WalkDir;
 
 use super::suffix::ExtraSuffixes;
@@ -132,14 +132,10 @@ pub fn validate_mappings(path: &Path) -> anyhow::Result<MappingsStats> {
         }
         other => bad(&other.to_string()),
     };
-    // Numbers are read as text and parsed here, so the reader's big-number guard is moot.
-    let mut r = JsonStreamReader::new_custom(
-        std::io::BufReader::new(file),
-        ReaderSettings {
-            restrict_number_values: false,
-            ..Default::default()
-        },
-    );
+    // The reader's default number guard (no exponent beyond +-99, no token over 100
+    // characters) stays ON: a line number is at most 10 digits, so anything the guard
+    // refuses is invalid here anyway, and it stops a huge number from being buffered.
+    let mut r = JsonStreamReader::new(std::io::BufReader::new(file));
     let mut stats = MappingsStats {
         cpp_files: 0,
         cs_files: 0,
@@ -197,8 +193,9 @@ pub fn validate_mappings(path: &Path) -> anyhow::Result<MappingsStats> {
                 )?;
                 let n = r.next_number_as_string().map_err(from_reader)?;
                 if n.parse::<u32>().is_err() {
+                    let shown: String = n.chars().take(32).collect();
                     return Err(bad(&format!(
-                        "{cpp}:{line} maps to {n}, not a non-negative integer line"
+                        "{cpp}:{line} maps to {shown}, not a non-negative integer line"
                     )));
                 }
                 stats.lines += 1;
@@ -544,6 +541,22 @@ mod tests {
             assert!(
                 validate_mappings(&p).is_err(),
                 "a {cut}-byte prefix was accepted"
+            );
+        }
+    }
+
+    /// A leaf "number" of thousands of digits (a wrong file or a partial write) is refused by
+    /// the reader's number guard before it is buffered, and the message stays short.
+    #[test]
+    fn a_huge_number_is_rejected_cheaply_with_a_short_message() {
+        for body in ["9".repeat(50_000), format!("1e{}", "9".repeat(40))] {
+            let doc = format!(r#"{{"a.cpp":{{"A.cs":{{"1":{body}}}}}}}"#);
+            let (_d, p) = write_json(doc.as_bytes());
+            let msg = invalid(&p);
+            assert!(
+                msg.len() < 1_000,
+                "the error must not echo the number: {} bytes",
+                msg.len()
             );
         }
     }
