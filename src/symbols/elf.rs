@@ -179,9 +179,11 @@ pub fn scan_dir(dir: &Path, extra: &ExtraSuffixes) -> std::io::Result<Vec<ElfLib
         // a 100+ MB unstripped library costs a few KB of resident memory, not a
         // full copy. (An empty file cannot be mapped; it has no build-id anyway.)
         //
-        // SAFETY: the map is read-only and dropped at the end of this iteration;
-        // the only hazard is another process truncating the library while it is
-        // being parsed, which build output being scanned does not do.
+        // SAFETY: the map is read-only and dropped at the end of this iteration.
+        // The contract (memmap2's): nothing may truncate or rewrite the library while
+        // it is mapped (SIGBUS / undefined behaviour otherwise). It holds for
+        // build-finalized outputs; a directory still being written by a linker is
+        // NOT a supported input (documented on `paths` in `--help`).
         let map = if len == 0 {
             None
         } else {
