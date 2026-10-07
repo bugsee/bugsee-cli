@@ -21,8 +21,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   (exit 11) before the first zip uploads, instead of after. A path that does not exist now exits
   10 (input not found) rather than 11; both are in the no-fallback range.
 - **Presigned symbol uploads no longer hold the whole archive in memory.** The PUT body and the
-  SHA-1 are streamed from disk in 64 KiB chunks (the PUT keeps an exact `Content-Length` and
-  re-opens the file per retry), and the ELF identity scan memory-maps libraries instead of reading
+  SHA-1 are streamed from disk in 64 KiB chunks (the PUT keeps an exact `Content-Length`,
+  re-opens the file per retry and follows 307/308 redirects itself, which reqwest cannot do for a
+  streamed body), and the ELF identity scan memory-maps libraries instead of reading
   them. Peak RSS for four 100 MB libraries dropped from 564 MB to 36 MB. Wire format unchanged.
   The one new constraint: a directory passed to `--type elf` must not be written to while it is
   scanned (a library truncated under its mapping is undefined behaviour, in practice SIGBUS), so
@@ -43,6 +44,28 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   original key order (it was alphabetical), and `inject` writes `debug_id` / `debugId` last. Both
   are still valid maps; an invalid-UTF-8 map outside a string value now reports as invalid JSON
   (exit 11) rather than I/O (exit 10).
+- **`sourcemaps inject` edits bundles in place.** The debug-id stub is appended (or, to re-key, our
+  own trailing stub is swapped) without copying the bundle: a 150 MB bundle's dirty memory went
+  from 317 MB to 2.4 MB. Output bytes are identical, and permissions and symlinks survive as before.
+  A map that cannot take the id (not a JSON object, invalid, read-only) is now refused BEFORE the
+  bundle is touched, so a failed run no longer leaves a stamped bundle beside an un-keyed map.
+
+### Fixed
+- **`dsym uuid` and `debug-files upload --type dsym` no longer report a Mach-O with no `LC_UUID`
+  as the nil UUID** (`00000000-0000-0000-0000-000000000000`). Such a slice can never match a crash
+  report and every one would collide on the same all-zero key, so it is skipped; a bundle with no
+  usable slice is rejected (and fails an `xcode upload-dsyms` build phase, as any unreadable
+  bundle does). The app-binary path already treated nil as absent.
+- **`--type elf` only treats real ELF files as ELF.** `symbolic` identifies Mach-O, PE and PDB just
+  as readily, so a macOS-built `.so` found by a directory scan would have been uploaded as an "elf"
+  symbol keyed by its Mach-O UUID. A file without the `\x7fELF` magic now has no build-id and is
+  skipped with the usual warning.
+- **`build-env read-plist` (and the `xcode` flows that read `Info.plist`) no longer crash on a
+  deeply nested plist.** Tens of thousands of nested arrays overflowed the stack and aborted the
+  process with SIGABRT; it now reads as `{}` like any other unusable plist. Plists over 1 MiB are
+  refused up front.
+- **`ios-deps` no longer reports a nameless dependency** (`library::`) for a truncated or mangled
+  `Podfile.lock` line such as `- (2.0)`.
 
 ## [0.7.13] - 2026-10-07
 

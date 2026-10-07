@@ -273,6 +273,89 @@ mod tests {
         app
     }
 
+    /// The app's identity comes from two files that can each be damaged: a broken
+    /// Info.plist or executable means "no UUID" (the caller falls back to a random one
+    /// so the build record still lands), never a panic and never a made-up UUID.
+    #[test]
+    fn main_executable_uuid_is_none_for_every_broken_app() {
+        use crate::symbols::test_macho::{thin_macho, CPU_SUBTYPE_ARM64_ALL, CPU_TYPE_ARM64};
+        let plist = |exe: &str| {
+            format!(
+                r#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleExecutable</key><string>{exe}</string></dict></plist>"#
+            )
+        };
+        let valid = thin_macho(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, [7; 16]);
+        let nil = thin_macho(CPU_TYPE_ARM64, CPU_SUBTYPE_ARM64_ALL, [0; 16]);
+
+        let build = |plist_bytes: &[u8], exe: Option<&[u8]>| {
+            let td = tempfile::tempdir().unwrap();
+            let app = td.path().join("A.app");
+            std::fs::create_dir_all(&app).unwrap();
+            std::fs::write(app.join("Info.plist"), plist_bytes).unwrap();
+            if let Some(b) = exe {
+                std::fs::write(app.join("MyApp"), b).unwrap();
+            }
+            (td, app)
+        };
+
+        // Control: an intact app reports the real UUID.
+        let (_t, app) = build(plist("MyApp").as_bytes(), Some(&valid));
+        assert_eq!(main_executable_uuid(&app).unwrap(), "07".repeat(16));
+
+        let mut cases: Vec<(String, Vec<u8>, Option<Vec<u8>>)> = vec![
+            ("garbage plist".into(), vec![0xff; 100], Some(valid.clone())),
+            ("empty plist".into(), Vec::new(), Some(valid.clone())),
+            (
+                "truncated plist".into(),
+                plist("MyApp").as_bytes()[..60].to_vec(),
+                Some(valid.clone()),
+            ),
+            (
+                "plist without the key".into(),
+                br#"<?xml version="1.0"?><plist version="1.0"><dict/></plist>"#.to_vec(),
+                Some(valid.clone()),
+            ),
+            (
+                "executable missing".into(),
+                plist("MyApp").into_bytes(),
+                None,
+            ),
+            (
+                "empty executable".into(),
+                plist("MyApp").into_bytes(),
+                Some(Vec::new()),
+            ),
+            (
+                "garbage executable".into(),
+                plist("MyApp").into_bytes(),
+                Some(vec![0xab; 500]),
+            ),
+            (
+                "executable with no LC_UUID".into(),
+                plist("MyApp").into_bytes(),
+                Some(nil),
+            ),
+            (
+                "executable named by a path escape".into(),
+                plist("../outside").into_bytes(),
+                Some(valid.clone()),
+            ),
+        ];
+        for n in 0..valid.len() {
+            cases.push((
+                format!("executable cut at {n}"),
+                plist("MyApp").into_bytes(),
+                Some(valid[..n].to_vec()),
+            ));
+        }
+        for (label, plist_bytes, exe) in cases {
+            let (_t, app) = build(&plist_bytes, exe.as_deref());
+            let got = std::panic::catch_unwind(|| main_executable_uuid(&app))
+                .unwrap_or_else(|_| panic!("{label}: PANICKED"));
+            assert_eq!(got, None, "{label}");
+        }
+    }
+
     #[test]
     fn main_executable_uuid_reads_real_macho_uuid() {
         // Positive symbolic path for IPA extraction: the other

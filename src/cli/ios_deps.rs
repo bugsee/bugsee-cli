@@ -322,6 +322,13 @@ pub fn parse_podfile_lock(path: &Path) -> Vec<DepEntry> {
         // Pod line: `  - Name (Version):` (2-space indent).
         if let Some(pod_body) = parse_pod_line(line) {
             let (name, version) = parse_name_version(pod_body);
+            if name.is_empty() {
+                // A truncated or mangled line (`- (2.0)`) names nothing; a nameless
+                // entry would put a bogus `library::` dependency in the graph. Its
+                // child lines have no owner either, so they are dropped with it.
+                current_pod = None;
+                continue;
+            }
             pods.insert(
                 name.clone(),
                 PodInfo {

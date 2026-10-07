@@ -356,6 +356,108 @@ mod tests {
         }
     }
 
+    /// Sizes straddling the 64 KiB copy buffer (and empty): every entry must come
+    /// back byte-identical with a valid CRC, for each compression method.
+    #[test]
+    fn every_method_round_trips_sizes_around_the_copy_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        for len in [0usize, 1, 65_535, 65_536, 65_537, 131_072, 300_001] {
+            // Patterned bytes: not a constant run (which would compress away any
+            // chunking bug) and not text.
+            let data: Vec<u8> = (0..len).map(|i| ((i * 31 + i / 251) % 256) as u8).collect();
+            let src = dir.path().join("src.bin");
+            std::fs::write(&src, &data).unwrap();
+            for (label, entry, strategy) in [
+                (
+                    "zstd",
+                    ZipEntry::compressed("e.bin", &src),
+                    Strategy::Zstd(3),
+                ),
+                (
+                    "deflate",
+                    ZipEntry::compressed("e.bin", &src),
+                    Strategy::Deflate,
+                ),
+                ("stored", ZipEntry::stored("e.bin", &src), Strategy::Zstd(3)),
+            ] {
+                let out = dir.path().join("out.zip");
+                let size = pack_entries(&[entry], &out, strategy).unwrap();
+                assert_eq!(
+                    size,
+                    std::fs::metadata(&out).unwrap().len(),
+                    "{label} {len}"
+                );
+                let mut archive = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+                let mut e = archive.by_name("e.bin").unwrap();
+                let mut got = Vec::new();
+                // `read_to_end` verifies the CRC-32 at EOF: corruption is an Err here.
+                e.read_to_end(&mut got).unwrap();
+                assert_eq!(got, data, "{label} {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_missing_source_is_an_error_not_an_empty_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("out.zip");
+        let missing = dir.path().join("nope");
+        let err = pack_entries(
+            &[ZipEntry::compressed("e", &missing)],
+            &out,
+            Strategy::default(),
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The archive is built by streaming: the bytes of a source that is larger than
+    /// anything we would want in memory come out right, with a bounded buffer.
+    #[test]
+    fn a_large_source_packs_by_streaming() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("big.bin");
+        {
+            let mut f = BufWriter::new(File::create(&src).unwrap());
+            let block: Vec<u8> = (0..1_000_003u32).map(|i| (i % 253) as u8).collect();
+            for _ in 0..12 {
+                f.write_all(&block).unwrap(); // ~12 MB
+            }
+        }
+        let out = dir.path().join("big.zip");
+        pack_entries(
+            &[ZipEntry::stored("big.bin", &src)],
+            &out,
+            Strategy::default(),
+        )
+        .unwrap();
+        let mut archive = ZipArchive::new(File::open(&out).unwrap()).unwrap();
+        let mut e = archive.by_name("big.bin").unwrap();
+        assert_eq!(e.size(), 12_000_036);
+        use sha1::Digest;
+        let mut hasher_in = sha1::Sha1::new();
+        let mut hasher_out = sha1::Sha1::new();
+        {
+            let mut f = File::open(&src).unwrap();
+            let mut buf = [0u8; 8192];
+            loop {
+                let n = f.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                hasher_in.update(&buf[..n]);
+            }
+            loop {
+                let n = e.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                hasher_out.update(&buf[..n]);
+            }
+            assert_eq!(hasher_in.finalize(), hasher_out.finalize());
+        }
+    }
+
     #[test]
     fn resolve_strategy_applies_production_floor_and_flag_rules() {
         // Default is zstd at the documented default level.

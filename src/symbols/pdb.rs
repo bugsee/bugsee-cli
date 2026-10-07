@@ -240,6 +240,82 @@ mod tests {
         (dir, path)
     }
 
+    // ── corrupted / truncated PDBs ─────────────────────────────────
+
+    /// A damaged PDB either fails to identify or identifies as ITSELF: never a
+    /// panic, and never a different debug id (it is the upload key).
+    #[test]
+    fn every_truncation_of_a_pdb_is_an_error_or_the_true_identity() {
+        let valid = synth_pdb(guid(), 7, 1, MACHINE_AMD64);
+        let want = "dfb8e43a-f242-3d73-a453-aeb6a777ef75-1";
+        let mut cuts: Vec<usize> = (0..=200).collect();
+        let mut at = 201usize;
+        while at < valid.len() {
+            cuts.push(at);
+            at += at / 9 + 17;
+        }
+        cuts.push(valid.len() - 1);
+        for cut in cuts {
+            let (_d, p) = write_temp(&valid[..cut]);
+            match identify(&p) {
+                Ok(id) => assert!(
+                    id.slices.iter().all(|s| s.uuid == want),
+                    "{cut}-byte prefix identified as {:?}",
+                    id.slices
+                ),
+                Err(Error::InputInvalid(_)) => {}
+                Err(other) => panic!("{cut}-byte prefix: unexpected {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn corrupted_msf_structures_never_panic() {
+        let valid = synth_pdb(guid(), 7, 1, MACHINE_AMD64);
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // The superblock fields (page size, page count, directory size / location)
+        // set to hostile values: a zero or huge page size, absurd counts.
+        for off in (32..56).step_by(4) {
+            for v in [0u32, 1, 0xffff_ffff, 0x8000_0000, 4096 * 1024] {
+                let mut b = valid.clone();
+                b[off..off + 4].copy_from_slice(&v.to_le_bytes());
+                let (_d, p) = write_temp(&b);
+                let _ = identify(&p);
+            }
+        }
+        for _ in 0..300 {
+            let mut b = valid.clone();
+            for _ in 0..1 + next() % 6 {
+                let at = (next() % b.len() as u64) as usize;
+                b[at] = next() as u8;
+            }
+            let (_d, p) = write_temp(&b);
+            let _ = identify(&p);
+        }
+    }
+
+    #[test]
+    fn non_pdb_files_are_rejected_as_invalid() {
+        for (label, bytes) in [
+            ("empty", Vec::new()),
+            ("msf magic only", super::MSF7_MAGIC.to_vec()),
+            ("zeros", vec![0u8; 8192]),
+            ("an ELF header", b"\x7fELF\x02\x01\x01".repeat(300)),
+        ] {
+            let (_d, p) = write_temp(&bytes);
+            assert!(
+                matches!(identify(&p), Err(Error::InputInvalid(_))),
+                "{label}"
+            );
+        }
+    }
+
     /// The upload key. This exact string is what the worker re-derives from the
     /// same bytes (`symbolfiles/pdb.py`, same `symbolic` major) and what a
     /// crashing Windows module resolves against — changing the formatting (to

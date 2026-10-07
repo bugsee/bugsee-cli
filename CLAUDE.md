@@ -114,6 +114,13 @@ rule, or entry name requires a major version bump and a coordinated rollout.
   ZIP uses method 93 (Z_STANDARD). `--no-zstd` is diagnostic only.
 - Every upload request carries the `X-Bugsee-Uploader: cli` telemetry header (set
   in `upload::http`).
+- Bounded memory: inputs are artefacts and symbol files of hundreds of MB, so never load a
+  whole file onto the heap (`fs::read`, `read_to_string`, `tokio::fs::read`, or a `.clone()` of a
+  body per retry). Hash and copy through a 64 KiB buffer; send request bodies with
+  `upload::http::file_body` + an explicit `Content-Length` (a presigned S3 PUT rejects chunked);
+  read identity out of headers with `symbols::mapped::map_file` (the one place a file is memory-mapped, so that `unsafe` lives only there); walk
+  JSON with `inject::mapjson` (struson), not a `serde_json::Value` tree. `scripts/e2e_flows.py`
+  enforces a peak-RSS budget on ~96 MB inputs for every large-input flow, so a regression fails CI.
 - Return a typed `error::Error` (or `anyhow` wrapping one) so `main`'s `classify`
   maps it to the right exit code. A bare `anyhow::anyhow!` falls through to exit 1
   (structural) — use a typed variant whenever the code matters to a caller.
@@ -125,6 +132,15 @@ rule, or entry name requires a major version bump and a coordinated rollout.
   response contract, not just "something happened".
 - `tests/` holds integration tests that exec the COMPILED binary (`assert_cmd`)
   and pin exit codes + stdout JSON.
+- `tests/file_handling.rs` pins file handling through the compiled binary: exact bytes left on
+  disk, large payloads on the wire, stdout kept empty, exit codes for unusable input. The streaming
+  JSON code is also tested differentially against the `serde_json::Value` behaviour it replaced.
+- `tests/broken_files.rs` pins what the binary does with BROKEN input (corrupt JSON / ELF /
+  Mach-O / PDB / zip / plist / manifests): never a crash, a stable exit code, nothing sent for
+  input that could not be identified, the user's files untouched. A new file-reading code path
+  needs a truncation and a garbage case there (or a unit-level sweep next to the parser, as
+  `symbols/elf.rs` and `symbols/dsym.rs` do: a damaged file may fail to identify but must never
+  identify as something else, because the identity is the upload key).
 - `scripts/e2e_flows.py` is a stdlib-only end-to-end harness that drives a real
   binary through every upload flow against a protocol-accurate mock server. CI
   runs it from-source on every push (`.github/workflows/e2e.yml`) and against the

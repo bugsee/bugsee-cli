@@ -321,6 +321,53 @@ fn env_truthy(value: Option<&String>) -> bool {
 /// failure, root that isn't a Dict). The Python callers treat
 /// absence as "field unknown" rather than failing.
 pub fn read_plist_to_json(path: &std::path::Path) -> serde_json::Map<String, Value> {
+    // `plist::Value` is built (and later dropped) recursively, one stack frame per
+    // nesting level. A malformed or hostile plist a few tens of thousands of levels
+    // deep overflowed the 8 MiB main-thread stack and ABORTED the process (SIGABRT,
+    // no error, no `{}`). Two bounds make that impossible, whatever the file holds:
+    //  - an Info.plist is a few KB; refuse anything over `MAX_PLIST_BYTES`, which
+    //    caps the nesting depth (a level costs at least ~6 bytes in either format);
+    //  - parse on a thread whose stack is far larger than that depth can use.
+    // As a side effect a panic inside the parser is contained and reads as `{}` too.
+    const MAX_PLIST_BYTES: u64 = 1024 * 1024;
+    const PLIST_PARSE_STACK_BYTES: usize = 256 * 1024 * 1024;
+
+    match std::fs::metadata(path) {
+        Ok(m) if m.len() <= MAX_PLIST_BYTES => {}
+        _ => return serde_json::Map::new(),
+    }
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let owned = path.to_path_buf();
+    match std::thread::Builder::new()
+        .name("plist-parse".into())
+        .stack_size(PLIST_PARSE_STACK_BYTES)
+        .spawn(move || parse_plist_to_json(&owned))
+    {
+        Ok(handle) => handle.join().unwrap_or_else(|_| {
+            tracing::warn!(path = %path.display(), "plist parser panicked; treating the plist as empty");
+            serde_json::Map::new()
+        }),
+        // A 256 MiB stack is reserved up front, which a tight `ulimit -v`, cgroup or
+        // `vm.overcommit_memory=2` can refuse. A small plist is parsed right here instead
+        // (at most ~1k nesting levels: far inside even a 2 MiB worker-thread stack); a
+        // large one is not, because only the big stack makes its depth safe.
+        Err(e) => {
+            const INLINE_PLIST_BYTES: u64 = 16 * 1024;
+            if size <= INLINE_PLIST_BYTES {
+                tracing::warn!(error = %e, "cannot spawn the plist parser thread; parsing inline");
+                parse_plist_to_json(path)
+            } else {
+                tracing::warn!(
+                    error = %e, path = %path.display(),
+                    "cannot spawn the plist parser thread; a {size}-byte plist is too large to parse inline"
+                );
+                serde_json::Map::new()
+            }
+        }
+    }
+}
+
+fn parse_plist_to_json(path: &std::path::Path) -> serde_json::Map<String, Value> {
     let mut out = serde_json::Map::new();
     let value = match plist::Value::from_file(path) {
         Ok(v) => v,
@@ -595,6 +642,136 @@ mod tests {
             assert!(!l.starts_with("gitlab-ci"));
             assert!(!l.starts_with("ci:"));
         }
+    }
+
+    // ── read_plist_to_json on broken / hostile files ──────────────
+
+    /// A binary plist whose objects form one chain of `n` nested arrays (4-byte refs).
+    fn nested_bplist(n: u32, width: usize) -> Vec<u8> {
+        // `width` (3 or 4) is both the object-ref size and the offset-table entry size.
+        // 3 bytes is the densest encoding that still addresses >65 535 objects: ~7 bytes
+        // per nesting level, i.e. the deepest chain that fits under the size cap.
+        let be = |v: u64| v.to_be_bytes()[8 - width..].to_vec();
+        let mut body = b"bplist00".to_vec();
+        let mut offsets = Vec::new();
+        for i in 0..n {
+            offsets.push(body.len() as u64);
+            if i + 1 < n {
+                body.push(0xa1); // array of 1
+                body.extend_from_slice(&be(i as u64 + 1));
+            } else {
+                body.push(0x50); // empty string
+            }
+        }
+        let table = body.len() as u64;
+        for o in offsets {
+            body.extend_from_slice(&be(o));
+        }
+        body.extend_from_slice(&[0; 6]);
+        body.extend_from_slice(&[width as u8, width as u8]); // offset size, object-ref size
+        body.extend_from_slice(&(n as u64).to_be_bytes());
+        body.extend_from_slice(&0u64.to_be_bytes()); // top object
+        body.extend_from_slice(&table.to_be_bytes());
+        body
+    }
+
+    fn plist_map(bytes: &[u8]) -> serde_json::Map<String, Value> {
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("Info.plist");
+        std::fs::write(&p, bytes).unwrap();
+        read_plist_to_json(&p)
+    }
+
+    /// Nesting deep enough to overflow the main-thread stack used to ABORT the whole
+    /// process. It must read as an ordinary unusable plist (`{}`), in both formats and
+    /// right up to the size cap — debug-build frames are the largest, so this is the
+    /// worst case the thread's stack has to absorb.
+    #[test]
+    fn a_plist_nested_past_any_stack_reads_as_empty_instead_of_crashing() {
+        let xml = |n: usize| {
+            [
+                &b"<?xml version=\"1.0\"?><plist version=\"1.0\">"[..],
+                &b"<array>".repeat(n),
+                &b"</array>".repeat(n),
+                b"</plist>",
+            ]
+            .concat()
+        };
+        // Largest XML nesting that still fits under the 1 MiB size cap.
+        assert!(xml(69_000).len() < 1024 * 1024);
+        assert!(plist_map(&xml(69_000)).is_empty());
+        assert!(plist_map(&xml(200_000)).is_empty(), "over the cap");
+        // Binary: ~9 bytes per level, so ~110k levels fit under the cap.
+        assert!(nested_bplist(110_000, 4).len() < 1024 * 1024);
+        assert!(plist_map(&nested_bplist(110_000, 4)).is_empty());
+        // The true worst case under the cap: 3-byte refs, ~149k levels.
+        let densest = nested_bplist(149_000, 3);
+        assert!(densest.len() < 1024 * 1024, "{}", densest.len());
+        assert!(plist_map(&densest).is_empty());
+        assert!(
+            plist_map(&nested_bplist(300_000, 4)).is_empty(),
+            "over the cap"
+        );
+    }
+
+    #[test]
+    fn broken_plists_read_as_empty_and_valid_neighbours_still_read() {
+        let valid: &[u8] = br#"<?xml version="1.0"?><plist version="1.0"><dict><key>CFBundleName</key><string>App</string><key>N</key><integer>7</integer></dict></plist>"#;
+        let m = plist_map(valid);
+        assert_eq!(m["CFBundleName"], "App");
+        assert_eq!(m["N"], "7");
+
+        let mut broken: Vec<(String, Vec<u8>)> = vec![
+            ("empty".into(), Vec::new()),
+            (
+                "garbage".into(),
+                (0..300u32).map(|i| (i * 37 % 251) as u8).collect(),
+            ),
+            ("bplist magic only".into(), b"bplist00".to_vec()),
+            ("bplist truncated".into(), b"bplist00\xd1\x01\x02".to_vec()),
+            (
+                "array root".into(),
+                br#"<?xml version="1.0"?><plist version="1.0"><array/></plist>"#.to_vec(),
+            ),
+            (
+                "no root".into(),
+                br#"<?xml version="1.0"?><plist version="1.0"></plist>"#.to_vec(),
+            ),
+            (
+                "not utf-8".into(),
+                b"<?xml version=\"1.0\"?><plist><dict><key>\xff\xfe</key><string>x</string></dict></plist>"
+                    .to_vec(),
+            ),
+        ];
+        // Every strict prefix of a valid XML plist is invalid: empty, never a panic
+        // and never a half-read dictionary.
+        for n in [0, 1, 20, 60, 100, valid.len() - 10, valid.len() - 1] {
+            broken.push((format!("xml truncated at {n}"), valid[..n].to_vec()));
+        }
+        for (label, bytes) in &broken {
+            let m = plist_map(bytes);
+            assert!(m.is_empty(), "{label}: {m:?}");
+        }
+    }
+
+    /// Entity declarations are not expanded (no billion-laughs blow-up, no external
+    /// fetch): a reference just reads as empty.
+    #[test]
+    fn xml_entities_are_not_expanded() {
+        let bomb = br#"<?xml version="1.0"?><!DOCTYPE plist [<!ENTITY a "aaaaaaaaaa"><!ENTITY b "&a;&a;&a;&a;&a;&a;&a;&a;"><!ENTITY c "&b;&b;&b;&b;&b;&b;&b;&b;">]><plist><dict><key>k</key><string>&c;</string></dict></plist>"#;
+        assert_eq!(plist_map(bomb)["k"], "");
+        let xxe = br#"<?xml version="1.0"?><!DOCTYPE plist [<!ENTITY x SYSTEM "file:///etc/passwd">]><plist><dict><key>k</key><string>&x;</string></dict></plist>"#;
+        assert_eq!(plist_map(xxe)["k"], "");
+    }
+
+    /// Something far larger than any Info.plist is refused up front, not parsed.
+    #[test]
+    fn an_oversized_plist_is_refused() {
+        let mut big =
+            br#"<?xml version="1.0"?><plist version="1.0"><dict><key>a</key><string>"#.to_vec();
+        big.extend(std::iter::repeat_n(b'x', 1024 * 1024));
+        big.extend_from_slice(b"</string></dict></plist>");
+        assert!(plist_map(&big).is_empty());
     }
 
     // ── env_truthy — cross-language contract ─────────────────────
