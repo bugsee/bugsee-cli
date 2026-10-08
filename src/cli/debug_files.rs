@@ -102,11 +102,14 @@ pub enum DebugFilesCommand {
         /// `--type sourcemaps` — sets `overwrite` on the metadata POST so
         /// format-scoped peers are replaced. Proguard ignores this flag today.
         ///
-        /// For `--type elf` this is how richer symbols replace poorer ones: an
-        /// AGP `SYMBOL_TABLE` upload (`.so.sym`, function names only) and a later
-        /// `FULL` one (`.so.dbg`, with line info) of the same library share its
-        /// GNU build-id, so without `--force` the `FULL` upload is skipped as
-        /// already present.
+        /// For `--type elf` it is rarely needed: each library declares whether it
+        /// carries debug info or only a symbol table, and the server replaces a
+        /// stored symbol table with a later `FULL` one (`.so.dbg`, with line info)
+        /// of the same GNU build-id on its own — transferring it once, and nothing
+        /// when the server already holds the same or a richer copy (it never
+        /// downgrades). `--force` means "always replace", re-sending every
+        /// library, so use it only to replace a symbol a server that predates
+        /// that behaviour is still holding.
         #[arg(long)]
         force: bool,
 
@@ -587,6 +590,8 @@ async fn run_proguard_upload(
             format: Some("mapping"),
             uuids: None,
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         };
         let client = client.as_ref().expect("client constructed when !dry_run");
         let outcome = presigned::upload(
@@ -821,6 +826,8 @@ async fn run_pdb_upload(
             format: Some("pdb"),
             uuids: None,
             overwrite: if force { Some(true) } else { None },
+            format_variant: None,
+            replace_if_richer: None,
         };
         let outcome = presigned::upload(
             client.as_ref().expect("client built when not dry-run"),
@@ -1019,6 +1026,8 @@ async fn run_rust_elf_upload(
             format: Some("elf"),
             uuids: None,
             overwrite: if force { Some(true) } else { None },
+            format_variant: None,
+            replace_if_richer: None,
         };
         let outcome = presigned::upload(
             client.as_ref().expect("client built when not dry-run"),
@@ -1182,6 +1191,7 @@ async fn run_elf_upload(
     // Skipped libraries that carry full debug info (`.so` / `.so.dbg`). The
     // server dedups on build-id alone, so one of these may have been skipped in
     // favour of an earlier `SYMBOL_TABLE` (`.so.sym`) upload of the same library.
+    let mut upgraded = 0u32;
     let mut full_already_existed = 0u32;
     let mut skipped_no_build_id = 0u32;
 
@@ -1282,27 +1292,38 @@ async fn run_elf_upload(
         let client = client.as_ref().expect("client constructed when !dry_run");
 
         // Run each `.so`'s pack → register → dedup-or-PUT pipeline concurrently.
-        let outcomes: Vec<(bool, anyhow::Result<presigned::Outcome>)> =
-            futures_util::stream::iter(uploadable.into_iter().enumerate())
-                .map(|(i, lib)| {
-                    let client = client.clone();
-                    let work = work_dir.path().to_path_buf();
-                    async move {
-                        let symbol_table_only = lib.name.ends_with(".so.sym");
-                        let outcome = upload_one_so(&client, ctx, &lib, i, &work).await;
-                        (symbol_table_only, outcome)
-                    }
-                })
-                .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
-                .collect()
-                .await;
+        let outcomes: Vec<(
+            Option<&'static str>,
+            anyhow::Result<presigned::UploadDetail>,
+        )> = futures_util::stream::iter(uploadable.into_iter().enumerate())
+            .map(|(i, lib)| {
+                let client = client.clone();
+                let work = work_dir.path().to_path_buf();
+                async move {
+                    let variant = lib.format_variant();
+                    let detail = upload_one_so(&client, ctx, &lib, i, &work).await;
+                    (variant, detail)
+                }
+            })
+            .buffer_unordered(ELF_UPLOAD_CONCURRENCY)
+            .collect()
+            .await;
 
-        for (symbol_table_only, outcome) in outcomes {
-            match outcome? {
-                presigned::Outcome::Uploaded => uploaded += 1,
+        for (variant, detail) in outcomes {
+            let detail = detail?;
+            match detail.outcome {
+                presigned::Outcome::Uploaded => {
+                    uploaded += 1;
+                    if detail.upgraded {
+                        upgraded += 1;
+                    }
+                }
                 presigned::Outcome::AlreadyExists => {
                     already_existed += 1;
-                    if !symbol_table_only {
+                    // A full-debug-info library skipped WITHOUT the server saying what
+                    // it holds: a server that predates `replace_if_richer` (a current
+                    // one replaces a poorer copy, or reports the richer one it keeps).
+                    if variant == Some("dwarf") && detail.stored.is_none() {
                         full_already_existed += 1;
                     }
                 }
@@ -1315,20 +1336,22 @@ async fn run_elf_upload(
     } else {
         tracing::info!(
             uploaded,
+            upgraded,
             already_existed,
             skipped_no_build_id,
             "native upload complete"
         );
-        // Never overwrite automatically: that would re-upload every unchanged
-        // library on every build. The CLI cannot see what the server holds, so
-        // say how to replace it when that is what the caller wants.
+        // A current server replaces a poorer stored copy on its own, so this
+        // only fires against one that predates that: it skipped a library with
+        // debug info without saying what it holds, and `--force` is then the
+        // only way to replace it (it re-sends every library, so it is not the default).
         if full_already_existed > 0 && !force {
             tracing::info!(
                 libraries = full_already_existed,
                 "full-debug-info libraries were skipped as already on the server; if \
                  they were previously uploaded with ndk.debugSymbolLevel = \
-                 'SYMBOL_TABLE' (.so.sym, no line info), re-run with --force to \
-                 replace them"
+                 'SYMBOL_TABLE' (.so.sym, no line info), this server cannot upgrade \
+                 them on its own — re-run with --force to replace them"
             );
         }
     }
@@ -1345,7 +1368,7 @@ async fn upload_one_so(
     lib: &elf::ElfLib,
     index: usize,
     work_dir: &Path,
-) -> anyhow::Result<presigned::Outcome> {
+) -> anyhow::Result<presigned::UploadDetail> {
     let build_id = lib
         .build_id
         .as_deref()
@@ -1375,8 +1398,14 @@ async fn upload_one_so(
         format: Some("elf"),
         uuids: None,
         overwrite: if ctx.force { Some(true) } else { None },
+        // Declare how rich this file is and let the server decide whether it
+        // beats what it holds: a `symtab` -> `dwarf` upgrade transfers once, an
+        // unchanged or poorer library transfers nothing. `--force` (overwrite)
+        // still means "always replace".
+        format_variant: lib.format_variant(),
+        replace_if_richer: Some(true),
     };
-    let outcome = presigned::upload(
+    let detail = presigned::upload_detailed(
         client,
         RetryPolicy::default(),
         ctx.endpoint,
@@ -1385,15 +1414,27 @@ async fn upload_one_so(
         &zip_path,
     )
     .await?;
-    match outcome {
+    match detail.outcome {
+        presigned::Outcome::Uploaded if detail.upgraded => {
+            tracing::info!(
+                lib = %lib.name,
+                build_id,
+                "uploaded (upgraded SYMBOL_TABLE -> FULL)"
+            )
+        }
         presigned::Outcome::Uploaded => {
             tracing::info!(lib = %lib.name, build_id, "uploaded")
         }
         presigned::Outcome::AlreadyExists => {
-            tracing::info!(lib = %lib.name, build_id, "already on server, skipped")
+            tracing::info!(
+                lib = %lib.name,
+                build_id,
+                stored = detail.stored.map(presigned::Variant::as_str),
+                "already on server at the same or better level, skipped"
+            )
         }
     }
-    Ok(outcome)
+    Ok(detail)
 }
 
 /// Pack and upload a Unity IL2CPP LineNumberMappings bundle.
@@ -1513,6 +1554,8 @@ async fn run_il2cpp_linemap_upload(
             format: Some("il2cpp-linemap"),
             uuids: Some(&uuids),
             overwrite: if force { Some(true) } else { None },
+            format_variant: None,
+            replace_if_richer: None,
         };
         let outcome = presigned::upload(
             client.as_ref().expect("client built when not dry-run"),
@@ -1631,6 +1674,8 @@ async fn upload_one_sourcemap(
         format: Some("sourcemap"),
         uuids: None,
         overwrite: if ctx.force { Some(true) } else { None },
+        format_variant: None,
+        replace_if_richer: None,
     };
     let client = client.expect("client constructed when !dry_run");
     let outcome = presigned::upload(
@@ -2108,6 +2153,8 @@ pub(crate) async fn run_dsym_upload(
             format: Some("dsym"),
             uuids: Some(&slice_uuids),
             overwrite: if force { Some(true) } else { None },
+            format_variant: None,
+            replace_if_richer: None,
         };
 
         if dry_run {
@@ -2132,7 +2179,7 @@ pub(crate) async fn run_dsym_upload(
         )
         .await?
         {
-            presigned::Registration::AlreadyExists => {
+            presigned::Registration::AlreadyExists { .. } => {
                 already_existed += 1;
                 tracing::info!(
                     bundle = bundle_name,
@@ -2140,7 +2187,7 @@ pub(crate) async fn run_dsym_upload(
                 );
                 continue;
             }
-            presigned::Registration::Proceed { presigned_url } => presigned_url,
+            presigned::Registration::Proceed { presigned_url, .. } => presigned_url,
         };
 
         // The server wants it — only NOW pack the (possibly large) bundle.

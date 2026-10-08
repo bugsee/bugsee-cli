@@ -74,6 +74,19 @@ pub struct ElfLib {
     richness: (bool, bool, u64),
 }
 
+impl ElfLib {
+    /// What this library can symbolicate, as the server's `format_variant`:
+    /// `"dwarf"` (debug info), `"symtab"` (symbol table only), or `None` for a
+    /// library carrying neither — it has no richness to declare.
+    pub fn format_variant(&self) -> Option<&'static str> {
+        match self.richness {
+            (true, _, _) => Some("dwarf"),
+            (false, true, _) => Some("symtab"),
+            _ => None,
+        }
+    }
+}
+
 /// Extract every ELF `.so` from `archive_path` into `out_dir`, reading each
 /// library's GNU build-id. An entry counts as a library when its name ends in
 /// a built-in suffix (see [`is_native_lib_entry`]) or one of `extra`. The wire `code_id` is produced by the same
@@ -780,6 +793,47 @@ mod tests {
             path: PathBuf::from(name),
             richness,
         }
+    }
+
+    #[test]
+    fn format_variant_reports_what_a_library_can_symbolicate() {
+        // Debug info wins whatever else the file carries; a symbol table alone is
+        // `symtab`; a library with neither has no richness to declare.
+        assert_eq!(
+            lib("a.so", None, (true, true, 1)).format_variant(),
+            Some("dwarf")
+        );
+        assert_eq!(
+            lib("a.so", None, (true, false, 1)).format_variant(),
+            Some("dwarf")
+        );
+        assert_eq!(
+            lib("a.so", None, (false, true, 1)).format_variant(),
+            Some("symtab")
+        );
+        assert_eq!(lib("a.so", None, (false, false, 1)).format_variant(), None);
+    }
+
+    /// The real fixtures, end to end through the identity reader: the unstripped
+    /// library is `dwarf`, the same library with its debug sections removed is
+    /// `symtab`, and both carry ONE build-id — which is exactly why the server needs
+    /// the variant to tell them apart.
+    #[test]
+    fn real_fixtures_classify_as_dwarf_and_symtab_with_one_build_id() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/elf");
+        let scanned = scan_dir(&dir, &ExtraSuffixes::default()).unwrap();
+        let variant_of = |name: &str| {
+            scanned
+                .iter()
+                .find(|l| l.name == name)
+                .unwrap_or_else(|| panic!("{name} not scanned"))
+        };
+        let full = variant_of("libsymbol1.so");
+        let table = variant_of("libsymbol1.symtab.so");
+        assert_eq!(full.format_variant(), Some("dwarf"));
+        assert_eq!(table.format_variant(), Some("symtab"));
+        assert_eq!(full.build_id, table.build_id);
+        assert!(full.build_id.is_some());
     }
 
     fn names(libs: &[ElfLib]) -> Vec<&str> {

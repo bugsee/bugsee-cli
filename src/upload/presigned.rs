@@ -71,6 +71,57 @@ pub struct Metadata<'a> {
     /// has these symbols (maps to the server's `overwrite`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub overwrite: Option<bool>,
+
+    /// Native ELF only: what this file can symbolicate — `"symtab"` (symbol
+    /// table, function names) or `"dwarf"` (debug info, file:line). The server
+    /// stores it so a later upload of the same build-id can be compared with it.
+    /// Absent for a library that carries neither.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub format_variant: Option<&'a str>,
+
+    /// Native ELF only: replace the stored copy when this file is richer
+    /// (`symtab` -> `dwarf`), never otherwise. Unlike `overwrite` it does not
+    /// re-transfer a library the server already holds at the same or better level.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub replace_if_richer: Option<bool>,
+}
+
+/// What a stored native symbol can symbolicate (the server's `format_variant`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Variant {
+    /// Symbol table only (AGP `SYMBOL_TABLE`): function names, no file:line.
+    Symtab,
+    /// Full debug info.
+    Dwarf,
+}
+
+impl Variant {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Variant::Symtab => "symtab",
+            Variant::Dwarf => "dwarf",
+        }
+    }
+
+    fn parse(s: &str) -> Option<Self> {
+        match s {
+            "symtab" => Some(Variant::Symtab),
+            "dwarf" => Some(Variant::Dwarf),
+            _ => None,
+        }
+    }
+}
+
+/// An upload attempt with the detail [`Outcome`] leaves out. Only the native ELF
+/// flow reads it; every other flow uses [`upload`] and the plain `Outcome`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadDetail {
+    pub outcome: Outcome,
+    /// Uploaded AND replaced a poorer stored copy (`replace_if_richer`).
+    pub upgraded: bool,
+    /// On `AlreadyExists`: what the server holds, when it says. `None` means it
+    /// did not say — an older server, or a stored copy that predates the field.
+    pub stored: Option<Variant>,
 }
 
 /// Outcome of a successful upload attempt.
@@ -89,6 +140,9 @@ struct MetadataResponse {
     code: Option<i64>,
     #[serde(default)]
     endpoint: Option<String>,
+    /// Set when the upload replaces a poorer stored copy (`replace_if_richer`).
+    #[serde(default)]
+    upgraded: Option<bool>,
     #[serde(default)]
     error: Option<ErrorPayload>,
 }
@@ -103,6 +157,15 @@ struct ErrorPayload {
     /// non-integer here must not fail the parse of an otherwise readable error.
     #[serde(default)]
     code: Option<serde_json::Value>,
+    /// On a duplicate, the server's `{format_variant}` for the stored copy.
+    #[serde(default)]
+    params: Option<ErrorParams>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ErrorParams {
+    #[serde(default)]
+    format_variant: Option<String>,
 }
 
 /// Whether the metadata response says the server already has this symbol.
@@ -129,9 +192,14 @@ fn is_already_exists(parsed: &MetadataResponse) -> bool {
 #[derive(Debug)]
 pub enum Registration {
     /// Server already has these symbols (`DuplicateSymbolsFoundError`, 16004).
-    AlreadyExists,
-    /// Proceed: PUT the payload to this presigned URL.
-    Proceed { presigned_url: String },
+    /// `stored` is what it holds, when it says.
+    AlreadyExists { stored: Option<Variant> },
+    /// Proceed: PUT the payload to this presigned URL. `upgraded` is set when the
+    /// upload replaces a poorer stored copy.
+    Proceed {
+        presigned_url: String,
+        upgraded: bool,
+    },
 }
 
 /// Stage 1: POST the metadata and interpret the response. Lets the caller dedup
@@ -191,7 +259,13 @@ pub async fn register(
 
     if is_already_exists(&parsed) {
         tracing::debug!("server reports SymbolAlreadyExists ({CODE_ALREADY_EXISTS})");
-        return Ok(Registration::AlreadyExists);
+        let stored = parsed
+            .error
+            .as_ref()
+            .and_then(|e| e.params.as_ref())
+            .and_then(|p| p.format_variant.as_deref())
+            .and_then(Variant::parse);
+        return Ok(Registration::AlreadyExists { stored });
     }
 
     let presigned = match parsed.endpoint.as_deref() {
@@ -217,6 +291,7 @@ pub async fn register(
 
     Ok(Registration::Proceed {
         presigned_url: presigned,
+        upgraded: parsed.upgraded == Some(true),
     })
 }
 
@@ -261,11 +336,39 @@ pub async fn upload(
     metadata: &Metadata<'_>,
     payload: &Path,
 ) -> Result<Outcome> {
+    Ok(
+        upload_detailed(client, policy, endpoint, app_token, metadata, payload)
+            .await?
+            .outcome,
+    )
+}
+
+/// [`upload`], also reporting whether it replaced a poorer stored copy and what
+/// the server said it already held.
+pub async fn upload_detailed(
+    client: &reqwest::Client,
+    policy: RetryPolicy,
+    endpoint: &str,
+    app_token: &str,
+    metadata: &Metadata<'_>,
+    payload: &Path,
+) -> Result<UploadDetail> {
     match register(client, policy, endpoint, app_token, metadata).await? {
-        Registration::AlreadyExists => Ok(Outcome::AlreadyExists),
-        Registration::Proceed { presigned_url } => {
+        Registration::AlreadyExists { stored } => Ok(UploadDetail {
+            outcome: Outcome::AlreadyExists,
+            upgraded: false,
+            stored,
+        }),
+        Registration::Proceed {
+            presigned_url,
+            upgraded,
+        } => {
             put_payload(client, policy, &presigned_url, payload).await?;
-            Ok(Outcome::Uploaded)
+            Ok(UploadDetail {
+                outcome: Outcome::Uploaded,
+                upgraded,
+                stored: None,
+            })
         }
     }
 }
@@ -288,6 +391,8 @@ mod tests {
             format: None,
             uuids: Some(&uuids),
             overwrite: Some(true),
+            format_variant: None,
+            replace_if_richer: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["uuids"], serde_json::json!(["aaaa", "bbbb"]));
@@ -308,6 +413,8 @@ mod tests {
             format: None,
             uuids: None,
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         };
         let v2 = serde_json::to_value(&m2).unwrap();
         assert!(v2.get("uuids").is_none());
@@ -326,11 +433,181 @@ mod tests {
             format: Some("il2cpp-linemap"),
             uuids: Some(&uuids),
             overwrite: Some(true),
+            format_variant: None,
+            replace_if_richer: None,
         };
         let v = serde_json::to_value(&m).unwrap();
         assert_eq!(v["format"], "il2cpp-linemap");
         assert_eq!(v["uuids"], serde_json::json!(["deadbeef", "cafebabe"]));
         assert_eq!(v["overwrite"], true);
+    }
+
+    fn elf_metadata<'a>(variant: Option<&'a str>, overwrite: Option<bool>) -> Metadata<'a> {
+        Metadata {
+            uuid: Some("bca64abfec40dbb631bb8f1c37414472"),
+            version: "1",
+            build: "1",
+            hash: Some("h"),
+            transform: Some("breakpad"),
+            format: Some("elf"),
+            uuids: None,
+            overwrite,
+            format_variant: variant,
+            replace_if_richer: Some(true),
+        }
+    }
+
+    #[test]
+    fn metadata_serializes_the_richness_pair_and_omits_it_when_unset() {
+        let v = serde_json::to_value(elf_metadata(Some("dwarf"), None)).unwrap();
+        assert_eq!(v["format_variant"], "dwarf");
+        assert_eq!(v["replace_if_richer"], true);
+        assert!(v.get("overwrite").is_none());
+
+        // A library with neither debug info nor a symbol table declares no variant.
+        let v = serde_json::to_value(elf_metadata(None, None)).unwrap();
+        assert!(v.get("format_variant").is_none(), "{v}");
+        assert_eq!(v["replace_if_richer"], true);
+    }
+
+    /// Every other flow leaves both fields off the wire entirely.
+    #[test]
+    fn metadata_without_the_richness_pair_is_unchanged_on_the_wire() {
+        let mut m = elf_metadata(None, None);
+        m.replace_if_richer = None;
+        let v = serde_json::to_value(&m).unwrap();
+        assert!(v.get("format_variant").is_none());
+        assert!(v.get("replace_if_richer").is_none());
+    }
+
+    async fn post_replying(body: serde_json::Value) -> (MockServer, reqwest::Client) {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(body))
+            .expect(1)
+            .mount(&server)
+            .await;
+        (server, http::build_client().unwrap())
+    }
+
+    #[tokio::test]
+    async fn register_reports_an_upgrade_when_the_server_says_so() {
+        let (server, client) = post_replying(serde_json::json!({
+            "code": 0, "endpoint": "https://s3.example/put", "upgraded": true
+        }))
+        .await;
+        let reg = register(
+            &client,
+            RetryPolicy::none(),
+            &server.uri(),
+            "TKN",
+            &elf_metadata(Some("dwarf"), None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            matches!(&reg, Registration::Proceed { upgraded: true, .. }),
+            "{reg:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_is_not_an_upgrade_when_the_server_does_not_say_so() {
+        for body in [
+            serde_json::json!({"code": 0, "endpoint": "https://s3.example/put"}),
+            serde_json::json!({"code": 0, "endpoint": "https://s3.example/put", "upgraded": false}),
+        ] {
+            let (server, client) = post_replying(body).await;
+            let reg = register(
+                &client,
+                RetryPolicy::none(),
+                &server.uri(),
+                "TKN",
+                &elf_metadata(Some("dwarf"), None),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(
+                    &reg,
+                    Registration::Proceed {
+                        upgraded: false,
+                        ..
+                    }
+                ),
+                "{reg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn register_reads_the_stored_variant_off_a_duplicate_reply() {
+        for (reported, expected) in [
+            (Some("dwarf"), Some(Variant::Dwarf)),
+            (Some("symtab"), Some(Variant::Symtab)),
+            // A value this client does not know is "not said", never a guess.
+            (Some("future-kind"), None),
+            (None, None),
+        ] {
+            let mut error =
+                serde_json::json!({"type": "DuplicateSymbolsFoundError", "code": 16004});
+            if let Some(v) = reported {
+                error["params"] = serde_json::json!({ "format_variant": v });
+            }
+            let (server, client) =
+                post_replying(serde_json::json!({"ok": false, "error": error})).await;
+            let reg = register(
+                &client,
+                RetryPolicy::none(),
+                &server.uri(),
+                "TKN",
+                &elf_metadata(Some("symtab"), None),
+            )
+            .await
+            .unwrap();
+            assert!(
+                matches!(&reg, Registration::AlreadyExists { stored } if *stored == expected),
+                "reported {reported:?}: {reg:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_detailed_carries_the_upgrade_and_the_stored_variant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let payload = tmp.path().join("p.zip");
+        std::fs::write(&payload, b"zip").unwrap();
+
+        let server = MockServer::start().await;
+        let put_url = format!("{}/put", server.uri());
+        Mock::given(method("POST"))
+            .and(path("/apps/TKN/symbols"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(
+                serde_json::json!({"code": 0, "endpoint": put_url, "upgraded": true}),
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .and(path("/put"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let client = http::build_client().unwrap();
+        let detail = upload_detailed(
+            &client,
+            RetryPolicy::none(),
+            &server.uri(),
+            "TKN",
+            &elf_metadata(Some("dwarf"), None),
+            &payload,
+        )
+        .await
+        .unwrap();
+        assert_eq!(detail.outcome, Outcome::Uploaded);
+        assert!(detail.upgraded);
+        assert_eq!(detail.stored, None);
     }
 
     #[tokio::test]
@@ -356,12 +633,14 @@ mod tests {
             format: Some("il2cpp-linemap"),
             uuids: Some(&uuids),
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         };
         let client = http::build_client().unwrap();
         let reg = register(&client, RetryPolicy::none(), &server.uri(), "TKN", &m)
             .await
             .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists));
+        assert!(matches!(reg, Registration::AlreadyExists { .. }));
 
         let reqs = server.received_requests().await.unwrap();
         let body: serde_json::Value = serde_json::from_slice(&reqs[0].body).unwrap();
@@ -392,12 +671,14 @@ mod tests {
             format: None,
             uuids: Some(&uuids),
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         };
         let client = http::build_client().unwrap();
         let reg = register(&client, RetryPolicy::none(), &server.uri(), "TKN", &m)
             .await
             .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists));
+        assert!(matches!(reg, Registration::AlreadyExists { .. }));
 
         // The metadata POST carried the declared UUIDs (the dedup key).
         let reqs = server.received_requests().await.unwrap();
@@ -416,6 +697,8 @@ mod tests {
             format: Some("sourcemap"),
             uuids: None,
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         }
     }
 
@@ -455,7 +738,10 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+        assert!(
+            matches!(reg, Registration::AlreadyExists { .. }),
+            "got {reg:?}"
+        );
     }
 
     #[tokio::test]
@@ -466,7 +752,10 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+        assert!(
+            matches!(reg, Registration::AlreadyExists { .. }),
+            "got {reg:?}"
+        );
     }
 
     #[tokio::test]
@@ -477,7 +766,10 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+        assert!(
+            matches!(reg, Registration::AlreadyExists { .. }),
+            "got {reg:?}"
+        );
     }
 
     #[tokio::test]
@@ -533,7 +825,10 @@ mod tests {
         }))
         .await
         .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+        assert!(
+            matches!(reg, Registration::AlreadyExists { .. }),
+            "got {reg:?}"
+        );
     }
 
     /// A payload bigger than the 64 KiB stream chunk and not a multiple of it.
@@ -705,7 +1000,10 @@ mod tests {
         let reg = register_against(serde_json::json!({ "code": 16004 }))
             .await
             .unwrap();
-        assert!(matches!(reg, Registration::AlreadyExists), "got {reg:?}");
+        assert!(
+            matches!(reg, Registration::AlreadyExists { .. }),
+            "got {reg:?}"
+        );
     }
 
     #[tokio::test]
@@ -728,13 +1026,15 @@ mod tests {
             format: None,
             uuids: None,
             overwrite: None,
+            format_variant: None,
+            replace_if_richer: None,
         };
         let client = http::build_client().unwrap();
         match register(&client, RetryPolicy::none(), &server.uri(), "TKN", &m)
             .await
             .unwrap()
         {
-            Registration::Proceed { presigned_url } => {
+            Registration::Proceed { presigned_url, .. } => {
                 assert_eq!(presigned_url, "https://s3.example/put")
             }
             other => panic!("expected Proceed, got {other:?}"),
