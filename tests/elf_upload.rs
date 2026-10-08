@@ -175,6 +175,240 @@ async fn elf_force_overwrites_a_library_already_on_the_server() {
     assert_eq!(posts[1]["uuid"], FIXTURE_BUILD_ID);
 }
 
+/// Zip one of the ELF fixtures under `entry_name` (the unstripped library, or the same
+/// library with its debug sections removed, which shares its build-id).
+fn pack_fixture_zip(dir: &Path, fixture: &str, entry_name: &str) -> PathBuf {
+    let elf = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/elf")
+        .join(fixture);
+    let zip_path = dir.join("native-debug-symbols.zip");
+    let mut zw = zip::ZipWriter::new(std::fs::File::create(&zip_path).unwrap());
+    zw.start_file(entry_name, zip::write::SimpleFileOptions::default())
+        .unwrap();
+    zw.write_all(&std::fs::read(elf).unwrap()).unwrap();
+    zw.finish().unwrap();
+    zip_path
+}
+
+/// Run `debug-files upload --type elf` on `zip` against `endpoint`; returns stderr.
+async fn run_elf_upload_of(
+    endpoint: String,
+    zip: PathBuf,
+    extra: &'static [&'static str],
+) -> String {
+    tokio::task::spawn_blocking(move || {
+        let zip = zip.to_string_lossy().into_owned();
+        let inputs = [zip];
+        let out = common::cli()
+            .args(elf_args(&endpoint, &inputs))
+            .args(extra)
+            .assert()
+            .success();
+        String::from_utf8_lossy(&out.get_output().stderr).into_owned()
+    })
+    .await
+    .unwrap()
+}
+
+/// Drop ANSI colour sequences so a log line can be matched as plain text.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::new();
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn post_bodies(requests: &[wiremock::Request]) -> Vec<serde_json::Value> {
+    requests
+        .iter()
+        .filter(|r| r.method.as_str() == "POST")
+        .map(|r| serde_json::from_slice(&r.body).unwrap())
+        .collect()
+}
+
+/// Every native upload declares how rich its file is and asks the server to replace a
+/// poorer stored copy — no `--force`, so no `overwrite`. The declaration is read off the
+/// FILE (debug info vs symbol table), never off its name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_declares_its_richness_and_asks_for_replace_if_richer() {
+    for (fixture, entry, expected) in [
+        ("libsymbol1.so", "arm64-v8a/libsymbol1.so", "dwarf"),
+        (
+            "libsymbol1.symtab.so",
+            "arm64-v8a/libsymbol1.so.sym",
+            "symtab",
+        ),
+        // Name and content disagree: the content decides.
+        ("libsymbol1.symtab.so", "arm64-v8a/libsymbol1.so", "symtab"),
+        ("libsymbol1.so", "arm64-v8a/libsymbol1.so.sym", "dwarf"),
+    ] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = pack_fixture_zip(tmp.path(), fixture, entry);
+        let put_url = format!("{}/put/sym", server.uri());
+        Mock::given(method("POST"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+            )
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .mount(&server)
+            .await;
+
+        run_elf_upload_of(server.uri(), zip, &[]).await;
+
+        let posts = post_bodies(&server.received_requests().await.unwrap());
+        assert_eq!(posts.len(), 1, "{fixture} as {entry}");
+        assert_eq!(posts[0]["format_variant"], expected, "{fixture} as {entry}");
+        assert_eq!(posts[0]["replace_if_richer"], true, "{fixture} as {entry}");
+        assert!(posts[0].get("overwrite").is_none(), "{}", posts[0]);
+        assert_eq!(posts[0]["uuid"], FIXTURE_BUILD_ID);
+        assert_eq!(posts[0]["transform"], "breakpad");
+    }
+}
+
+/// Acceptance: the server holds a symbol table for the build-id; the unstripped library
+/// replaces it with NO `--force`, transfers its bytes once, and the run reports the upgrade.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_reports_an_upgrade_and_transfers_once() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip = pack_fixture_zip(tmp.path(), "libsymbol1.so", "arm64-v8a/libsymbol1.so");
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .and(body_string_contains(r#""format_variant":"dwarf""#))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(json!({"code": 0, "endpoint": put_url, "upgraded": true})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let stderr = strip_ansi(&run_elf_upload_of(server.uri(), zip, &[]).await);
+
+    assert!(stderr.contains("upgraded SYMBOL_TABLE -> FULL"), "{stderr}");
+    assert!(stderr.contains("uploaded=1 upgraded=1"), "{stderr}");
+    assert!(!stderr.contains("re-run with --force"), "{stderr}");
+}
+
+/// Acceptance: re-running with the same file, or offering a symbol table when the server
+/// holds DWARF, transfers nothing — the server answers 16004 and says what it keeps — and
+/// the old "re-run with --force" advice does not appear, because it would be wrong.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_skips_without_transfer_when_the_server_keeps_the_richer_copy() {
+    for (fixture, entry, stored) in [
+        ("libsymbol1.so", "arm64-v8a/libsymbol1.so", "dwarf"),
+        (
+            "libsymbol1.symtab.so",
+            "arm64-v8a/libsymbol1.so.sym",
+            "dwarf",
+        ),
+        (
+            "libsymbol1.symtab.so",
+            "arm64-v8a/libsymbol1.so.sym",
+            "symtab",
+        ),
+    ] {
+        let server = MockServer::start().await;
+        let tmp = tempfile::tempdir().unwrap();
+        let zip = pack_fixture_zip(tmp.path(), fixture, entry);
+        Mock::given(method("POST"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "ok": false,
+                "error": {
+                    "type": "DuplicateSymbolsFoundError",
+                    "code": 16004,
+                    "params": {"format_variant": stored}
+                }
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("PUT"))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(0) // nothing is transferred
+            .mount(&server)
+            .await;
+
+        let stderr = run_elf_upload_of(server.uri(), zip, &[]).await;
+
+        assert!(stderr.contains("same or better level"), "{stderr}");
+        assert!(!stderr.contains("re-run with --force"), "{stderr}");
+    }
+}
+
+/// When the server does not say what it holds (a server that predates this, or a copy
+/// with no variant), the per-library line must not claim it is "the same or better".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_does_not_claim_same_or_better_when_the_server_does_not_say() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip = pack_fixture_zip(tmp.path(), "libsymbol1.so", "arm64-v8a/libsymbol1.so");
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": false,
+            "error": {"type": "DuplicateSymbolsFoundError", "code": 16004}
+        })))
+        .mount(&server)
+        .await;
+
+    let stderr = run_elf_upload_of(server.uri(), zip, &[]).await;
+
+    assert!(stderr.contains("already on server, skipped"), "{stderr}");
+    assert!(!stderr.contains("same or better"), "{stderr}");
+    // The summary still tells the operator how to replace a copy this server cannot upgrade.
+    assert!(stderr.contains("re-run with --force"), "{stderr}");
+}
+
+/// `--force` still means "always replace": it sends `overwrite` and still declares the
+/// file's richness, so the record it creates is labelled for the next comparison.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_force_still_overwrites_and_declares_richness() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip = pack_fixture_zip(
+        tmp.path(),
+        "libsymbol1.symtab.so",
+        "arm64-v8a/libsymbol1.so.sym",
+    );
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"code": 0, "endpoint": put_url})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    run_elf_upload_of(server.uri(), zip, &["--force"]).await;
+
+    let posts = post_bodies(&server.received_requests().await.unwrap());
+    assert_eq!(posts[0]["overwrite"], true);
+    assert_eq!(posts[0]["format_variant"], "symtab");
+}
+
 /// `--extension` lets a caller pick up a symbol spelling the CLI does not know
 /// yet: the entry is keyed by its real build-id exactly like a `.so`. Without
 /// the flag the same archive uploads nothing.
