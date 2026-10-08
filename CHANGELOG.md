@@ -6,6 +6,30 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-10-08
+
+### Changed
+- **`debug-files upload --type elf` upgrades a stored symbol table to DWARF without `--force`.**
+  A library first uploaded as an AGP `SYMBOL_TABLE` (`.so.sym`) and later available with debug
+  info shares one GNU build-id, so the server skipped the richer file and `--force` (which re-sends
+  every library in the run) was the only remedy. Each library now declares what it can symbolicate —
+  `format_variant` = `dwarf` or `symtab`, read from the file itself, never its name — and asks the
+  server to replace a poorer stored copy (`replace_if_richer`). A symbol table replaced by an
+  unstripped library transfers once and logs `upgraded SYMBOL_TABLE -> FULL` (`upgraded=N` in the
+  run summary); re-running with the same file, or offering a symbol table when the server holds
+  debug info, transfers nothing — the server never downgrades. `--force` still means "always
+  replace" and still declares the variant. See [#78].
+  - Needs the appserver change in bugsee-appserver#65-#67 (deployed to production before this
+    release is adopted). Against a server without it the new fields are ignored and behaviour is
+    unchanged; a skipped library with debug info then still gets the "re-run with `--force`" advice,
+    which a current server no longer prints because it would be wrong.
+  - The new fields are sent only for `--type elf`. Every other upload flow's wire body is unchanged.
+  - Known limits: `--type rust` ELF does not send the fields yet, and a library carrying only
+    `.dynsym` symbols is labelled `symtab`, so a later true `SYMBOL_TABLE` for it does not replace
+    it (a missed upgrade, never a lost symbol).
+
+[#78]: https://github.com/bugsee/bugsee-cli/issues/78
+
 ## [0.8.0] - 2026-10-07
 
 ### Added
