@@ -1403,6 +1403,11 @@ async fn upload_one_so(
         // unchanged or poorer library transfers nothing. `--force` (overwrite)
         // still means "always replace".
         format_variant: lib.format_variant(),
+        // Sent for EVERY library, not only `dwarf` ones. The server never lets a
+        // `symtab` replace anything (a stored copy with no variant is replaceable only
+        // by `dwarf`), so this cannot downgrade. It also opts a plain Android app out
+        // of the legacy find-or-update, which has no duplicate check: without it an
+        // unchanged symbol-table library would re-transfer on every build.
         replace_if_richer: Some(true),
     };
     let detail = presigned::upload_detailed(
@@ -1425,13 +1430,19 @@ async fn upload_one_so(
         presigned::Outcome::Uploaded => {
             tracing::info!(lib = %lib.name, build_id, "uploaded")
         }
-        presigned::Outcome::AlreadyExists => {
+        // The server said what it keeps: it is the same as, or richer than, this file.
+        presigned::Outcome::AlreadyExists if detail.stored.is_some() => {
             tracing::info!(
                 lib = %lib.name,
                 build_id,
                 stored = detail.stored.map(presigned::Variant::as_str),
                 "already on server at the same or better level, skipped"
             )
+        }
+        // It did not say (a server that predates this, or a copy with no variant), so
+        // all that is known is that the build-id is held.
+        presigned::Outcome::AlreadyExists => {
+            tracing::info!(lib = %lib.name, build_id, "already on server, skipped")
         }
     }
     Ok(detail)

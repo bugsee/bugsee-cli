@@ -350,9 +350,32 @@ async fn elf_upload_skips_without_transfer_when_the_server_keeps_the_richer_copy
 
         let stderr = run_elf_upload_of(server.uri(), zip, &[]).await;
 
-        assert!(stderr.contains("already on server"), "{stderr}");
+        assert!(stderr.contains("same or better level"), "{stderr}");
         assert!(!stderr.contains("re-run with --force"), "{stderr}");
     }
+}
+
+/// When the server does not say what it holds (a server that predates this, or a copy
+/// with no variant), the per-library line must not claim it is "the same or better".
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn elf_upload_does_not_claim_same_or_better_when_the_server_does_not_say() {
+    let server = MockServer::start().await;
+    let tmp = tempfile::tempdir().unwrap();
+    let zip = pack_fixture_zip(tmp.path(), "libsymbol1.so", "arm64-v8a/libsymbol1.so");
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "ok": false,
+            "error": {"type": "DuplicateSymbolsFoundError", "code": 16004}
+        })))
+        .mount(&server)
+        .await;
+
+    let stderr = run_elf_upload_of(server.uri(), zip, &[]).await;
+
+    assert!(stderr.contains("already on server, skipped"), "{stderr}");
+    assert!(!stderr.contains("same or better"), "{stderr}");
+    // The summary still tells the operator how to replace a copy this server cannot upgrade.
+    assert!(stderr.contains("re-run with --force"), "{stderr}");
 }
 
 /// `--force` still means "always replace": it sends `overwrite` and still declares the
