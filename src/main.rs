@@ -17,13 +17,6 @@ use exit_code::ExitCode;
 // fork (forking a live multi-threaded runtime is undefined behaviour — only the
 // forking thread survives, leaving the runtime deadlock-prone). So we parse,
 // optionally double-fork, THEN build the runtime in the surviving process.
-/// Colour only an interactive terminal: Xcode / Gradle / CI logs and the
-/// detached `bugsee-cli.log` file would otherwise be full of escape codes.
-/// Honours <https://no-color.org> (any non-empty `NO_COLOR` disables colour).
-fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
-    stderr_is_terminal && no_color.is_none_or(|v| v.is_empty())
-}
-
 fn main() {
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
@@ -98,6 +91,13 @@ fn main() {
         }
     });
     std::process::exit(code.as_i32());
+}
+
+/// Colour only an interactive terminal: Xcode / Gradle / CI logs and the
+/// detached `bugsee-cli.log` file would otherwise be full of escape codes.
+/// Honours <https://no-color.org> (any non-empty `NO_COLOR` disables colour).
+fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stderr_is_terminal && no_color.is_none_or(|v| v.is_empty())
 }
 
 #[cfg(test)]
