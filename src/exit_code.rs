@@ -61,7 +61,10 @@ impl ExitCode {
     /// as a library and calling this method directly.
     #[allow(dead_code)]
     pub fn should_fallback(self) -> bool {
-        matches!(self, ExitCode::Unexpected | ExitCode::Usage)
+        matches!(
+            self,
+            ExitCode::Unexpected | ExitCode::Usage | ExitCode::InputNotFound
+        )
     }
 }
 
