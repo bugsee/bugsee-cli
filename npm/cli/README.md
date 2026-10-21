@@ -79,9 +79,9 @@ gate). A launcher that cannot find a binary at all exits `1`, which is the
 
 ## Other install channels
 
-`@bugsee/bugsee-cli` is the same CLI published by cargo-dist as a single
-package that downloads its binary in a `postinstall`. It remains supported as
-an alias; **prefer `@bugsee/cli`** — it is the one that works under
+`@bugsee/bugsee-cli` was the same CLI published by cargo-dist as a single
+package that downloads its binary in a `postinstall`. It is deprecated and no
+longer published (last version 0.8.2); use `@bugsee/cli`, which also works under
 `--ignore-scripts`. See the
 [Distribution section](https://github.com/bugsee/bugsee-cli#distribution) for
 the shell installer, Homebrew tap, and the per-build-system bundles.
