@@ -125,6 +125,9 @@ jobs:
           shellcheck npm/bootstrap-names.sh npm/test-bootstrap-names.sh
       - name: trust_state fixtures
         run: bash npm/test-bootstrap-names.sh
+      - name: launcher exit status
+        # A binary killed by a signal must not look like a success (#87).
+        run: node --test npm/test-launcher.js
 
   test:
     name: test (${{ matrix.os }})

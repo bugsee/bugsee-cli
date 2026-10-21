@@ -37,6 +37,7 @@ version 0.8.2, see #87).
 | `build.mjs`                  | Assembles all seven packages from a directory of release assets.                                                                              |
 | `bootstrap-names.sh`         | One-time registry + trusted-publisher bootstrap for a NEW package name (see below).                                                          |
 | `test-bootstrap-names.sh`    | Fixture tests for that script's trust-entry check. No network or npm needed: `bash npm/test-bootstrap-names.sh`.                             |
+| `test-launcher.js`           | Pins the launcher's exit-status contract, incl. a binary killed by a signal (#87). No network or built binary: `node --test npm/test-launcher.js`. |
 
 The six platform packages have no sources here: `build.mjs` mints each
 `package.json` and `README.md` from the platform table, so adding a platform is
