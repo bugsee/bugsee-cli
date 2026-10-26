@@ -1,4 +1,5 @@
 use clap::Parser;
+use std::io::IsTerminal;
 use tracing_subscriber::EnvFilter;
 
 mod cli;
@@ -63,6 +64,10 @@ fn main() {
             EnvFilter::try_from_default_env().unwrap_or_else(|_| "bugsee_cli=info".into()),
         )
         .with_writer(std::io::stderr)
+        .with_ansi(ansi_enabled(
+            std::io::stderr().is_terminal(),
+            std::env::var_os("NO_COLOR").as_deref(),
+        ))
         .init();
 
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -86,4 +91,29 @@ fn main() {
         }
     });
     std::process::exit(code.as_i32());
+}
+
+/// Colour only an interactive terminal: Xcode / Gradle / CI logs and the
+/// detached `bugsee-cli.log` file would otherwise be full of escape codes.
+/// Honours <https://no-color.org> (any non-empty `NO_COLOR` disables colour).
+fn ansi_enabled(stderr_is_terminal: bool, no_color: Option<&std::ffi::OsStr>) -> bool {
+    stderr_is_terminal && no_color.is_none_or(|v| v.is_empty())
+}
+
+#[cfg(test)]
+mod ansi_tests {
+    use super::ansi_enabled;
+    use std::ffi::OsStr;
+
+    #[test]
+    fn colour_only_on_a_terminal() {
+        assert!(ansi_enabled(true, None));
+        assert!(!ansi_enabled(false, None));
+    }
+
+    #[test]
+    fn no_color_disables_colour_unless_empty() {
+        assert!(!ansi_enabled(true, Some(OsStr::new("1"))));
+        assert!(ansi_enabled(true, Some(OsStr::new(""))));
+    }
 }
