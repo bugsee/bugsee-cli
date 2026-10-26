@@ -66,12 +66,13 @@ cargo-dist-version = "0.32.0"
 allow-dirty = ["ci"]
 # CI backends to support
 ci = "github"
-# The installers to generate for each app
-installers = ["shell", "powershell", "npm", "homebrew"]
+# The installers to generate for each app.
+# No "npm", and NO `npm-scope`: setting a scope makes dist emit the npm installer
+# (`@bugsee/bugsee-cli`) even when "npm" is absent here. That package is retired
+# (#87); npm packages are built by `npm/build.mjs` and published by `npm-publish.yml`.
+installers = ["shell", "powershell", "homebrew"]
 # A GitHub repo to push Homebrew formulas to
 tap = "bugsee/homebrew-tap"
-# A namespace to use when publishing this package to the npm registry
-npm-scope = "@bugsee"
 # Publish jobs to run in CI
 publish-jobs = ["homebrew"]
 # Target platforms to build apps for (Rust target-triple syntax)

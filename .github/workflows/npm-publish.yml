@@ -4,17 +4,17 @@ name: Publish to npm
 # trust target on every published package's npmjs.com settings —
 # `workflow_filename = npm-publish.yml` in npm's Trusted Publisher UI.
 #
-# It publishes EIGHT packages in two independent jobs:
+# It publishes SEVEN packages in the one `publish-optional-deps` job:
+# @bugsee/cli + the six @bugsee/cli-<platform> packages — the binary split per
+# os/cpu behind optionalDependencies, assembled by npm/build.mjs from the
+# release's binary archives. See npm/README.md.
 #
-#   publish               @bugsee/bugsee-cli — the cargo-dist npm installer,
-#                         one package whose postinstall downloads the binary.
-#                         Taken verbatim from the release asset.
-#   publish-optional-deps @bugsee/cli + the six @bugsee/cli-<platform>
-#                         packages — the binary split per os/cpu behind
-#                         optionalDependencies, assembled by npm/build.mjs
-#                         from the release's binary archives. See npm/README.md.
+# The legacy single-package `@bugsee/bugsee-cli` (the cargo-dist npm installer)
+# is NOT published from here any more: its launcher exited 0 when the binary was
+# killed by a signal (#87). It was frozen at 0.8.2 (the one patched release) and
+# deprecated in favour of @bugsee/cli. Do not re-add a job for it.
 #
-# EVERY ONE of those eight names needs its OWN Trusted Publisher entry on
+# EVERY ONE of those seven names needs its OWN Trusted Publisher entry on
 # npmjs.com (repository bugsee/bugsee-cli, workflow npm-publish.yml) before its
 # FIRST publish. That entry lives on a PACKAGE's settings page, so it cannot
 # even be created for a name that has never been published: each new name needs
@@ -25,16 +25,14 @@ name: Publish to npm
 #
 # >>> RUNBOOK: `bash npm/bootstrap-names.sh <name>` does both steps and is
 # >>> idempotent; npm/README.md, "First-publish bootstrap" explains it. Read it before the
-# >>> first release that includes the @bugsee/cli family. @bugsee/bugsee-cli is
-# >>> already bootstrapped and needs nothing.
+# >>> first release that includes a new package name.
 #
 # Why a separate workflow (and not folded into release.yml):
 # `dist init` regenerates release.yml on every dist upgrade and would
 # silently clobber any OIDC wiring there. Keeping the npm publish in
 # our own workflow file insulates it from dist's lifecycle. dist still
-# generates the `bugsee-cli-npm-package.tar.gz` tarball as a GitHub
-# Release asset (via `installers = [..., "npm"]`); we just download
-# the asset and publish ourselves.
+# builds the per-platform binary archives and attaches them to the GitHub
+# Release; we just download those and publish ourselves.
 #
 # Triggers:
 #   - `workflow_run` on the dist `Release` workflow completing — the
@@ -47,7 +45,7 @@ name: Publish to npm
 #     it fires reliably. Guarded to a SUCCESSFUL, tag-`push`-triggered
 #     Release whose tag looks like `vX.Y.Z` (PR-mode Release runs and
 #     failed releases are skipped). By the time Release has completed,
-#     the npm tarball asset is already attached to the release.
+#     the binary archives are already attached to the release.
 #   - `workflow_dispatch` with a `tag` input — the MANUAL path, for
 #     backfilling missing versions or re-publishing a specific release.
 #
@@ -84,15 +82,15 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  publish:
-    name: publish to npm via OIDC
+  publish-optional-deps:
+    name: publish @bugsee/cli family via OIDC
     runs-on: ubuntu-latest
     # Manual dispatch always runs. The automated path runs only for a
     # SUCCESSFUL Release that was triggered by a tag PUSH whose ref looks
     # like a version tag — this filters out PR-mode Release runs (which
     # complete with event == 'pull_request') and failed releases. The
-    # exact `vX.Y.Z` shape is re-checked in `resolve` as a belt-and-braces
-    # guard (`startsWith(..., 'v')` alone would also match e.g. `vnext`).
+    # exact `vX.Y.Z` shape is re-checked in `resolve`
+    # (`startsWith(..., 'v')` alone would also match e.g. `vnext`).
     if: >-
       github.event_name == 'workflow_dispatch' ||
       (github.event.workflow_run.conclusion == 'success' &&
@@ -118,128 +116,11 @@ jobs:
           # $GITHUB_OUTPUT (e.g. should_publish=true) — refuse before writing it.
           case "$tag" in *$'\n'*|*$'\r'*) echo "::error::tag contains a newline"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
-            echo "should_publish=true" >> "$GITHUB_OUTPUT"
-            echo "Resolved release tag: $tag"
-          else
-            echo "should_publish=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::'$tag' is not a version tag (vX.Y.Z); skipping npm publish."
-          fi
-
-      - name: Setup Node
-        # DELIBERATELY no `registry-url:` here — setup-node@v6 with that
-        # option writes an .npmrc containing
-        # `//registry.npmjs.org/:_authToken=${NODE_AUTH_TOKEN}`, which
-        # tells npm to use token auth instead of OIDC. We want the
-        # opposite: no .npmrc, so npm 11.5+ auto-uses the OIDC token
-        # minted from `permissions: id-token: write` above.
-        if: steps.resolve.outputs.should_publish == 'true'
-        uses: actions/setup-node@v7
-        with:
-          node-version: '22'
-
-      - name: Upgrade npm to satisfy Trusted Publishing floor (≥ 11.5.1)
-        # Node 22's bundled npm is below the OIDC floor as of 2026.
-        if: steps.resolve.outputs.should_publish == 'true'
-        run: |
-          npm install -g npm@latest
-          node --version
-          npm --version
-
-      - name: Download npm package tarball from release
-        if: steps.resolve.outputs.should_publish == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          TAG: ${{ steps.resolve.outputs.tag }}
-        run: |
-          mkdir -p release-assets
-          gh release download "$TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir release-assets \
-            --pattern 'bugsee-cli-npm-package.tar.gz'
-          ls -la release-assets/
-
-      - name: Publish via OIDC
-        # `npm publish <tarball>` accepts an npm-pack-format tarball
-        # directly — no extraction needed. npm 11.5+ detects the
-        # ACTIONS_ID_TOKEN_REQUEST_* env vars GitHub injects when
-        # `id-token: write` is granted, mints the OIDC token, and
-        # presents it to the registry. Trust on npmjs.com side maps
-        # (repo, workflow filename) → @bugsee/bugsee-cli publish.
-        #
-        # Absolute path is critical: a bare relative path like
-        # `release-assets/bugsee-cli-npm-package.tar.gz` is parsed by
-        # npm as a git spec (`owner/repo`) and routed through git
-        # ls-remote, failing with a confusing SSH/permission error.
-        #
-        # `--tag` is intentionally omitted so each publish moves
-        # `dist-tags.latest`; the automated path always runs for the
-        # newest release, and manual backfills must be run oldest→newest
-        # so `latest` ends on the highest version.
-        #
-        # `--provenance` emits a sigstore build-provenance attestation
-        # (supply-chain integrity). It requires a PUBLIC source repo, and
-        # bugsee/bugsee-cli is public — so it's enabled. If the repo ever
-        # goes private again, drop this flag: npm rejects provenance from
-        # private repos with `E422 … repository visibility: "private"`
-        # (OIDC auth itself is unaffected by visibility).
-        #
-        # Do NOT add `env: NODE_AUTH_TOKEN: ...` — even an empty value
-        # makes npm prefer broken token auth over OIDC.
-        if: steps.resolve.outputs.should_publish == 'true'
-        run: |
-          tarball="$GITHUB_WORKSPACE/release-assets/bugsee-cli-npm-package.tar.gz"
-          ls -la "$tarball"
-          npm publish "$tarball" --access public --provenance
-
-  publish-optional-deps:
-    name: publish @bugsee/cli family via OIDC
-    runs-on: ubuntu-latest
-    # DELIBERATELY NOT `needs: publish`. The two jobs publish different
-    # packages from the same release and neither depends on the other's
-    # output; chaining them would make a @bugsee/bugsee-cli failure (or a
-    # re-publish of an already-published version) suppress the family, and
-    # vice versa. They share only the trigger.
-    #
-    # Same guard as `publish` above, for the same reasons — see its comment.
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event.workflow_run.conclusion == 'success' &&
-       github.event.workflow_run.event == 'push' &&
-       startsWith(github.event.workflow_run.head_branch, 'v'))
-    steps:
-      # Repeated rather than factored into a shared `resolve` job on purpose:
-      # hoisting it would mean editing the `publish` job above, which is the
-      # live, working OIDC path for @bugsee/bugsee-cli. Ten duplicated lines
-      # are cheaper than any risk to that.
-      - name: Resolve release tag
-        id: resolve
-        env:
-          # Via env, never interpolated into the script: head_branch and the
-          # dispatch input are untrusted strings (defence in depth), and `${{ }}` is
-          # substituted BEFORE the shell parses the script (code injection).
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_TAG: ${{ github.event.inputs.tag }}
-          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
-        run: |
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            tag="$INPUT_TAG"
-          else
-            tag="$HEAD_BRANCH"
-          fi
-          # A newline would let the value smuggle extra `key=value` lines into
-          # $GITHUB_OUTPUT (e.g. should_publish=true) — refuse before writing it.
-          case "$tag" in *$'\n'*|*$'\r'*) echo "::error::tag contains a newline"; exit 1 ;; esac
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          # ANCHORED, unlike the `publish` job's copy above. Unanchored,
-          # `^v[0-9]+\.[0-9]+\.[0-9]+` also matches `v1.2.3-rc1`, which would
-          # then publish as 1.2.3-rc1 with no `--tag` and MOVE
-          # `dist-tags.latest` onto a prerelease. Here that would hit all seven
-          # packages at once, so prereleases are matched explicitly and routed
-          # to `next` rather than silently treated as stable. The same latent
-          # bug in the `publish` job above is deliberately left alone: that is
-          # the live @bugsee/bugsee-cli path and is out of scope for this
-          # change. Worth a follow-up.
+          # ANCHORED. Unanchored, `^v[0-9]+\.[0-9]+\.[0-9]+` also matches
+          # `v1.2.3-rc1`, which would then publish as 1.2.3-rc1 with no `--tag`
+          # and MOVE `dist-tags.latest` onto a prerelease. That would hit all
+          # seven packages at once, so prereleases are matched explicitly and
+          # routed to `next` rather than silently treated as stable.
           if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
             {
               echo "should_publish=true"
@@ -278,9 +159,9 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node
-        # No `registry-url:` — see the note on the same step in `publish`.
-        # An .npmrc with `_authToken` would make npm prefer token auth over
-        # the OIDC token and every publish below would fail.
+        # DELIBERATELY no `registry-url:` — setup-node with that option writes
+        # an .npmrc with `_authToken=${NODE_AUTH_TOKEN}`, which makes npm prefer
+        # token auth over the OIDC token, and every publish below would fail.
         if: steps.resolve.outputs.should_publish == 'true'
         uses: actions/setup-node@v7
         with:

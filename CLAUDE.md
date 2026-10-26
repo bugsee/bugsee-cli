@@ -169,21 +169,20 @@ size-check FAIL can fail the build (exit 40).
 ## Distribution & activation
 
 Releases are tag-driven: pushing a `vX.Y.Z` tag runs `release.yml` (cargo-dist
-builds the target triples + a GitHub Release with shell/powershell/npm/homebrew
+builds the target triples + a GitHub Release with shell/powershell/homebrew
 installers). Two workflows then chain off it automatically via `workflow_run` —
 `npm-publish.yml` (npm, via OIDC Trusted Publishing) and `mirror-to-s3.yml`
 (`download.bugsee.com/cli/v<ver>/` + the `latest` alias and the
 `cli/v<major>.x/version.txt` pointer that `bugsee-cli update` reads). Both also
 keep a `workflow_dispatch` path for backfilling a missed version.
 
-`npm-publish.yml` has TWO independent jobs, because npm ships two packages
-for the same binary: `publish` takes the cargo-dist-generated
-`bugsee-cli-npm-package.tar.gz` release asset straight to `@bugsee/bugsee-cli`
-(a single package whose postinstall downloads the binary), while
-`publish-optional-deps` runs `npm/build.mjs` over the release's binary archives
-to assemble and publish `@bugsee/cli` plus its six `@bugsee/cli-<platform>`
-packages (per-`os`/`cpu` `optionalDependencies`, so nothing downloads at install
-time). Seven packages, platform packages FIRST — npm skips an unresolvable
+`npm-publish.yml`'s one job, `publish-optional-deps`, runs `npm/build.mjs` over
+the release's binary archives to assemble and publish `@bugsee/cli` plus its six
+`@bugsee/cli-<platform>` packages (per-`os`/`cpu` `optionalDependencies`, so
+nothing downloads at install time). The legacy cargo-dist package
+`@bugsee/bugsee-cli` is retired (frozen at 0.8.2, deprecated; its launcher
+exited 0 on a signal kill, #87) — there is no `"npm"` in dist's `installers` and
+no job for it; do not re-add either. Seven packages, platform packages FIRST — npm skips an unresolvable
 optional dependency silently, so the front package must never be live ahead of
 them. See `npm/README.md`. Each package needs its own Trusted Publisher entry
 pointing at `npm-publish.yml`, written with `npm trust github <pkg> --file
