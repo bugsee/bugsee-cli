@@ -26,3 +26,7 @@ Thumbs.db
 npm/dist/
 npm/**/*.tgz
 npm/cli/vendor/
+
+# Python bytecode (scripts/e2e_flows.py)
+__pycache__/
+*.pyc
