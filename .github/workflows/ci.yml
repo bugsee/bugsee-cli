@@ -13,6 +13,10 @@ concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
+# Least privilege: no job here writes to the repo, so the token is read-only.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
   # Fail fast on any rustc warning across all jobs that compile code.

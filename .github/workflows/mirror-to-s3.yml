@@ -83,20 +83,30 @@ jobs:
     steps:
       - name: Resolve release tag
         id: resolve
+        env:
+          # Via env, never interpolated into the script: head_branch and the
+          # dispatch input are untrusted strings (defence in depth), and `${{ }}` is
+          # substituted BEFORE the shell parses the script (code injection).
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
           set -euo pipefail
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
           else
             # For a tag-push-triggered run, head_branch is the tag name.
-            tag="${{ github.event.workflow_run.head_branch }}"
+            tag="$HEAD_BRANCH"
           fi
+          # A newline would let the value smuggle extra `key=value` lines into
+          # $GITHUB_OUTPUT (e.g. should_publish=true) — refuse before writing it.
+          case "$tag" in *$'\n'*|*$'\r'*) echo "::error::tag contains a newline"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
 
           if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
             echo "should_mirror=true" >> "$GITHUB_OUTPUT"
             echo "Resolved release tag: $tag"
-          elif [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             # A hand-typed tag that isn't a version is a typo, not a
             # no-op — fail loudly rather than "succeeding" without mirroring.
             echo "::error::'$tag' is not a version tag (vX.Y.Z)."
@@ -135,7 +145,7 @@ jobs:
           set -euo pipefail
           mkdir -p assets
           gh release download "$TAG" \
-            --repo "${{ github.repository }}" \
+            --repo "$GITHUB_REPOSITORY" \
             --dir assets \
             --pattern '*'
           echo "Downloaded:"

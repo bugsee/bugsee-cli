@@ -43,14 +43,16 @@ jobs:
       matrix: ${{ steps.resolve.outputs.matrix }}
     steps:
       - id: resolve
+        env:
+          ARCH: ${{ inputs.arch }}
         run: |
           x64='{"arch":"x64","runner":"windows-latest","triple":"x86_64-pc-windows-msvc"}'
           arm64='{"arch":"arm64","runner":"windows-11-arm","triple":"aarch64-pc-windows-msvc"}'
-          case "${{ inputs.arch }}" in
+          case "$ARCH" in
             x64)   matrix="[$x64]" ;;
             arm64) matrix="[$arm64]" ;;
             both)  matrix="[$x64,$arm64]" ;;
-            *)     echo "::error::unknown arch '${{ inputs.arch }}'"; exit 1 ;;
+            *)     echo "::error::unknown arch '$ARCH'"; exit 1 ;;
           esac
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
           echo "testing: $matrix"
@@ -68,9 +70,11 @@ jobs:
 
       - name: Download + verify the published Windows binary
         shell: pwsh
+        env:
+          VERSION: ${{ inputs.version }}
         run: |
           $ErrorActionPreference = "Stop"
-          $v = "${{ inputs.version }}"
+          $v = $env:VERSION
           $base = "https://download.bugsee.com/cli/v$v"
           $triple = "${{ matrix.triple }}"
           Write-Host "Fetching $base/bugsee-cli-$triple.zip"
