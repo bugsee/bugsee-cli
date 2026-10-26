@@ -33,7 +33,13 @@ CAPTURE_LOCK = threading.Lock()
 
 
 def cappath(name):
-    return os.path.join(STATE["cap"], name)
+    # Resolve and verify containment: `name` can come off a request line, and this is
+    # the check that guarantees a capture file never lands outside the capture dir.
+    root = os.path.realpath(STATE["cap"])
+    path = os.path.realpath(os.path.join(root, name))
+    if not path.startswith(root + os.sep):
+        raise ValueError(f"capture path escapes {root}: {name!r}")
+    return path
 
 
 class Handler(http.server.BaseHTTPRequestHandler):

@@ -265,10 +265,16 @@ jobs:
         # it stamps against `Cargo.toml` — so a `main` that has already moved
         # on would abort the build rather than publish packages whose sources
         # are not the ones the release was cut from.
+        #
+        # On the automated path, pin to the COMMIT the Release run built
+        # (`workflow_run.head_sha`), not the tag name: a tag can be force-pushed
+        # between the Release finishing and this job starting, and this job
+        # runs repo code (`npm/build.mjs`) with OIDC publish rights. A manual
+        # dispatch has no workflow_run, so it falls back to the typed tag.
         if: steps.resolve.outputs.should_publish == 'true'
         uses: actions/checkout@v7
         with:
-          ref: ${{ steps.resolve.outputs.tag }}
+          ref: ${{ github.event.workflow_run.head_sha || steps.resolve.outputs.tag }}
           persist-credentials: false
 
       - name: Setup Node
