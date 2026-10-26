@@ -106,7 +106,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
 
     def do_PUT(self):
         body = self._read_body()
-        name = self.path.rsplit("/put/", 1)[-1]
+        # basename: the name comes off the request line, so keep it inside the capture dir.
+        name = os.path.basename(self.path.rsplit("/put/", 1)[-1])
         with CAPTURE_LOCK:
             STATE["puts"][STATE["flow"]] = STATE["puts"].get(STATE["flow"], 0) + 1
             with open(cappath(name + ".bin"), "wb") as f:

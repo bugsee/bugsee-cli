@@ -101,12 +101,22 @@ jobs:
     steps:
       - name: Resolve release tag
         id: resolve
+        env:
+          # Via env, never interpolated into the script: head_branch and the
+          # dispatch input are untrusted strings (defence in depth), and `${{ }}` is
+          # substituted BEFORE the shell parses the script (code injection).
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
           else
-            tag="${{ github.event.workflow_run.head_branch }}"
+            tag="$HEAD_BRANCH"
           fi
+          # A newline would let the value smuggle extra `key=value` lines into
+          # $GITHUB_OUTPUT (e.g. should_publish=true) — refuse before writing it.
+          case "$tag" in *$'\n'*|*$'\r'*) echo "::error::tag contains a newline"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           if echo "$tag" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+'; then
             echo "should_publish=true" >> "$GITHUB_OUTPUT"
@@ -140,10 +150,11 @@ jobs:
         if: steps.resolve.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           mkdir -p release-assets
-          gh release download "${{ steps.resolve.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --dir release-assets \
             --pattern 'bugsee-cli-npm-package.tar.gz'
           ls -la release-assets/
@@ -203,12 +214,22 @@ jobs:
       # are cheaper than any risk to that.
       - name: Resolve release tag
         id: resolve
+        env:
+          # Via env, never interpolated into the script: head_branch and the
+          # dispatch input are untrusted strings (defence in depth), and `${{ }}` is
+          # substituted BEFORE the shell parses the script (code injection).
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ github.event.inputs.tag }}
+          HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            tag="${{ github.event.inputs.tag }}"
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="$INPUT_TAG"
           else
-            tag="${{ github.event.workflow_run.head_branch }}"
+            tag="$HEAD_BRANCH"
           fi
+          # A newline would let the value smuggle extra `key=value` lines into
+          # $GITHUB_OUTPUT (e.g. should_publish=true) — refuse before writing it.
+          case "$tag" in *$'\n'*|*$'\r'*) echo "::error::tag contains a newline"; exit 1 ;; esac
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           # ANCHORED, unlike the `publish` job's copy above. Unanchored,
           # `^v[0-9]+\.[0-9]+\.[0-9]+` also matches `v1.2.3-rc1`, which would
@@ -273,10 +294,11 @@ jobs:
         if: steps.resolve.outputs.should_publish == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.resolve.outputs.tag }}
         run: |
           mkdir -p release-assets
-          gh release download "${{ steps.resolve.outputs.tag }}" \
-            --repo "${{ github.repository }}" \
+          gh release download "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
             --dir release-assets \
             --pattern 'bugsee-cli-*-*.tar.xz' \
             --pattern 'bugsee-cli-*-*.tar.xz.sha256' \
@@ -290,10 +312,12 @@ jobs:
         # fail here rather than publish a family whose front package pins an
         # optionalDependency that will never exist.
         if: steps.resolve.outputs.should_publish == 'true'
+        env:
+          VERSION: ${{ steps.resolve.outputs.version }}
         run: |
           node npm/build.mjs \
             --artifacts-dir release-assets \
-            --version "${{ steps.resolve.outputs.version }}" \
+            --version "$VERSION" \
             --out npm/dist
           find npm/dist -maxdepth 2 -name package.json -exec sh -c \
             'echo "--- $1"; cat "$1"' _ {} \;
