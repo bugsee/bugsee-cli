@@ -109,7 +109,11 @@ pub fn extract_libs(
         if !entry.is_file() {
             continue;
         }
-        let name = entry.name().to_string();
+        // zip 9: `name()` returns a Result (defensive; decoding falls back to CP437).
+        let name = entry
+            .name()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?
+            .into_owned();
         if !(is_native_lib_entry(&name) || extra.matches(&name)) {
             continue;
         }

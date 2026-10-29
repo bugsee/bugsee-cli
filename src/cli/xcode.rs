@@ -3397,7 +3397,7 @@ mod tests {
             .expect("a PUT to the presigned URL");
         let mut archive_zip = ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
         let names: Vec<String> = (0..archive_zip.len())
-            .map(|i| archive_zip.by_index(i).unwrap().name().to_string())
+            .map(|i| archive_zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["dependencies.json"]);
         let mut content = String::new();
@@ -3513,7 +3513,7 @@ mod tests {
             .expect("a PUT to the presigned URL");
         let mut archive_zip = ZipArchive::new(std::io::Cursor::new(put.body.clone())).unwrap();
         let names: Vec<String> = (0..archive_zip.len())
-            .map(|i| archive_zip.by_index(i).unwrap().name().to_string())
+            .map(|i| archive_zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["timings.json"]);
         let mut content = String::new();
@@ -3626,7 +3626,7 @@ mod tests {
             .expect("an artefact PUT");
         let mut zip = ZipArchive::new(std::io::Cursor::new(art.body.clone())).unwrap();
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert_eq!(names.len(), 1);
         assert!(names[0].ends_with(".ipa"), "artefact entry: {}", names[0]);
@@ -3644,7 +3644,7 @@ mod tests {
         assert!(
             inner
                 .file_names()
-                .any(|n| n.starts_with("Payload/MyApp.app/")),
+                .any(|n| n.is_ok_and(|n| n.starts_with("Payload/MyApp.app/"))),
             "synthetic .ipa must place the app under Payload/"
         );
     }
