@@ -250,7 +250,7 @@ mod tests {
 
         // Iteration order matches insertion order.
         let names: Vec<String> = (0..archive.len())
-            .map(|i| archive.by_index(i).unwrap().name().to_string())
+            .map(|i| archive.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert_eq!(names, vec!["mapping.txt", "icon.png"]);
 
@@ -269,6 +269,79 @@ mod tests {
             .read_to_end(&mut icon_bytes)
             .unwrap();
         assert_eq!(icon_bytes, b"\x89PNG\r\n\x1a\n");
+    }
+
+    /// Pins the raw header bytes of every archive we write, so a `zip` upgrade
+    /// that changes a default (timestamps, flags, version fields, extra
+    /// fields, unix mode, ZIP64, data descriptors, comment) fails here instead
+    /// of silently changing the wire format. Values were captured from the
+    /// archives written by zip 8.6.0 and verified byte-identical under zip 9.
+    #[test]
+    fn written_archive_headers_are_pinned() {
+        let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]);
+        let u32_at = |b: &[u8], o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+
+        let dir = tempfile::tempdir().unwrap();
+        let stored = dir.path().join("a.apk");
+        let mapped = dir.path().join("mapping.txt");
+        let out = dir.path().join("packed.zip");
+        std::fs::write(&stored, b"stored payload").unwrap();
+        std::fs::write(&mapped, b"class a -> b:\n".repeat(64)).unwrap();
+        pack_entries(
+            &[
+                ZipEntry::stored("a.apk", &stored),
+                ZipEntry::compressed("mapping.txt", &mapped),
+            ],
+            &out,
+            Strategy::Zstd(11),
+        )
+        .unwrap();
+        let b = std::fs::read(&out).unwrap();
+
+        // (name, version needed, method) for each entry, in insertion order.
+        let expect = [("a.apk", 10u16, 0u16), ("mapping.txt", 45, 93)];
+        let mut p = 0;
+        for (name, ver, method) in expect {
+            assert_eq!(&b[p..p + 4], b"PK\x03\x04");
+            assert_eq!(u16_at(&b, p + 4), ver, "{name}: version needed");
+            assert_eq!(
+                u16_at(&b, p + 6),
+                0,
+                "{name}: flags (no UTF-8 bit, no descriptor)"
+            );
+            assert_eq!(u16_at(&b, p + 8), method, "{name}: method");
+            assert_eq!(u16_at(&b, p + 10), 0, "{name}: DOS time");
+            assert_eq!(u16_at(&b, p + 12), 33, "{name}: DOS date 1980-01-01");
+            let (csize, nlen, elen) = (
+                u32_at(&b, p + 18) as usize,
+                u16_at(&b, p + 26) as usize,
+                u16_at(&b, p + 28) as usize,
+            );
+            assert_eq!(&b[p + 30..p + 30 + nlen], name.as_bytes());
+            assert_eq!(elen, 0, "{name}: no local extra field");
+            p += 30 + nlen + elen + csize;
+        }
+        for (name, ver, method) in expect {
+            assert_eq!(&b[p..p + 4], b"PK\x01\x02");
+            assert_eq!(u16_at(&b, p + 4), 0x300 | ver, "{name}: made by unix");
+            assert_eq!(u16_at(&b, p + 6), ver);
+            assert_eq!(u16_at(&b, p + 8), 0);
+            assert_eq!(u16_at(&b, p + 10), method);
+            assert_eq!(u16_at(&b, p + 12), 0);
+            assert_eq!(u16_at(&b, p + 14), 33);
+            let (nlen, elen, clen) = (
+                u16_at(&b, p + 28) as usize,
+                u16_at(&b, p + 30) as usize,
+                u16_at(&b, p + 32) as usize,
+            );
+            assert_eq!((elen, clen), (0, 0), "{name}: no extra/comment");
+            assert_eq!(u32_at(&b, p + 38), 0o100644 << 16, "{name}: unix mode 0644");
+            p += 46 + nlen + elen + clen;
+        }
+        assert_eq!(&b[p..p + 4], b"PK\x05\x06");
+        assert_eq!(u16_at(&b, p + 10), 2, "entry count");
+        assert_eq!(u16_at(&b, p + 20), 0, "no archive comment");
+        assert_eq!(b.len(), p + 22, "no trailing bytes / ZIP64 records");
     }
 
     #[test]

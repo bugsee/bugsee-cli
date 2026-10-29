@@ -42,7 +42,7 @@ fn zip_entries(zip_bytes: &[u8]) -> Vec<(String, Vec<u8>)> {
             let mut e = archive.by_index(i).unwrap();
             let mut data = Vec::new();
             e.read_to_end(&mut data).unwrap(); // verifies the CRC
-            (e.name().to_string(), data)
+            (e.name().unwrap().to_string(), data)
         })
         .collect()
 }

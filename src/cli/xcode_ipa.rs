@@ -393,6 +393,53 @@ mod tests {
         assert_eq!(main_executable_uuid(&app), Some(expected));
     }
 
+    /// Pins the permission bits, timestamp and flags of the synthetic `.ipa`
+    /// entries (captured from zip 8.6.0, unchanged under zip 9).
+    #[cfg(unix)]
+    #[test]
+    fn ipa_entry_metadata_is_pinned() {
+        use std::os::unix::fs::PermissionsExt;
+        let td = tempfile::tempdir().unwrap();
+        let app = make_app(td.path(), "MyApp.app");
+        std::fs::set_permissions(app.join("MyApp"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+        std::fs::set_permissions(app.join("icon.png"), std::fs::Permissions::from_mode(0o644))
+            .unwrap();
+        let ipa = td.path().join("MyApp.ipa");
+        package_app_as_ipa(&app, &ipa).unwrap();
+
+        let mut zip = ZipArchive::new(std::fs::File::open(&ipa).unwrap()).unwrap();
+        for (name, mode, method) in [
+            (
+                "Payload/MyApp.app/MyApp",
+                0o100755,
+                CompressionMethod::Deflated,
+            ),
+            (
+                "Payload/MyApp.app/icon.png",
+                0o100644,
+                CompressionMethod::Stored,
+            ),
+        ] {
+            let e = zip.by_name(name).unwrap();
+            assert_eq!(e.unix_mode(), Some(mode), "{name}: unix mode");
+            assert_eq!(e.compression(), method, "{name}: method");
+            let t = e.last_modified().expect("mtime");
+            assert_eq!(
+                (
+                    t.year(),
+                    t.month(),
+                    t.day(),
+                    t.hour(),
+                    t.minute(),
+                    t.second()
+                ),
+                (1980, 1, 1, 0, 0, 0),
+                "{name}: fixed mtime"
+            );
+        }
+    }
+
     #[test]
     fn packages_app_under_payload_with_per_file_method() {
         let td = tempfile::tempdir().unwrap();
@@ -402,7 +449,7 @@ mod tests {
 
         let mut zip = ZipArchive::new(std::fs::File::open(&ipa).unwrap()).unwrap();
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert!(names.contains(&"Payload/MyApp.app/Info.plist".to_string()));
         assert!(names.contains(&"Payload/MyApp.app/MyApp".to_string()));
@@ -468,7 +515,7 @@ mod tests {
         package_app_as_ipa(&app, &ipa).unwrap();
         let mut zip = ZipArchive::new(std::fs::File::open(&ipa).unwrap()).unwrap();
         let names: Vec<String> = (0..zip.len())
-            .map(|i| zip.by_index(i).unwrap().name().to_string())
+            .map(|i| zip.by_index(i).unwrap().name().unwrap().to_string())
             .collect();
         assert!(!names.iter().any(|n| n.ends_with("/Current")));
     }
