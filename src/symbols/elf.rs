@@ -109,7 +109,7 @@ pub fn extract_libs(
         if !entry.is_file() {
             continue;
         }
-        // zip 9: `name()` is fallible (a non-UTF-8 name that is not valid CP437).
+        // zip 9: `name()` returns a Result (defensive; decoding falls back to CP437).
         let name = entry
             .name()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?

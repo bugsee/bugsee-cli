@@ -323,7 +323,14 @@ mod tests {
         }
         for (name, ver, method) in expect {
             assert_eq!(&b[p..p + 4], b"PK\x01\x02");
-            assert_eq!(u16_at(&b, p + 4), 0x300 | ver, "{name}: made by unix");
+            // The made-by host byte is platform-dependent in the zip crate
+            // (DOS on Windows, Unix elsewhere) when not set explicitly.
+            let host: u16 = if cfg!(windows) { 0x000 } else { 0x300 };
+            assert_eq!(
+                u16_at(&b, p + 4),
+                host | ver,
+                "{name}: made-by host/version"
+            );
             assert_eq!(u16_at(&b, p + 6), ver);
             assert_eq!(u16_at(&b, p + 8), 0);
             assert_eq!(u16_at(&b, p + 10), method);
