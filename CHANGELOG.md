@@ -6,6 +6,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+- **MSRV raised to 1.89** (`rust-version`): `uuid` 1.29 requires it. Verified with
+  `cargo +1.89 check --all-targets`.
+
 ## [0.8.1] - 2026-10-08
 
 ### Changed
