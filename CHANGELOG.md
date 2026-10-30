@@ -14,7 +14,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   range (<9.0.0), and neither 13.9.0 nor 14.0.0-alpha.4 builds with that feature off. The CLI now
   takes `symbolic-common` / `symbolic-debuginfo` from `bugsee/symbolic` (upstream 13.9.0 plus
   getsentry/symbolic#1097, the zip 7.2.0 -> 9 bump) as a pinned git dependency, until a
-  `symbolic` release includes that change. Also refreshes `rustls` (0.23.46), `tokio` (1.54),
+  `symbolic` release includes that change ([#96]). Also refreshes `rustls` (0.23.46), `tokio` (1.54),
   `uuid`, `plist`, `memmap2`, `zstd-sys` and other transitive dependencies.
 
 ### Changed
@@ -26,6 +26,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   logs and the detached `bugsee-cli.log` no longer contain escape codes; a non-empty `NO_COLOR`
   also turns colour off.
 - **The legacy `@bugsee/bugsee-cli` npm package is no longer published.** Use `@bugsee/cli`.
+
+[#96]: https://github.com/bugsee/bugsee-cli/issues/96
 
 ## [0.8.1] - 2026-10-08
 

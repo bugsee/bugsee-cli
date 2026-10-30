@@ -26,6 +26,10 @@ updates:
       # a major bump (14.x) could diverge from what the worker reads and silently
       # break symbolication. Minor/patch within 13.x are still proposed (the
       # arch/format identifier-pinning tests guard those); a major is not.
+      #
+      # NOTE: both crates are currently a rev-pinned GIT dependency on the
+      # bugsee/symbolic fork (see Cargo.toml), which Dependabot does not track, so
+      # these rules are inert until they return to crates.io. Tracking: https://github.com/bugsee/bugsee-cli/issues/96
       - dependency-name: "symbolic-common"
         update-types: ["version-update:semver-major"]
       - dependency-name: "symbolic-debuginfo"
