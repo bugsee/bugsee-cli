@@ -14,7 +14,7 @@ per-build-system orchestrators shell to it instead of each re-implementing the
 HTTP / compression / retry / presigned-handshake logic — the Android Gradle
 plugin (Kotlin), and the iOS SDK + fastlane `BugseeAgent`s (Python).
 
-Binary crate, no library target. Edition 2021, MSRV 1.88 (declared in
+Binary crate, no library target. Edition 2021, MSRV 1.89 (declared in
 `Cargo.toml`'s `rust-version`). `rust-toolchain.toml` selects `stable`, NOT the
 MSRV — and CI builds `stable` too, so nothing in CI catches MSRV drift. A
 dependency bump can silently raise the real floor; check with `cargo +<ver>
