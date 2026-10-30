@@ -236,7 +236,7 @@ dependencies = [
  "uuid",
  "walkdir",
  "wiremock",
- "zip 9.1.2",
+ "zip",
  "zstd 0.14.3",
 ]
 
@@ -2077,8 +2077,7 @@ checksum = "13c2bddecc57b384dee18652358fb23172facb8a2c51ccc10d74c157bdea3292"
 [[package]]
 name = "symbolic-common"
 version = "13.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ddfa0014ff4e423a1bb8881453c7a29181eb14fe1dbc8e0197ebfa081903f3ed"
+source = "git+https://github.com/bugsee/symbolic?rev=3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8#3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8"
 dependencies = [
  "debugid",
  "memmap2",
@@ -2089,8 +2088,7 @@ dependencies = [
 [[package]]
 name = "symbolic-debuginfo"
 version = "13.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a8d43fa61c285421813524f466b5ad9a81fb97a03d1a8bf02931588a2aa47434"
+source = "git+https://github.com/bugsee/symbolic?rev=3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8#3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8"
 dependencies = [
  "debugid",
  "elementtree",
@@ -2115,15 +2113,14 @@ dependencies = [
  "symbolic-ppdb",
  "thiserror 2.0.21",
  "wasmparser 0.243.0",
- "zip 7.2.0",
+ "zip",
  "zstd 0.13.3",
 ]
 
 [[package]]
 name = "symbolic-ppdb"
 version = "13.9.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1949ab1ac6caf9e1fde03d5bd35570727b2839fb399737171784ecf7dc4baa0e"
+source = "git+https://github.com/bugsee/symbolic?rev=3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8#3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8"
 dependencies = [
  "flate2",
  "indexmap",
@@ -2466,12 +2463,6 @@ name = "try-lock"
 version = "0.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
-
-[[package]]
-name = "typed-path"
-version = "0.12.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8e28f89b80c87b8fb0cf04ab448d5dd0dd0ade2f8891bae878de66a75a28600e"
 
 [[package]]
 name = "typed-path"
@@ -3145,20 +3136,6 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "7.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c42e33efc22a0650c311c2ef19115ce232583abbe80850bc8b66509ebef02de0"
-dependencies = [
- "crc32fast",
- "flate2",
- "indexmap",
- "memchr",
- "typed-path 0.12.3",
- "zopfli",
-]
-
-[[package]]
-name = "zip"
 version = "9.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ec2e3161de27091f18a831d9494e9c53378a34833af5c1dda35ad85849da18d6"
@@ -3169,7 +3146,7 @@ dependencies = [
  "indexmap",
  "memchr",
  "nix",
- "typed-path 0.13.0",
+ "typed-path",
  "windows-sys 0.61.2",
  "zopfli",
  "zstd 0.14.3",

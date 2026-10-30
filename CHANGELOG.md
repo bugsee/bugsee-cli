@@ -9,15 +9,17 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [0.8.2] - 2026-10-30
 
 ### Security
-- **`zip` 8.6.0 -> 9.1.2** for the crate's own use (the upload packer), which is the copy that
-  handles untrusted input on our side. Also refreshes `rustls` (0.23.46), `tokio` (1.54), `uuid`,
-  `plist`, `memmap2`, `zstd-sys` and other transitive dependencies.
-  - **Known remaining exposure:** `symbolic-debuginfo` 13.9.0 still pulls in `zip` 7.2.0 through
-    its `sourcebundle` feature, which is inside the advisories' vulnerable range (<9.0.0). No
-    `symbolic` release moves off zip 7 yet (14.0.0-alpha.4 still requires `^7.2.0`), and 13.9.0
-    does not build with that feature disabled. Tracked until upstream bumps `zip`.
+- **`zip` 8.6.0 -> 9.1.2, and no `zip` 7.x left in the tree.** `symbolic-debuginfo` 13.9.0 pulled
+  in `zip` 7.2.0 through its default `sourcebundle` feature, inside the advisories' vulnerable
+  range (<9.0.0), and neither 13.9.0 nor 14.0.0-alpha.4 builds with that feature off. The CLI now
+  takes `symbolic-common` / `symbolic-debuginfo` from `bugsee/symbolic` (upstream 13.9.0 plus
+  getsentry/symbolic#1097, the zip 7.2.0 -> 9 bump) as a pinned git dependency, until a
+  `symbolic` release includes that change. Also refreshes `rustls` (0.23.46), `tokio` (1.54),
+  `uuid`, `plist`, `memmap2`, `zstd-sys` and other transitive dependencies.
 
 ### Changed
+- **Symbol parsing comes from a pinned fork of `symbolic`** (see Security above); behaviour is
+  unchanged.
 - **MSRV raised to 1.89** (`rust-version`): `uuid` 1.29 requires it. Verified with
   `cargo +1.89 check --all-targets`.
 - **No ANSI colour codes in logs unless stderr is a terminal.** Xcode and Gradle build logs, CI
