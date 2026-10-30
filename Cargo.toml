@@ -1,6 +1,6 @@
 [package]
 name = "bugsee-cli"
-version = "0.8.1"
+version = "0.8.2"
 edition = "2021"
 # Real floor, not an aspiration: the locked tree requires 1.89 (`uuid`,
 # plus `gimli`, `globset`, `plist`, `time` at 1.88). Verify a bump with `cargo +<ver> check
@@ -116,8 +116,13 @@ futures-util = "0.3"
 # `code_id` (GNU build-id) the per-`.so` native upload reads is a stable,
 # major-13 value, so a newer minor here stays identifier-compatible with the
 # worker's 13.1.1.
-symbolic-common = "13.9.0"
-symbolic-debuginfo = "13.9.0"
+# TEMPORARY FORK: bugsee/symbolic branch `bugsee/13.9.0-zip9` = upstream 13.9.0 plus
+# getsentry/symbolic#1097 (zip 7.2.0 -> 9). Stock 13.9.0 pulls zip 7.2.0 through its
+# default `sourcebundle` feature, inside the advisory range (<9.0.0), and neither
+# 13.9.0 nor 14.0.0-alpha.4 builds with that feature off. Drop this and return to
+# crates.io once a symbolic release includes #1097. Tracking: https://github.com/bugsee/bugsee-cli/issues/96
+symbolic-common = { git = "https://github.com/bugsee/symbolic", rev = "326a05f91d5fc41cbd5c4f0d4144b7793dfee744" }
+symbolic-debuginfo = { git = "https://github.com/bugsee/symbolic", rev = "326a05f91d5fc41cbd5c4f0d4144b7793dfee744" }
 
 # Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
 # load-path lines). Used in cli/ios_deps.rs only.
