@@ -13,9 +13,36 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   in `zip` 7.2.0 through its default `sourcebundle` feature, inside the advisories' vulnerable
   range (<9.0.0), and neither 13.9.0 nor 14.0.0-alpha.4 builds with that feature off. The CLI now
   takes `symbolic-common` / `symbolic-debuginfo` from `bugsee/symbolic` (upstream 13.9.0 plus
-  getsentry/symbolic#1097, the zip 7.2.0 -> 9 bump) as a pinned git dependency, until a
-  `symbolic` release includes that change ([#96]). Also refreshes `rustls` (0.23.46), `tokio` (1.54),
+  getsentry/symbolic#1097, the zip 7.2.0 -> 9 bump, and a `zstd` 0.13 -> 0.14 bump) as a pinned
+  git dependency, until a `symbolic` release includes those changes ([#96]). Also refreshes `rustls` (0.23.46), `tokio` (1.54),
   `uuid`, `plist`, `memmap2`, `zstd-sys` and other transitive dependencies.
+- **Nine more RustSec advisories cleared; `cargo audit` reports none.** Each bump was read
+  against its upstream changelog and exercised against the live endpoints and real symbol files
+  (see Verification).
+  - `h2` 0.4.14 -> 0.4.20 (RUSTSEC-2026-0258). HTTP/2 client used by every upload. Hardening
+    only: bounded small-DATA-frame floods, a cap on HPACK table size, validated `content-length` /
+    `:status` / GOAWAY frames, flow-control and reset-limit accounting fixes. A compliant server
+    sees no change.
+  - `rustls-webpki` 0.103.15 -> 0.103.16 (RUSTSEC-2026-0382): rejects certificate paths through a
+    small set of distrusted intermediate public keys.
+  - `webpki-roots` 1.0.7 -> 1.0.11 (RUSTSEC-2026-0381): the bundled root store drops Atos
+    TrustedRoot 2011, SecureSign Root CA12 and three eMudhra emSign roots, and adds SECOM and Telia
+    TLS roots. None of them are in the chains of `api.bugsee.com`, `download.bugsee.com` or S3.
+  - `quinn-proto` 0.11.17 -> 0.11.19 (RUSTSEC-2026-0338, -0340, -0343). Lockfile-only: reached
+    through reqwest's optional HTTP/3 feature, which this crate does not enable, so it is never
+    compiled; bumped so the lockfile stops advertising it.
+  - `zstd` 0.13 -> 0.14.3, `zstd-safe` 7.2 -> 8.2 (RUSTSEC-2026-0391, -0398, -0403). Pulled in by
+    `symbolic-debuginfo`, not by this crate (which already used 0.14), so the fix is in the
+    fork. The only use is decompressing zstd-compressed ELF sections; the 0.14 breaking changes
+    (dictionary borrowing, license, bindgen) do not touch that call.
+
+### Verification
+- The stock-`symbolic` build and this build were compared on the same inputs: 2,160 CLI
+  invocations over 315 files and 45 directories (system Mach-O fat binaries and the `symbolic` and
+  repo fixtures) gave identical exit code, stdout and stderr; 30 real uploads (ELF, PDB, dSYM and
+  Rust flows) gave byte-identical registration bodies and uploaded packages.
+- `scripts/e2e_flows.py` passes against both, inside its peak-memory budgets; the new build reaches
+  `api.bugsee.com` and `download.bugsee.com` over TLS/HTTP2 with the same responses as before.
 
 ### Changed
 - **Symbol parsing comes from a pinned fork of `symbolic`** (see Security above); behaviour is

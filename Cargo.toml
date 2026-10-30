@@ -121,8 +121,8 @@ futures-util = "0.3"
 # default `sourcebundle` feature, inside the advisory range (<9.0.0), and neither
 # 13.9.0 nor 14.0.0-alpha.4 builds with that feature off. Drop this and return to
 # crates.io once a symbolic release includes #1097. Tracking: https://github.com/bugsee/bugsee-cli/issues/96
-symbolic-common = { git = "https://github.com/bugsee/symbolic", rev = "3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8" }
-symbolic-debuginfo = { git = "https://github.com/bugsee/symbolic", rev = "3e017ca69cb3d507f9fec92ab9ed61f092bdf7c8" }
+symbolic-common = { git = "https://github.com/bugsee/symbolic", rev = "326a05f91d5fc41cbd5c4f0d4144b7793dfee744" }
+symbolic-debuginfo = { git = "https://github.com/bugsee/symbolic", rev = "326a05f91d5fc41cbd5c4f0d4144b7793dfee744" }
 
 # Regex for the iOS deps text parsers (Cartfile.resolved lines and otool -L
 # load-path lines). Used in cli/ios_deps.rs only.
