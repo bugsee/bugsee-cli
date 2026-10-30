@@ -6,9 +6,20 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-10-30
+
+### Security
+- **`zip` 8.6.0 -> 9.1.2**, fixing the five open advisories against it (one critical, three high,
+  one moderate; patched in 9.0.0 / 9.0.5). Also refreshes `rustls` (0.23.46), `tokio` (1.54),
+  `uuid`, `plist`, `memmap2`, `zstd-sys` and other transitive dependencies.
+
 ### Changed
 - **MSRV raised to 1.89** (`rust-version`): `uuid` 1.29 requires it. Verified with
   `cargo +1.89 check --all-targets`.
+- **No ANSI colour codes in logs unless stderr is a terminal.** Xcode and Gradle build logs, CI
+  logs and the detached `bugsee-cli.log` no longer contain escape codes; a non-empty `NO_COLOR`
+  also turns colour off.
+- **The legacy `@bugsee/bugsee-cli` npm package is no longer published.** Use `@bugsee/cli`.
 
 ## [0.8.1] - 2026-10-08
 
