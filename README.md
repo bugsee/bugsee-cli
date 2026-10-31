@@ -46,20 +46,21 @@ The metadata-resolving subcommands print JSON (a bare string for `build-env xcod
 ```
 bugsee-cli debug-files upload <paths>... \
     --version <X> --build <Y> \
-    [--type proguard|rust|elf|dsym|pdb|sourcemaps|il2cpp-linemap] \
-    [--uuid <UUID>]   # required for elf; rejected for dsym/pdb/rust; IL2CPP module id(s), comma-separate for multi-ABI \
+    [--type proguard|rust|elf|dsym|pdb|portable-pdb|sourcemaps|il2cpp-linemap] \
+    [--uuid <UUID>]   # required for elf; rejected for dsym/pdb/portable-pdb/rust; IL2CPP module id(s), comma-separate for multi-ABI \
     [--il2cpp-uuid <UUID>] [--il2cpp-root <PATH>]  # il2cpp-linemap only \
+    [--shipped-dir <DIR>]  # portable-pdb only: the app's own copies of the assemblies \
     [--icon <PATH>]   # proguard only: attach launcher icon to the symbol zip \
     [--zstd-level N | --no-zstd]  # 9..=22, default 11; --no-zstd is diagnostic only
     [--extension <SUFFIX>]  # also match these file-name suffixes (repeatable / comma-separated), e.g. .so.sym
-    [--force]         # re-upload even if the server already has it (dsym/pdb/elf/rust/il2cpp-linemap/sourcemaps; proguard ignores it)
+    [--force]         # re-upload even if the server already has it (dsym/pdb/portable-pdb/elf/rust/il2cpp-linemap/sourcemaps; proguard ignores it)
     [--concurrency N] # sourcemaps only: ceiling on uploads in flight, 1..=32 (default: scaled)
     [--allow-empty]   # sourcemaps only: "nothing to upload" is success, not exit 10/11
     [--strip-sources-content]  # sourcemaps only: upload maps without the embedded source
     [--dry-run]
 ```
 
-The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, sourcemap, and Unity IL2CPP line-map types are working; `pe`, `portable-pdb`, `breakpad`, `jvm`, `sourcebundle` and `wasm` are scaffold-only and rejected (exit 20).
+The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, portable-PDB, sourcemap, and Unity IL2CPP line-map types are working; `pe`, `breakpad`, `jvm`, `sourcebundle` and `wasm` are scaffold-only and rejected (exit 20).
 
 `--extension <SUFFIX>` picks up files under a spelling the CLI does not know yet, IN ADDITION to each type's built-in names, so a toolchain change does not need a CLI release first. It matches the end of the whole name (`.so.sym` works), and each type's content check still applies to what it adds (ELF build-id, PDB container, dSYM `Contents/Resources/DWARF`). See `debug-files upload --help` for what it widens per type.
 
@@ -77,6 +78,27 @@ bugsee-cli debug-files upload path/to/Symbols/LineNumberMappings.json \
   --version 1.2.3 --build 45 \
   --uuid <arm64-build-id>,<armeabi-build-id>
 ```
+
+#### Unity Mono / .NET — `--type portable-pdb`
+
+A Unity Mono Release build ships no pdb, so the runtime prints managed frames as `at Ns.Type.Method (args) [0x0000b] in <MVID>:0`: a method, an IL offset and a module id, no file or line. `--type portable-pdb` takes the compiler's output (a `.dll` and its portable `.pdb`, found under the given directories, e.g. `Library/Bee/artifacts/...`) and uploads a BMF mapping keyed by that module id, so the server can turn the frame into `File.cs:42`.
+
+```sh
+# stripping Disabled: the shipped dll IS the compiler's, one directory is enough
+bugsee-cli debug-files upload Library/Bee/artifacts/1300b0aP.dag --type portable-pdb --version 1.2.3 --build 45
+
+# stripping Low or higher: the linker rewrote the dlls (a NEW module id), so also say where the shipped ones are
+bugsee-cli debug-files upload Library/Bee/artifacts/1300b0aP.dag --type portable-pdb --version 1.2.3 --build 45 \
+  --shipped-dir Library/Bee/artifacts/Android/ManagedStripped
+```
+
+- **The id is the shipped assembly's.** With `--shipped-dir`, each `X.dll` under the paths is paired with the `X.dll` there, and the mapping is registered under THAT module id, which is what the runtime prints. Methods are matched by full signature and IL offset, never by metadata token (the linker renumbers those). Methods the build removed, or whose IL size changed, are left out and counted in the log, since the compiler's offsets would be wrong for them.
+- **The pdb must belong to its assembly.** It is checked against the dll's CodeView entry; a pdb from another build exits 11 with nothing sent.
+- **Development builds work too.** They ship their pdbs and need nothing, but if the pdbs were stripped after the build the frames look like Release ones and these mappings resolve them.
+- A dll without a pdb beside it (Unity's own `UnityEngine.*`, the BCL) and files that are not .NET assemblies are skipped when scanning a directory. A named `.dll` or `.pdb` must have its partner.
+- Only portable PDBs are read (what Roslyn / Unity 2021+ emit): not Windows PDBs, not embedded ones. No `--uuid`: the identity comes from the assembly.
+
+See [`docs/unity-mono-portable-pdb.md`](docs/unity-mono-portable-pdb.md) for the BMF format and the design.
 
 #### Rust (Cargo) projects — `--type rust`
 
@@ -460,14 +482,16 @@ major**; `--version X.Y.Z` installs an exact version (a different major is allow
 best-effort (exit 0), so an integrator can run it on every build. Downloads come from
 `download.bugsee.com/cli`; override with `BUGSEE_CLI_UPDATE_BASE_URL` for an internal mirror.
 
-### `debug-files convert` (not yet implemented)
+### `debug-files convert`
 
 ```
-bugsee-cli debug-files convert <input> --to bmf|bsf --output <path>
+bugsee-cli debug-files convert <input>... --to bmf --output <dir> [--shipped-dir <dir>]
 ```
 
-Converts to Bugsee's legacy BMF/BSF formats, for existing deployments only. The arguments are fixed,
-but the command currently always fails with exit 1.
+Converts .NET assemblies and their portable PDBs to BMF, the same conversion `debug-files upload
+--type portable-pdb` does before it uploads, but writes the files (`<module id>.bmf`, one per
+assembly) into `--output` and sends nothing. `--shipped-dir` is as there. `--to bsf` is not
+implemented (exit 20).
 
 ### Global flags
 
@@ -570,6 +594,7 @@ published, still supported. New integrations should use `@bugsee/cli`.
 | [`docs/upload-unification.md`](docs/upload-unification.md) | Build-info bundle, chunked upload, cross-platform producers |
 | [`docs/upload-unification-activation.md`](docs/upload-unification-activation.md) | Rollout / activation |
 | [`docs/unity-il2cpp-linenumber-mappings.md`](docs/unity-il2cpp-linenumber-mappings.md) | Unity IL2CPP `LineNumberMappings.json` / MethodMap design (format `il2cpp-linemap`) |
+| [`docs/unity-mono-portable-pdb.md`](docs/unity-mono-portable-pdb.md) | Unity Mono / .NET: portable PDB -> BMF, and the BMF file format (format `bmf`) |
 
 ## Layout
 
