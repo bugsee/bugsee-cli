@@ -100,7 +100,9 @@ stdout outside a command's defined output.
 Integrators branch on the exit code (e.g. to decide whether to fall back to their
 in-language path). The ranges are public: `0` success; `1`/`2` structural (caller
 should fall back); `10–39` substantive failures (no fallback); `40` a deliberate
-build gate (size-check). Changing a code's meaning is a breaking change that must
+build gate (size-check); `50` an internal error (a panic) after a request may have been sent. A
+panic is never allowed to exit `101`: before any request it exits `1` (fallback is safe), after
+one it exits `50` (server state unknown, no fallback). Changing a code's meaning is a breaking change that must
 be coordinated across every consumer — add new codes, never repurpose old ones.
 
 ### Wire shapes are a public contract

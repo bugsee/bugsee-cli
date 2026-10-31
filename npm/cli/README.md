@@ -74,8 +74,8 @@ const metadata = JSON.parse(out.stdout);
 [stable, documented code](https://github.com/bugsee/bugsee-cli#exit-code-contract)
 and the launcher forwards it unchanged (`0` success, `1`/`2` structural — the
 caller should fall back, `10`–`39` substantive failures, `40` a deliberate build
-gate). A launcher that cannot find a binary at all exits `1`, which is the
-"structural, fall back" case by that same contract.
+gate, `50` an internal error after a request may have been sent). A launcher
+that cannot find a binary at all exits `1`, which is the "structural, fall back" case by that same contract.
 
 ## Other install channels
 

@@ -18,6 +18,28 @@ use exit_code::ExitCode;
 // forking thread survives, leaving the runtime deadlock-prone). So we parse,
 // optionally double-fork, THEN build the runtime in the surviving process.
 fn main() {
+    // A panic must never reach the OS as exit 101: that is outside the contract, so every
+    // integrator reads it as a substantive failure. Catch it here and map it by phase. This is
+    // `catch_unwind`, not a panic hook, on purpose: a hook would also fire for panics the code
+    // already contains (a joined thread, a `JoinError`) and turn them into an exit.
+    // Needs `panic = "unwind"` (the default; nothing in this crate sets `abort`).
+    if std::panic::catch_unwind(run).is_err() {
+        // The default hook has already printed the message and location to stderr.
+        let code = ExitCode::for_panic(upload::http::request_sent());
+        eprintln!(
+            "error: internal error (panic); exiting {} ({})",
+            code.as_i32(),
+            if code.should_fallback() {
+                "no request had been sent"
+            } else {
+                "a request may have been sent; server state unknown"
+            }
+        );
+        std::process::exit(code.as_i32());
+    }
+}
+
+fn run() {
     let cli = match cli::Cli::try_parse() {
         Ok(cli) => cli,
         Err(e) => {
