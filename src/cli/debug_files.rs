@@ -28,8 +28,8 @@ pub enum DebugFilesCommand {
         paths: Vec<PathBuf>,
 
         /// Restrict discovery to a specific debug-file type. If unset, defaults to `proguard`.
-        /// Supported: `proguard`, `rust`, `elf`, `dsym`, `pdb`, `sourcemaps`,
-        /// `il2cpp-linemap`; other types are scaffold-only. For a Cargo project use
+        /// Supported: `proguard`, `rust`, `elf`, `dsym`, `pdb`, `portable-pdb`,
+        /// `sourcemaps`, `il2cpp-linemap`; other types are scaffold-only. For a Cargo project use
         /// `--type rust`, which discovers whichever format the target produced
         /// (`.dSYM` / `.pdb` / build-id ELF) and reports the build settings needed
         /// when it finds none.
@@ -53,9 +53,9 @@ pub enum DebugFilesCommand {
         /// from what the CLI would have computed, a warning is logged but the
         /// override wins.
         ///
-        /// Required for `--type elf`; REJECTED for `--type dsym` and
-        /// `--type pdb`, whose identity is read out of the file itself and
-        /// could never match an override at crash time.
+        /// Required for `--type elf`; REJECTED for `--type dsym`, `--type pdb`
+        /// and `--type portable-pdb`, whose identity is read out of the file
+        /// itself and could never match an override at crash time.
         ///
         /// For `--type sourcemaps`, the id keys EVERY map found — meant for a
         /// single map passed by path (e.g. a React Native bundle's), and it
@@ -141,6 +141,19 @@ pub enum DebugFilesCommand {
         #[arg(long)]
         strip_sources_content: bool,
 
+        /// The app's own copies of the assemblies in PATHS. `--type portable-pdb` only.
+        ///
+        /// Unity's Mono Release builds ship no pdb, and with managed stripping on, the linker
+        /// rewrites each dll (a new module id, the same method bodies). The runtime prints that
+        /// shipped module id in every frame, so it is the key the symbols must carry. Point this at
+        /// the directory holding the shipped dlls (`Library/Bee/artifacts/Android/ManagedStripped`,
+        /// or `assets/bin/Data/Managed` of an unpacked APK); each assembly in PATHS is paired with
+        /// the dll of the same file name there. Methods the build removed, or whose IL it changed,
+        /// are left out and reported. Without it the dlls in PATHS are taken to be what ships
+        /// (Unity with managed stripping disabled, where the two are identical).
+        #[arg(long, value_name = "DIR")]
+        shipped_dir: Option<PathBuf>,
+
         /// Also pick up files whose name ends in SUFFIX, in addition to the names the
         /// chosen `--type` already recognizes. Repeat the flag or comma-separate values;
         /// a missing leading `.` is added (`so.sym` = `.so.sym`).
@@ -169,19 +182,29 @@ pub enum DebugFilesCommand {
         dry_run: bool,
     },
 
-    /// Convert a debug-file to Bugsee's legacy BMF/BSF format (existing deployments only; NOT YET IMPLEMENTED).
+    /// Convert .NET assemblies and their portable PDBs to Bugsee's BMF mapping format.
+    ///
+    /// `--to bmf` writes one `<module id>.bmf` per assembly into `--output` (what
+    /// `debug-files upload --type portable-pdb` uploads). `--to bsf` is not implemented.
     Convert {
-        /// Input debug-file to convert (e.g. a Windows PDB or Mono MDB).
+        /// The compiler's output: directories (scanned recursively) or `.dll` / `.pdb` files.
+        /// Every `X.dll` needs its portable `X.pdb` beside it; a dll with none (Unity's own
+        /// assemblies) is skipped when scanning a directory.
         #[arg(required = true)]
-        input: PathBuf,
+        input: Vec<PathBuf>,
 
-        /// Target legacy format to convert to.
+        /// Target format to convert to.
         #[arg(long, value_enum)]
         to: LegacyFormat,
 
-        /// Output path for the converted file.
+        /// Directory to write the converted files to (created if missing).
         #[arg(long)]
         output: PathBuf,
+
+        /// The app's own copies of the assemblies in INPUT, when the build rewrites them; see
+        /// `debug-files upload --help`.
+        #[arg(long, value_name = "DIR")]
+        shipped_dir: Option<PathBuf>,
     },
 }
 
@@ -196,7 +219,10 @@ pub enum DebugFileType {
     /// Windows PDB — the debug info a `*-pc-windows-msvc` build emits next to
     /// the binary. Keyed by the PDB debug id (GUID + age).
     Pdb,
-    /// .NET Portable PDB (scaffold — not yet processed).
+    /// .NET Portable PDB, for the Mono runtime (Unity Mono, Xamarin): each assembly and its
+    /// `.pdb`, converted to a BMF mapping keyed by the module id (MVID) the runtime prints
+    /// in its frames. PATHS are the compiler's output; see `--shipped-dir` for builds that rewrite
+    /// the assemblies. A pdb that does not belong to its assembly exits 11 and uploads nothing.
     PortablePdb,
     /// Breakpad symbol file (scaffold — not yet processed).
     Breakpad,
@@ -233,9 +259,9 @@ pub enum DebugFileType {
 
 #[derive(ValueEnum, Debug, Clone, Copy)]
 pub enum LegacyFormat {
-    /// Convert to the legacy BMF container.
+    /// Convert to the BMF container (Bugsee Mapping File, for .NET / Mono).
     Bmf,
-    /// Convert to the legacy BSF container.
+    /// Convert to the legacy BSF container (not implemented).
     Bsf,
 }
 
@@ -251,6 +277,7 @@ pub async fn dispatch(
             version,
             build,
             uuid: uuid_override,
+            shipped_dir,
             il2cpp_uuids,
             il2cpp_root,
             icon,
@@ -270,12 +297,13 @@ pub async fn dispatch(
                 DebugFileType::Elf => {}
                 DebugFileType::Dsym => {}
                 DebugFileType::Pdb => {}
+                DebugFileType::PortablePdb => {}
                 DebugFileType::Sourcemaps => {}
                 DebugFileType::Il2cppLinemap => {}
                 other => {
                     return Err(config_invalid(format!(
                         "supported types are --type proguard, rust, elf, dsym, pdb, \
-                         sourcemaps, and il2cpp-linemap; got {other:?} (other formats \
+                         portable-pdb, sourcemaps, and il2cpp-linemap; got {other:?} (other formats \
                          are scaffold-only)"
                     )));
                 }
@@ -342,6 +370,18 @@ pub async fn dispatch(
                     "--uuid does not apply to --type pdb — the identity is the PDB's own \
                      debug id (GUID + age), read from the container; an override could \
                      never match what a crashing Windows module reports",
+                ));
+            }
+            if kind == DebugFileType::PortablePdb && parsed_override.is_some() {
+                return Err(config_invalid(
+                    "--uuid does not apply to --type portable-pdb — the identity is the module \
+                     id (MVID) of the shipped assembly, which is what the Mono runtime prints \
+                     in every frame; an override could never match it",
+                ));
+            }
+            if kind != DebugFileType::PortablePdb && shipped_dir.is_some() {
+                return Err(config_invalid(
+                    "--shipped-dir is only valid for --type portable-pdb",
                 ));
             }
             if kind == DebugFileType::Rust && parsed_override.is_some() {
@@ -414,6 +454,21 @@ pub async fn dispatch(
                 .await;
             }
 
+            if kind == DebugFileType::PortablePdb {
+                return super::portable_pdb::run_upload(
+                    &paths,
+                    shipped_dir.as_deref(),
+                    &endpoint,
+                    &app_token,
+                    &version,
+                    &build,
+                    strategy,
+                    force,
+                    dry_run,
+                )
+                .await;
+            }
+
             if kind == DebugFileType::Rust {
                 return run_rust_upload(
                     &paths, &endpoint, &app_token, &version, &build, strategy, force, &extra,
@@ -474,15 +529,19 @@ pub async fn dispatch(
             )
             .await
         }
-        DebugFilesCommand::Convert { input, to, output } => {
-            tracing::info!(
-                ?input,
-                ?to,
-                ?output,
-                "debug-files convert — not yet implemented"
-            );
-            anyhow::bail!("convert not yet implemented")
-        }
+        DebugFilesCommand::Convert {
+            input,
+            to,
+            output,
+            shipped_dir,
+        } => match to {
+            LegacyFormat::Bmf => {
+                super::portable_pdb::run_convert(&input, shipped_dir.as_deref(), &output)
+            }
+            LegacyFormat::Bsf => Err(config_invalid(
+                "--to bsf is not implemented; only --to bmf is supported",
+            )),
+        },
     }
 }
 
