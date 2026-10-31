@@ -26,7 +26,11 @@ fn main() {
     if std::panic::catch_unwind(run).is_err() {
         // The default hook has already printed the message and location to stderr.
         let code = ExitCode::for_panic(upload::http::request_sent());
-        eprintln!(
+        // `writeln!` to a discarded result, not `eprintln!`: that panics when stderr is closed,
+        // and a panic here is outside `catch_unwind` (it would exit 101 again).
+        use std::io::Write;
+        let _ = writeln!(
+            std::io::stderr(),
             "error: internal error (panic); exiting {} ({})",
             code.as_i32(),
             if code.should_fallback() {

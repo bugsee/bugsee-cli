@@ -86,3 +86,79 @@ fn no_panic_keeps_the_normal_exit_codes() {
     let out = common::cli().arg("--no-such-flag").output().unwrap();
     assert_eq!(out.status.code(), Some(2));
 }
+
+/// Two source maps, uploaded one at a time (`--concurrency 1`), so the second map's blocking pack
+/// step runs after the first map's requests have gone out.
+async fn sourcemap_upload_with_panic(
+    server: &MockServer,
+    point: &'static str,
+) -> (Option<i32>, String) {
+    let tmp = tempfile::tempdir().unwrap();
+    for i in 1..=2 {
+        std::fs::write(
+            tmp.path().join(format!("m{i}.js.map")),
+            format!(
+                r#"{{"version":3,"debug_id":"2222222{i}-2222-2222-2222-222222222222","sources":["a.js"],"mappings":"AAAA"}}"#
+            ),
+        )
+        .unwrap();
+    }
+    let endpoint = server.uri();
+    tokio::task::spawn_blocking(move || {
+        let out = common::cli()
+            .env("BUGSEE_CLI_TEST_PANIC", point)
+            .args(["--endpoint", &endpoint, "--app-token", "TKN"])
+            .args(["debug-files", "upload", "--type", "sourcemaps"])
+            .args(["--version", "1", "--build", "1", "--concurrency", "1"])
+            .arg(tmp.path())
+            .output()
+            .unwrap();
+        (
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    })
+    .await
+    .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_task_panic_before_any_request_exits_1() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let (code, stderr) = sourcemap_upload_with_panic(&server, "blocking").await;
+    assert_eq!(code, Some(1), "stderr: {stderr}");
+    assert!(
+        stderr.contains("injected test panic (blocking)"),
+        "{stderr}"
+    );
+}
+
+/// The case a `JoinError` wrapped as an ordinary error would get wrong: the first map's requests
+/// are out, then a blocking task panics. Must be 50, not the fallback code 1.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn blocking_task_panic_after_requests_were_sent_exits_50() {
+    let server = MockServer::start().await;
+    let put_url = format!("{}/put/sym", server.uri());
+    Mock::given(method("POST"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_json(serde_json::json!({"code": 0, "endpoint": put_url})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&server)
+        .await;
+    let (code, stderr) = sourcemap_upload_with_panic(&server, "blocking-after-send").await;
+    assert_eq!(code, Some(50), "stderr: {stderr}");
+    assert!(
+        stderr.contains("injected test panic (blocking-after-send)"),
+        "{stderr}"
+    );
+}

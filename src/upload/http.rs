@@ -79,11 +79,11 @@ impl RetryPolicy {
     }
 }
 
-/// Build the shared reqwest client for the upload subcommands.
-/// Set the moment the first network request that could change server state is about to leave the
-/// process, and never cleared. `main` reads it when a panic escapes, to tell "the CLI died before it
+/// Set the moment the first network request is about to leave the process, and never cleared. `main` reads it when a panic escapes, to tell "the CLI died before it
 /// asked the server for anything" (an integrator may safely fall back) from "it died with a request
-/// possibly in flight" (the server's state is unknown, so nobody may redo the work blindly).
+/// possibly in flight" (the server's state is unknown, so nobody may redo the work blindly). It is
+/// deliberately coarse: ANY request counts, including a read-only GET, because over-reporting only
+/// costs a fallback that would have been safe, while under-reporting could double-register a build.
 static REQUEST_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 /// Whether any request has (possibly) been sent by this process. See [`REQUEST_SENT`].
@@ -93,6 +93,7 @@ pub fn request_sent() -> bool {
 
 /// Test-only fault injection (debug builds only; compiled out of release): `BUGSEE_CLI_TEST_PANIC`
 /// = `before-send` panics ahead of the request, `after-send` right after the response arrives.
+/// [`test_panic_in_blocking`] covers the `spawn_blocking` pack step.
 #[cfg(debug_assertions)]
 fn test_panic(point: &str) {
     if std::env::var("BUGSEE_CLI_TEST_PANIC").as_deref() == Ok(point) {
@@ -102,6 +103,22 @@ fn test_panic(point: &str) {
 #[cfg(not(debug_assertions))]
 fn test_panic(_point: &str) {}
 
+/// Fault injection inside a `spawn_blocking` closure: `blocking` always panics,
+/// `blocking-after-send` only once a request has been sent. Debug builds only.
+#[cfg(debug_assertions)]
+pub fn test_panic_in_blocking() {
+    match std::env::var("BUGSEE_CLI_TEST_PANIC").as_deref() {
+        Ok("blocking") => panic!("injected test panic (blocking)"),
+        Ok("blocking-after-send") if request_sent() => {
+            panic!("injected test panic (blocking-after-send)")
+        }
+        _ => {}
+    }
+}
+#[cfg(not(debug_assertions))]
+pub fn test_panic_in_blocking() {}
+
+/// Build the shared reqwest client for the upload subcommands.
 pub fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)

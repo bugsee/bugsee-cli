@@ -512,6 +512,7 @@ Stable. Integrators (Gradle plugin, fastlane plugin, iOS SDK BugseeAgent) use th
 | 40    | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
 | 41–49 | Reserved.                                                            | no                       |
 | 50    | Internal error: the CLI panicked AFTER a request may have been sent (server state unknown). A panic BEFORE any request exits **1** instead. Never 101. | no |
+| 51+   | Reserved.                                                            | no                       |
 
 An unknown or malformed flag is clap's usage error, exit 2; exit 20 is a valid flag the CLI rejects in combination. If the binary is killed by a signal, the npm launcher reports `128 + signum`, which falls in the reserved range.
 

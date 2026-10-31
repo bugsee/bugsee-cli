@@ -18,6 +18,7 @@
 //! | 40     | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
 //! | 41–49  | Reserved.                                                            | no                       |
 //! | 50     | Internal error (a Rust panic) AFTER a request may have been sent.    | no                       |
+//! | 51+    | Reserved.                                                            | no                       |
 //!
 //! A panic BEFORE any request was sent exits 1 (the CLI never got a fair chance, nothing was
 //! changed server-side, so falling back is safe). A panic once a request may be in flight exits 50:
@@ -62,14 +63,6 @@ impl ExitCode {
         self as i32
     }
 
-    /// Whether an integrating plugin should fall back to its in-language
-    /// uploader when the CLI exits with this code. See the module-level
-    /// table for the rationale.
-    ///
-    /// Not invoked by the binary itself — it's the contract integrators
-    /// (Gradle plugin, MSBuild, etc.) consume by re-deriving the same
-    /// rule against this CLI's exit code, or by depending on this crate
-    /// as a library and calling this method directly.
     /// The code a panic maps to, given whether any request was sent first.
     pub fn for_panic(request_sent: bool) -> ExitCode {
         if request_sent {
@@ -79,7 +72,13 @@ impl ExitCode {
         }
     }
 
-    #[allow(dead_code)]
+    /// Whether an integrating plugin should fall back to its in-language
+    /// uploader when the CLI exits with this code. See the module-level
+    /// table for the rationale.
+    ///
+    /// Integrators (Gradle plugin, MSBuild, etc.) consume this contract by
+    /// re-deriving the same rule against the CLI's exit code. The binary itself
+    /// only uses it to describe a panic exit.
     pub fn should_fallback(self) -> bool {
         matches!(self, ExitCode::Unexpected | ExitCode::Usage)
     }
