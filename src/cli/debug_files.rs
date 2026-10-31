@@ -1607,6 +1607,17 @@ struct SourcemapUploadCtx<'a> {
     strip_sources_content: bool,
 }
 
+/// Turn a `spawn_blocking` join failure into an error, EXCEPT a panic: that is re-raised on this task
+/// so it unwinds to `main`'s `catch_unwind` and is classified by phase (exit 1 before any request,
+/// 50 after). Returned as an `anyhow` error it would be the generic `Unexpected` (exit 1, "fall
+/// back") even when other maps' requests had already gone out.
+fn blocking_failed(e: tokio::task::JoinError, what: &str, map_path: &Path) -> anyhow::Error {
+    match e.try_into_panic() {
+        Ok(payload) => std::panic::resume_unwind(payload),
+        Err(e) => anyhow::anyhow!("{what} {} failed to run: {e}", map_path.display()),
+    }
+}
+
 /// Pack ONE `.map` and register + PUT it. `None` when this was a dry run (packed, never sent).
 async fn upload_one_sourcemap(
     client: Option<&reqwest::Client>,
@@ -1644,7 +1655,7 @@ async fn upload_one_sourcemap(
             stripped_copy_without_sources(&owned_path, &tmp_owned, strip)
         })
         .await
-        .map_err(|e| anyhow::anyhow!("stripping {} failed to run: {e}", map_path.display()))??
+        .map_err(|e| blocking_failed(e, "stripping", map_path))??
     };
     let (map_path, identity) = match stripped.as_ref() {
         Some((path, id)) => (path.as_path(), id),
@@ -1660,11 +1671,12 @@ async fn upload_one_sourcemap(
         ctx.strategy,
     );
     let zip_size = tokio::task::spawn_blocking(move || {
+        http::test_panic_in_blocking();
         let entries = vec![ZipEntry::compressed(&entry_name, &map_owned)];
         compress::pack_entries(&entries, &zip_owned, strategy)
     })
     .await
-    .map_err(|e| anyhow::anyhow!("packing {} failed to run: {e}", map_path.display()))??;
+    .map_err(|e| blocking_failed(e, "packing", map_path))??;
     tracing::info!(path = %map_path.display(), zip_size, strategy = ?ctx.strategy, "packed");
 
     if dry_run {
@@ -4565,5 +4577,36 @@ mod extra_suffix_discovery_tests {
             discover_dsyms(std::slice::from_ref(&custom), &extra(&[".symbols"])),
             vec![custom]
         );
+    }
+}
+
+#[cfg(test)]
+mod blocking_failed_tests {
+    use super::*;
+
+    /// A panic inside `spawn_blocking` must surface as a PANIC on the awaiting task (so `main`
+    /// classifies it by phase), not as a generic error that would map to exit 1 after requests went out.
+    #[tokio::test]
+    #[should_panic(expected = "boom in blocking")]
+    async fn a_blocking_panic_is_reraised_not_wrapped() {
+        let join = tokio::task::spawn_blocking(|| -> u8 { panic!("boom in blocking") })
+            .await
+            .map_err(|e| blocking_failed(e, "packing", Path::new("x.map")));
+        // Unreachable if the panic is re-raised from inside the map_err above.
+        panic!("expected a re-raised panic, got {join:?}");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_blocking_task_is_an_error() {
+        let handle = tokio::spawn(async {
+            tokio::task::spawn_blocking(|| std::thread::sleep(std::time::Duration::from_millis(50)))
+                .await
+        });
+        handle.abort();
+        // Build a cancelled JoinError the supported way: abort a task and await it.
+        let e = handle.await.unwrap_err();
+        assert!(e.is_cancelled());
+        let err = blocking_failed(e, "packing", Path::new("x.map"));
+        assert!(err.to_string().contains("packing x.map failed to run"));
     }
 }

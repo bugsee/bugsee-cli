@@ -441,6 +441,7 @@ async fn fetch_text(url: &str) -> anyhow::Result<String> {
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
+    crate::upload::http::mark_request_sent();
     let resp = client.get(url).send().await?.error_for_status()?;
     if resp
         .content_length()
@@ -461,6 +462,7 @@ async fn install(base: &str, version: &str, triple: &str, dest: &Path) -> anyhow
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()?;
 
+    crate::upload::http::mark_request_sent();
     let resp = client.get(&art_url).send().await?.error_for_status()?;
     if resp
         .content_length()

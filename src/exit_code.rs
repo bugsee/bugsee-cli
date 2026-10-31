@@ -16,7 +16,14 @@
 //! | 20–29  | Configuration problems (missing/rejected token, bad flag combo).     | no                       |
 //! | 30–39  | Upload problems (network, server 4xx/5xx).                            | no                       |
 //! | 40     | Build gate failed deliberately (e.g. size-check FAIL).               | no                       |
-//! | 41+    | Reserved.                                                            | no                       |
+//! | 41–49  | Reserved.                                                            | no                       |
+//! | 50     | Internal error (a Rust panic) AFTER a request may have been sent.    | no                       |
+//! | 51+    | Reserved.                                                            | no                       |
+//!
+//! A panic BEFORE any request was sent exits 1 (the CLI never got a fair chance, nothing was
+//! changed server-side, so falling back is safe). A panic once a request may be in flight exits 50:
+//! the server's state is unknown, so an integrator must not redo the work blindly (a build
+//! registration would be duplicated). A panic is never allowed to surface as 101.
 //!
 //! The rationale for `should_fallback`: codes 1 and 2 indicate the CLI never
 //! got a fair chance to run. Codes ≥ 10 indicate a substantive failure that
@@ -44,6 +51,11 @@ pub enum ExitCode {
     /// structural CLI failure, so an integrating bootstrapper must propagate it
     /// as a build failure rather than fall back to its in-language path.
     SizeCheckFailed = 40,
+
+    /// The CLI panicked after at least one request may have left the process. Terminal and NOT a
+    /// fallback trigger: the server may or may not have applied the request. (A panic before any
+    /// request exits `Unexpected` instead.)
+    InternalAfterSend = 50,
 }
 
 impl ExitCode {
@@ -51,15 +63,22 @@ impl ExitCode {
         self as i32
     }
 
+    /// The code a panic maps to, given whether any request was sent first.
+    pub fn for_panic(request_sent: bool) -> ExitCode {
+        if request_sent {
+            ExitCode::InternalAfterSend
+        } else {
+            ExitCode::Unexpected
+        }
+    }
+
     /// Whether an integrating plugin should fall back to its in-language
     /// uploader when the CLI exits with this code. See the module-level
     /// table for the rationale.
     ///
-    /// Not invoked by the binary itself — it's the contract integrators
-    /// (Gradle plugin, MSBuild, etc.) consume by re-deriving the same
-    /// rule against this CLI's exit code, or by depending on this crate
-    /// as a library and calling this method directly.
-    #[allow(dead_code)]
+    /// Integrators (Gradle plugin, MSBuild, etc.) consume this contract by
+    /// re-deriving the same rule against the CLI's exit code. The binary itself
+    /// only uses it to describe a panic exit.
     pub fn should_fallback(self) -> bool {
         matches!(self, ExitCode::Unexpected | ExitCode::Usage)
     }
@@ -84,6 +103,15 @@ mod tests {
         // A size-check FAIL is terminal, NOT a fallback trigger — re-running via
         // the in-language path would skip the gate and not fail the build.
         assert!(!ExitCode::SizeCheckFailed.should_fallback());
+        assert!(!ExitCode::InternalAfterSend.should_fallback());
+    }
+
+    #[test]
+    fn a_panic_maps_by_phase() {
+        assert_eq!(ExitCode::for_panic(false), ExitCode::Unexpected);
+        assert!(ExitCode::for_panic(false).should_fallback());
+        assert_eq!(ExitCode::for_panic(true), ExitCode::InternalAfterSend);
+        assert!(!ExitCode::for_panic(true).should_fallback());
     }
 
     #[test]
@@ -100,5 +128,6 @@ mod tests {
         assert_eq!(ExitCode::UploadServer.as_i32(), 30);
         assert_eq!(ExitCode::UploadTransport.as_i32(), 31);
         assert_eq!(ExitCode::SizeCheckFailed.as_i32(), 40);
+        assert_eq!(ExitCode::InternalAfterSend.as_i32(), 50);
     }
 }

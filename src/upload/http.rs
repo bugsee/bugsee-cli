@@ -79,6 +79,51 @@ impl RetryPolicy {
     }
 }
 
+/// Set the moment the first network request is about to leave the process, and never cleared. `main` reads it when a panic escapes, to tell "the CLI died before it
+/// asked the server for anything" (an integrator may safely fall back) from "it died with a request
+/// possibly in flight" (the server's state is unknown, so nobody may redo the work blindly). It is
+/// deliberately coarse: ANY request counts, including a read-only GET, because over-reporting only
+/// costs a fallback that would have been safe, while under-reporting could double-register a build.
+static REQUEST_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a request is about to leave the process. `send_with_retry` does this itself; the few
+/// callers that send directly (the size-check baseline GET, the self-update downloads) call it too.
+pub fn mark_request_sent() {
+    REQUEST_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether any request has (possibly) been sent by this process. See [`REQUEST_SENT`].
+pub fn request_sent() -> bool {
+    REQUEST_SENT.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Test-only fault injection (debug builds only; compiled out of release): `BUGSEE_CLI_TEST_PANIC`
+/// = `before-send` panics ahead of the request, `after-send` right after the response arrives.
+/// [`test_panic_in_blocking`] covers the `spawn_blocking` pack step.
+#[cfg(debug_assertions)]
+fn test_panic(point: &str) {
+    if std::env::var("BUGSEE_CLI_TEST_PANIC").as_deref() == Ok(point) {
+        panic!("injected test panic ({point})");
+    }
+}
+#[cfg(not(debug_assertions))]
+fn test_panic(_point: &str) {}
+
+/// Fault injection inside a `spawn_blocking` closure: `blocking` always panics,
+/// `blocking-after-send` only once a request has been sent. Debug builds only.
+#[cfg(debug_assertions)]
+pub fn test_panic_in_blocking() {
+    match std::env::var("BUGSEE_CLI_TEST_PANIC").as_deref() {
+        Ok("blocking") => panic!("injected test panic (blocking)"),
+        Ok("blocking-after-send") if request_sent() => {
+            panic!("injected test panic (blocking-after-send)")
+        }
+        _ => {}
+    }
+}
+#[cfg(not(debug_assertions))]
+pub fn test_panic_in_blocking() {}
+
 /// Build the shared reqwest client for the upload subcommands.
 pub fn build_client() -> Result<reqwest::Client> {
     reqwest::Client::builder()
@@ -123,8 +168,12 @@ where
 {
     let mut attempt = 1u32;
     loop {
+        test_panic("before-send");
+        // Before, not after: once `send()` is polled the bytes may be on the wire.
+        mark_request_sent();
         match make().send().await {
             Ok(resp) => {
+                test_panic("after-send");
                 let status = resp.status();
                 // A 429 is retried even when `retry_on_status` is false. That flag exists to protect
                 // NON-IDEMPOTENT requests, where a 5xx may mean the server processed the request and

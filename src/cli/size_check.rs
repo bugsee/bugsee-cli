@@ -284,6 +284,7 @@ async fn fetch_baseline(
     }
 
     let client = http::build_client().ok()?;
+    http::mark_request_sent();
     let resp = match client.get(&url).query(&query).send().await {
         Ok(r) => r,
         Err(e) => {

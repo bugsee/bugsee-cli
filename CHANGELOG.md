@@ -6,6 +6,18 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- **A Rust panic no longer exits 101.** 101 is outside the exit-code contract, so every integrator
+  read it as a substantive failure: the Gradle plugin (bugsee/bugsee-android-gradle-plugin#96) did
+  not fall back to its Kotlin uploader, and the iOS `BugseeAgent` did not either. A panic is now
+  caught in `main` and mapped by phase. Before any network request was sent (a read-only GET counts too, so
+  the answer errs towards "may have been sent") it exits **1** (`Unexpected`), which every integrator already treats as "fall back". Once a request may have
+  been sent it exits the new code **50** (`InternalAfterSend`): the server's state is unknown, so
+  nothing may redo the work blindly (a build registration would be duplicated). 50 is in the
+  reserved no-fallback range, so an older integrator treats it as a substantive failure, exactly as
+  it treated 101. A panic inside a `spawn_blocking` task (sourcemap strip/pack) is re-raised so it is
+  classified the same way. The message and location still go to stderr. No other exit code changes.
+
 ## [0.8.2] - 2026-10-30
 
 ### Security
