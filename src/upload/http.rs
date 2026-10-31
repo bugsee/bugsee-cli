@@ -86,6 +86,12 @@ impl RetryPolicy {
 /// costs a fallback that would have been safe, while under-reporting could double-register a build.
 static REQUEST_SENT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Record that a request is about to leave the process. `send_with_retry` does this itself; the few
+/// callers that send directly (the size-check baseline GET, the self-update downloads) call it too.
+pub fn mark_request_sent() {
+    REQUEST_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Whether any request has (possibly) been sent by this process. See [`REQUEST_SENT`].
 pub fn request_sent() -> bool {
     REQUEST_SENT.load(std::sync::atomic::Ordering::SeqCst)
@@ -164,7 +170,7 @@ where
     loop {
         test_panic("before-send");
         // Before, not after: once `send()` is polled the bytes may be on the wire.
-        REQUEST_SENT.store(true, std::sync::atomic::Ordering::SeqCst);
+        mark_request_sent();
         match make().send().await {
             Ok(resp) => {
                 test_panic("after-send");

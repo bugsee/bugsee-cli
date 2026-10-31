@@ -24,6 +24,9 @@ path = "src/main.rs"
 dist = true
 
 [profile.release]
+# Do NOT set `panic = "abort"` here (or in `dist`): `main`'s `catch_unwind` maps a panic to exit 1/50
+# (see src/exit_code.rs); aborting would turn it back into a signal exit (134) that no integrator
+# understands. The panic tests are compiled out of release builds, so nothing else would notice.
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
