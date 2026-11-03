@@ -301,6 +301,30 @@ fn convert_writes_one_bmf_per_assembly() {
 }
 
 #[test]
+fn naming_the_same_assembly_twice_is_not_an_error() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = compiler_dir(tmp.path());
+    let out_dir = tmp.path().join("out");
+    let dll = dir.join("BugseeSample.dll");
+    let pdb = dir.join("BugseeSample.pdb");
+    // the directory, the dll and the pdb are all the one assembly; so is a second copy
+    let again = tmp.path().join("again");
+    std::fs::create_dir_all(&again).unwrap();
+    for name in ["BugseeSample.dll", "BugseeSample.pdb"] {
+        std::fs::copy(fixture(name), again.join(name)).unwrap();
+    }
+    let out = common::cli()
+        .args(["debug-files", "convert"])
+        .args([&dir, &dll, &pdb, &again])
+        .args(["--to", "bmf", "--output"])
+        .arg(&out_dir)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(std::fs::read_dir(&out_dir).unwrap().count(), 1);
+}
+
+#[test]
 fn a_named_assembly_without_its_pdb_is_input_not_found() {
     let tmp = tempfile::tempdir().unwrap();
     let dll = tmp.path().join("Lonely.dll");
@@ -375,6 +399,14 @@ fn flags_that_do_not_apply_are_configuration_errors() {
         (
             upload_args(&[&dir], &["--uuid", uuid, "--dry-run"]),
             "--uuid does not apply to --type portable-pdb",
+        ),
+        (
+            upload_args(&[&dir], &["--extension", ".exe", "--dry-run"]),
+            "--extension does not apply to --type portable-pdb",
+        ),
+        (
+            upload_args(&[&dir], &["--il2cpp-uuid", uuid, "--dry-run"]),
+            "--il2cpp-uuid and --il2cpp-root are only valid for --type il2cpp-linemap",
         ),
         (
             vec![

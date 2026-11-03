@@ -39,6 +39,9 @@ pub struct Stats {
     pub dropped_il_mismatch: usize,
     /// Methods whose sequence points could not be decoded.
     pub damaged: usize,
+    /// Types the walk refused to enter: a damaged `NestedClass` table or async-state-machine
+    /// attribute made them contain themselves, or nest absurdly deep.
+    pub skipped_types: usize,
 }
 
 pub struct Converted {
@@ -291,7 +294,16 @@ struct Walk<'a, 'm> {
     files: Vec<String>,
     methods: Vec<Method>,
     stats: Stats,
+    /// Types currently being walked (a type must not contain itself), the depth of that walk, and
+    /// how many more types the walk may enter. A damaged table can say anything, and the walk is
+    /// recursive: none of this may reach the stack's end or a runaway loop.
+    active: HashSet<u32>,
+    depth: usize,
+    budget: usize,
 }
+
+/// Real nesting is a handful of levels (`Outer+Inner`, a lambda's display class inside it).
+const MAX_TYPE_DEPTH: usize = 64;
 
 impl<'a, 'm> Walk<'a, 'm> {
     fn new(md: &'m Metadata<'a>, pdb: &'m Metadata<'m>) -> Self {
@@ -313,6 +325,11 @@ impl<'a, 'm> Walk<'a, 'm> {
             files: Vec::new(),
             methods: Vec::new(),
             stats: Stats::default(),
+            active: HashSet::new(),
+            depth: 0,
+            // each type is entered at most twice in a sound assembly (once by its enclosing type,
+            // once from an async kickoff): a generous multiple of that bounds anything else
+            budget: 4 * (md.rows(super::dotnet::T_TYPEDEF) as usize + 1),
         }
     }
 
@@ -333,33 +350,51 @@ impl<'a, 'm> Walk<'a, 'm> {
         shipped: Option<&ShippedIndex>,
     ) {
         for &t in types {
-            if self.signer.md.type_name(t) == "<Module>" {
+            if self.depth >= MAX_TYPE_DEPTH || self.budget == 0 || !self.active.insert(t) {
+                self.stats.skipped_types += 1;
                 continue;
             }
-            for m in self.signer.md.type_methods(t) {
-                let Some(points) = self.pdb.sequence_points(m) else {
-                    self.stats.damaged += 1;
-                    continue;
-                };
-                if points.is_empty() {
-                    // No sequence points: an `async` method's kickoff stub. Its code lives in the
-                    // state machine's MoveNext, so process that type NOW, naming it after this
-                    // method (the runtime prints the async method's own name for its frames).
-                    let machine = self.async_machines.get(&m).and_then(|n| {
-                        self.type_index
-                            .get(n.split(',').next().unwrap_or("").trim())
-                            .copied()
-                    });
-                    if let Some(machine) = machine {
-                        self.types(&[machine], Some(m), compiler, shipped);
-                    }
-                    continue;
+            self.budget -= 1;
+            self.depth += 1;
+            self.one_type(t, containing, compiler, shipped);
+            self.depth -= 1;
+            self.active.remove(&t);
+        }
+    }
+
+    fn one_type(
+        &mut self,
+        t: u32,
+        containing: Option<u32>,
+        compiler: &Assembly,
+        shipped: Option<&ShippedIndex>,
+    ) {
+        if self.signer.md.type_name(t) == "<Module>" {
+            return;
+        }
+        for m in self.signer.md.type_methods(t) {
+            let Some(points) = self.pdb.sequence_points(m) else {
+                self.stats.damaged += 1;
+                continue;
+            };
+            if points.is_empty() {
+                // No sequence points: an `async` method's kickoff stub. Its code lives in the
+                // state machine's MoveNext, so process that type NOW, naming it after this
+                // method (the runtime prints the async method's own name for its frames).
+                let machine = self.async_machines.get(&m).and_then(|n| {
+                    self.type_index
+                        .get(n.split(',').next().unwrap_or("").trim())
+                        .copied()
+                });
+                if let Some(machine) = machine {
+                    self.types(&[machine], Some(m), compiler, shipped);
                 }
-                self.register(m, t, containing, &points, compiler, shipped);
+                continue;
             }
-            if let Some(nested) = self.nested.get(&t).cloned() {
-                self.types(&nested, None, compiler, shipped);
-            }
+            self.register(m, t, containing, &points, compiler, shipped);
+        }
+        if let Some(nested) = self.nested.get(&t).cloned() {
+            self.types(&nested, None, compiler, shipped);
         }
     }
 
@@ -679,6 +714,51 @@ mod tests {
         for len in 0..pdb.len() {
             exercise(&dll, &pdb[..len]);
         }
+    }
+
+    /// Set one cell of the dll's metadata (little-endian) to `value`.
+    fn poke(dll: &mut [u8], row: u32, col: usize, value: u32) {
+        let snapshot = dll.to_vec();
+        let asm = Assembly::parse(&snapshot).unwrap();
+        let (at, width) = asm
+            .metadata
+            .cell_location(&snapshot, super::super::dotnet::T_NESTEDCLASS, row, col)
+            .unwrap();
+        dll[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
+    }
+
+    #[test]
+    fn a_type_that_contains_itself_does_not_loop_the_walk() {
+        let clean = std::fs::read(fixture("BugseeSample.dll")).unwrap();
+        let pdb = std::fs::read(fixture("BugseeSample.pdb")).unwrap();
+        let rows = Assembly::parse(&clean)
+            .unwrap()
+            .metadata
+            .nested_types()
+            .values()
+            .map(Vec::len)
+            .sum::<usize>() as u32;
+        assert!(rows >= 2, "the sample needs nested types");
+
+        // `NestedClass` is (nested, enclosing). Make row 2 say "row 1's type is nested in ITSELF":
+        // the walk then goes T -> A -> A -> ..., which used to run until the stack ended.
+        let target = {
+            let asm = Assembly::parse(&clean).unwrap();
+            let c = |r, col| {
+                asm.metadata
+                    .cell_for_test(super::super::dotnet::T_NESTEDCLASS, r, col)
+            };
+            c(1, 0)
+        };
+        let mut dll = clean.clone();
+        poke(&mut dll, 2, 0, target);
+        poke(&mut dll, 2, 1, target);
+
+        let asm = Assembly::parse(&dll).unwrap();
+        let pdb = Metadata::parse(&pdb).unwrap();
+        let converted = convert(&asm, &pdb, None).unwrap();
+        assert!(converted.stats.skipped_types > 0, "the cycle was cut");
+        assert!(!converted.bmf.methods.is_empty());
     }
 
     #[test]

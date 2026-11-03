@@ -174,6 +174,8 @@ pub enum DebugFilesCommand {
         /// files are already identified by content whatever their name.
         /// `il2cpp-linemap` — files taken as the mappings JSON (built in:
         /// `LineNumberMappings.json`), with siblings resolved next to them.
+        /// `portable-pdb` takes no extra suffixes (assemblies are `X.dll` beside `X.pdb`);
+        /// passing one is an error.
         #[arg(long = "extension", value_name = "SUFFIX", value_delimiter = ',')]
         extensions: Vec<String>,
 
@@ -378,6 +380,19 @@ pub async fn dispatch(
                      id (MVID) of the shipped assembly, which is what the Mono runtime prints \
                      in every frame; an override could never match it",
                 ));
+            }
+            if kind == DebugFileType::PortablePdb {
+                if !extra.is_empty() {
+                    return Err(config_invalid(
+                        "--extension does not apply to --type portable-pdb — assemblies are \
+                         matched as `X.dll` with a sibling `X.pdb`",
+                    ));
+                }
+                if !il2cpp_uuids.is_empty() || il2cpp_root.is_some() {
+                    return Err(config_invalid(
+                        "--il2cpp-uuid and --il2cpp-root are only valid for --type il2cpp-linemap",
+                    ));
+                }
             }
             if kind != DebugFileType::PortablePdb && shipped_dir.is_some() {
                 return Err(config_invalid(

@@ -1,6 +1,6 @@
 # bugsee-cli
 
-Cross-platform Rust binary that collects debug information files (dSYM, ELF, Windows PDB, R8/ProGuard mappings, JS source maps, Unity IL2CPP line maps; PE, Portable PDB and Breakpad are planned), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, and the npm package used by the React Native and web tooling); .NET, Unity and Flutter integrations are planned.
+Cross-platform Rust binary that collects debug information files (dSYM, ELF, Windows PDB, R8/ProGuard mappings, JS source maps, Unity IL2CPP line maps, .NET portable PDBs for Unity Mono; PE and Breakpad are planned), resolves build-environment metadata (VCS, CI provider, iOS dependency graph, Xcode version, Mach-O UUIDs), and uploads symbols to Bugsee. One binary, shelled by thin per-build-system orchestrators (Android Gradle plugin, Xcode Run Script via the iOS SDK's BugseeAgent, fastlane plugin, and the npm package used by the React Native and web tooling); .NET, Unity and Flutter integrations are planned.
 
 ## Installation
 
@@ -62,7 +62,7 @@ bugsee-cli debug-files upload <paths>... \
 
 The upload flow itself. ProGuard, Rust, ELF, dSYM, PDB, portable-PDB, sourcemap, and Unity IL2CPP line-map types are working; `pe`, `breakpad`, `jvm`, `sourcebundle` and `wasm` are scaffold-only and rejected (exit 20).
 
-`--extension <SUFFIX>` picks up files under a spelling the CLI does not know yet, IN ADDITION to each type's built-in names, so a toolchain change does not need a CLI release first. It matches the end of the whole name (`.so.sym` works), and each type's content check still applies to what it adds (ELF build-id, PDB container, dSYM `Contents/Resources/DWARF`). See `debug-files upload --help` for what it widens per type.
+`--extension <SUFFIX>` picks up files under a spelling the CLI does not know yet, IN ADDITION to each type's built-in names, so a toolchain change does not need a CLI release first. It matches the end of the whole name (`.so.sym` works), and each type's content check still applies to what it adds (ELF build-id, PDB container, dSYM `Contents/Resources/DWARF`). `--type portable-pdb` takes none (an assembly is `X.dll` beside `X.pdb`), and passing one is an error. See `debug-files upload --help` for what it widens per type.
 
 #### Android NDK — `--type elf`
 

@@ -93,9 +93,9 @@ module id plus every entry of the signatures list. So both are set to the SHIPPE
 Up to four per method, built from Cecil's names:
 
 1. `Ns.Type.Method (ParamType name, ParamType name)`: type full names, nested types and generic arity
-   as in `System.Collections.Generic.List`1`; nesting separators (`+`, `/`) become dots; a generic
+   as in ``System.Collections.Generic.List`1``; nesting separators (`+`, `/`) become dots; a generic
    METHOD appends `[T,U]`; a top-level generic instance is reduced to its open type; an anonymous-type
-   parameter is `<>f__AnonymousType0`2[<Id>j__TPar,<Label>j__TPar] x`.
+   parameter is ``<>f__AnonymousType0`2[<Id>j__TPar,<Label>j__TPar] x``.
 2. The same with the compiler's static-lambda holder (`.<>c.`) removed.
 3. and 4. For an `async` method's `MoveNext`: 1 and 2 under the ORIGINAL method's name, because the
    runtime prints the async method's own name for those frames.

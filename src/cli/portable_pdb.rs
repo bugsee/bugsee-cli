@@ -46,6 +46,23 @@ pub struct Converted {
     pub bmf: PathBuf,
     pub module_id: String,
     pub module_name: String,
+    /// SHA-256 of the written file: the same assembly found twice converts to the same bytes.
+    pub digest: [u8; 32],
+}
+
+fn digest_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            return Ok(hasher.finalize().into());
+        }
+        hasher.update(&buf[..n]);
+    }
 }
 
 fn is_dll(p: &Path) -> bool {
@@ -64,6 +81,14 @@ fn sibling_pdb(dll: &Path) -> Option<PathBuf> {
 /// .NET assembly. A path NAMING a file is stricter: it must have its pdb.
 pub fn discover(paths: &[PathBuf], shipped_dir: Option<&Path>) -> anyhow::Result<Vec<Pair>> {
     let mut found: Vec<(PathBuf, PathBuf)> = Vec::new();
+    // The same file reached twice (`X.dll X.pdb`, a directory and a file inside it, overlapping
+    // directories) is one assembly.
+    let mut seen: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    let mut add = |found: &mut Vec<(PathBuf, PathBuf)>, dll: PathBuf, pdb: PathBuf| {
+        if seen.insert(fs::canonicalize(&dll).unwrap_or_else(|_| dll.clone())) {
+            found.push((dll, pdb));
+        }
+    };
     for path in paths {
         if path.is_dir() {
             for entry in WalkDir::new(path).follow_links(false).sort_by_file_name() {
@@ -71,7 +96,7 @@ pub fn discover(paths: &[PathBuf], shipped_dir: Option<&Path>) -> anyhow::Result
                     .map_err(|e| input_not_found(format!("cannot read {}: {e}", path.display())))?;
                 if entry.file_type().is_file() && is_dll(entry.path()) {
                     match sibling_pdb(entry.path()) {
-                        Some(pdb) => found.push((entry.path().to_path_buf(), pdb)),
+                        Some(pdb) => add(&mut found, entry.path().to_path_buf(), pdb),
                         None => tracing::debug!(
                             dll = %entry.path().display(),
                             "no .pdb beside it, skipped"
@@ -107,7 +132,7 @@ pub fn discover(paths: &[PathBuf], shipped_dir: Option<&Path>) -> anyhow::Result
                     pdb.display()
                 )));
             }
-            found.push((dll, pdb));
+            add(&mut found, dll, pdb);
         } else {
             return Err(input_not_found(format!(
                 "path does not exist: {}",
@@ -229,6 +254,14 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
              so frames in them will not get line numbers"
         );
     }
+    if stats.skipped_types > 0 {
+        tracing::warn!(
+            assembly = %header.module_name,
+            types = stats.skipped_types,
+            "these types have a damaged nesting or async-state-machine record in the assembly \
+             and were left out"
+        );
+    }
     if stats.damaged > 0 {
         tracing::warn!(
             assembly = %header.module_name,
@@ -237,6 +270,7 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
         );
     }
     Ok(Some(Converted {
+        digest: digest_file(&bmf_path)?,
         bmf: bmf_path,
         module_id: header.module_id,
         module_name: header.module_name,
@@ -248,10 +282,21 @@ fn convert_all(pairs: &[Pair], out_dir: &Path) -> anyhow::Result<Vec<Converted>>
     let mut out: Vec<Converted> = Vec::new();
     for pair in pairs {
         if let Some(c) = convert_pair(pair, out_dir)? {
-            // Two inputs with one module id would overwrite each other's file.
-            if out.iter().any(|o| o.module_id == c.module_id) {
+            // One module id is one file: the same build found twice (a copy under another
+            // directory) converts to identical bytes and is taken once; two different
+            // conversions would overwrite each other, so that is an error.
+            if let Some(first) = out.iter().find(|o| o.module_id == c.module_id) {
+                if first.digest == c.digest {
+                    tracing::debug!(
+                        dll = %pair.dll.display(),
+                        module_id = %c.module_id,
+                        "same assembly as one already converted, skipped"
+                    );
+                    continue;
+                }
                 return Err(input_invalid(format!(
-                    "two assemblies under the given paths have the module id {} ({} is the second)",
+                    "two different assemblies under the given paths have the module id {} \
+                     ({} is the second)",
                     c.module_id,
                     pair.dll.display()
                 )));
@@ -392,4 +437,86 @@ pub async fn run_upload(
     }
     tracing::info!(uploaded, already_existed, "portable-pdb upload complete");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(name: &str) -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dotnet")
+            .join(name)
+    }
+
+    fn pair_in(dir: &Path, pdb_bytes: Option<Vec<u8>>) -> Pair {
+        fs::create_dir_all(dir).unwrap();
+        fs::copy(fixture("BugseeSample.dll"), dir.join("BugseeSample.dll")).unwrap();
+        match pdb_bytes {
+            Some(b) => fs::write(dir.join("BugseeSample.pdb"), b).unwrap(),
+            None => {
+                fs::copy(fixture("BugseeSample.pdb"), dir.join("BugseeSample.pdb")).unwrap();
+            }
+        };
+        Pair {
+            dll: dir.join("BugseeSample.dll"),
+            pdb: dir.join("BugseeSample.pdb"),
+            shipped: None,
+        }
+    }
+
+    #[test]
+    fn the_same_file_named_in_several_ways_is_one_assembly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let p = pair_in(&tmp.path().join("a"), None);
+        let found = discover(
+            &[
+                tmp.path().join("a"),
+                p.dll.clone(),
+                p.pdb.clone(),
+                tmp.path().to_path_buf(),
+            ],
+            None,
+        )
+        .unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn an_identical_copy_is_taken_once_and_different_content_is_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let a = pair_in(&tmp.path().join("a"), None);
+        let b = pair_in(&tmp.path().join("b"), None);
+        // two copies of one build (say, under two Library subdirectories): one result
+        let done = convert_all(&[a, b], &out).unwrap();
+        assert_eq!(done.len(), 1);
+
+        // the same module id with a pdb that converts to something else: refused. Find a byte of
+        // the pdb whose change keeps the pdb readable and paired but changes the lines.
+        let clean = fs::read(fixture("BugseeSample.pdb")).unwrap();
+        let first = pair_in(&tmp.path().join("c"), None);
+        let reference = convert_pair(&first, &tmp.path().join("ref"))
+            .unwrap()
+            .unwrap()
+            .digest;
+        let mut refused = false;
+        for at in (0..clean.len()).rev() {
+            let mut bytes = clean.clone();
+            bytes[at] ^= 0x01;
+            let other = pair_in(&tmp.path().join("d"), Some(bytes));
+            match convert_pair(&other, &tmp.path().join("probe")) {
+                Ok(Some(c)) if c.digest != reference => {
+                    let err = convert_all(&[first, other], &tmp.path().join("both"))
+                        .unwrap_err()
+                        .to_string();
+                    assert!(err.contains("two different assemblies"), "{err}");
+                    refused = true;
+                    break;
+                }
+                _ => {}
+            }
+        }
+        assert!(refused, "no single-byte change gave a different conversion");
+    }
 }

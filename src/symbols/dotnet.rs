@@ -483,6 +483,30 @@ impl<'a> Metadata<'a> {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn cell_for_test(&self, table: u8, row: u32, col: usize) -> u32 {
+        self.cell(table, row, col)
+    }
+
+    /// Where a cell sits inside `base` (the bytes this metadata was parsed from) and how wide it
+    /// is, so a test can damage exactly one value.
+    #[cfg(test)]
+    pub(crate) fn cell_location(
+        &self,
+        base: &[u8],
+        table: u8,
+        row: u32,
+        col: usize,
+    ) -> Option<(usize, usize)> {
+        let t = &self.tables[table as usize & 63];
+        if row == 0 || row > t.rows || col >= MAX_COLS {
+            return None;
+        }
+        let inside = (self.tables_data.as_ptr() as usize).checked_sub(base.as_ptr() as usize)?;
+        let at = inside + t.start + (row as usize - 1) * t.row_size + t.col_off[col] as usize;
+        Some((at, t.col_width[col] as usize))
+    }
+
     pub fn string(&self, index: u32) -> Cow<'a, str> {
         let Some(rest) = self.strings.get(index as usize..) else {
             return Cow::Borrowed("");
