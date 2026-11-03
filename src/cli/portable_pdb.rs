@@ -298,18 +298,41 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
 fn convert_all(pairs: &[Pair], out_dir: &Path) -> anyhow::Result<Vec<Converted>> {
     let mut staged: Vec<PathBuf> = Vec::new();
     let result = convert_staged(pairs, out_dir, &mut staged).and_then(|mut done| {
-        let mut moved: Vec<PathBuf> = Vec::new();
+        // (final name, the earlier file it replaced, set aside until the whole run is moved)
+        let mut moved: Vec<(PathBuf, Option<PathBuf>)> = Vec::new();
         for c in &mut done {
             let final_path = out_dir.join(format!("{}.bmf", c.module_id));
-            if let Err(e) = fs::rename(&c.bmf, &final_path) {
-                // no partial set: take back what was already moved
-                for path in &moved {
+            let aside = final_path.is_file().then(|| {
+                let mut name = final_path.clone().into_os_string();
+                name.push(format!(".{}.old", std::process::id()));
+                PathBuf::from(name)
+            });
+            let step = (|| -> std::io::Result<()> {
+                if let Some(aside) = &aside {
+                    fs::rename(&final_path, aside)?;
+                }
+                fs::rename(&c.bmf, &final_path)
+            })();
+            if let Err(e) = step {
+                // all or nothing: take back what was moved, and put back what it replaced
+                if let Some(aside) = &aside {
+                    let _ = fs::rename(aside, &final_path);
+                }
+                for (path, old) in moved.iter().rev() {
                     let _ = fs::remove_file(path);
+                    if let Some(old) = old {
+                        let _ = fs::rename(old, path);
+                    }
                 }
                 return Err(e.into());
             }
-            moved.push(final_path.clone());
+            moved.push((final_path.clone(), aside));
             c.bmf = final_path;
+        }
+        for (_, old) in &moved {
+            if let Some(old) = old {
+                let _ = fs::remove_file(old);
+            }
         }
         Ok(done)
     });
@@ -593,5 +616,40 @@ mod tests {
             .collect();
         // only the blocker: neither the first result nor any staged file
         assert_eq!(names, ["db54951704a1467eacf4bb55b8c77bfe.bmf"]);
+    }
+
+    #[test]
+    fn a_failed_rerun_puts_back_the_results_it_would_have_replaced() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let a = || pair_in(&tmp.path().join("a"), None);
+        let b = || {
+            let mut b = pair_in(&tmp.path().join("b"), None);
+            b.shipped = Some(fixture("BugseeSample.rewritten.dll"));
+            b
+        };
+        // a first, good run leaves A's result; stand-in bytes make it recognisable afterwards
+        let first = convert_all(&[a()], &out).unwrap();
+        let a_file = first[0].bmf.clone();
+        fs::write(&a_file, b"results of the earlier run").unwrap();
+
+        // second run: A is moved over it, then B's move fails
+        let blocked = out.join("db54951704a1467eacf4bb55b8c77bfe.bmf");
+        fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+        assert!(convert_all(&[a(), b()], &out).is_err());
+
+        assert_eq!(fs::read(&a_file).unwrap(), b"results of the earlier run");
+        let mut names: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            [
+                a_file.file_name().unwrap().to_string_lossy().into_owned(),
+                "db54951704a1467eacf4bb55b8c77bfe.bmf".to_string()
+            ]
+        );
     }
 }
