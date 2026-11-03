@@ -446,7 +446,7 @@ async fn serve_release(newer: &str, triple: &str, artefact: &[u8]) -> MockServer
     server
 }
 
-/// What is next to the binary, by file name.
+/// What is in a directory, by file name.
 #[cfg(windows)]
 fn names_in(dir: &Path) -> Vec<String> {
     let mut names: Vec<String> = std::fs::read_dir(dir)
@@ -466,7 +466,10 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// loader ignores) and then checks what a user depends on after an update:
 /// - the replaced `.exe` launches, and reports the version;
 /// - it can update again, over a file that was itself put there by a self-replace;
-/// - nothing but the binary is left in its directory once the helper has finished.
+/// - nothing is left behind once the helper has finished. `self-replace` moves the old binary and
+///   starts its `.__selfdelete__.exe` helper from `env::temp_dir()` (it only falls back to the
+///   binary's directory when that is on another volume), so the updater is given a temp directory
+///   the test owns and BOTH that and the binary's directory must end up clean.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_litter() {
@@ -486,11 +489,15 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         std::fs::create_dir(&artefacts).unwrap();
         let archive = build_release_archive(&artefacts, triple, &payload);
         let server = serve_release(&newer, triple, &archive).await;
+        let systemp = tmp.path().join(format!("systemp-{round}"));
+        std::fs::create_dir(&systemp).unwrap();
 
-        let (base, exe_for_run) = (server.uri(), exe.clone());
+        let (base, exe_for_run, temp_for_run) = (server.uri(), exe.clone(), systemp.clone());
         tokio::task::spawn_blocking(move || {
             assert_cmd::Command::new(&exe_for_run)
                 .env("BUGSEE_CLI_UPDATE_BASE_URL", &base)
+                .env("TMP", &temp_for_run)
+                .env("TEMP", &temp_for_run)
                 .arg("update")
                 .assert()
                 .success();
@@ -517,19 +524,23 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         .unwrap();
 
         // The helper that removes the old binary runs after the updater exits: give it time, then
-        // require that only the binary is left.
-        let mut left = names_in(&bindir);
+        // require that only the binary is left, and that nothing is left in the temp directory.
+        let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
         for _ in 0..80 {
-            if left == [exe_name.clone()] {
+            if left == [exe_name.clone()] && in_temp.is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-            left = names_in(&bindir);
+            (left, in_temp) = (names_in(&bindir), names_in(&systemp));
         }
         assert_eq!(
             left,
             [exe_name.clone()],
             "round {round}: self-replace left files next to the binary"
+        );
+        assert!(
+            in_temp.is_empty(),
+            "round {round}: self-replace left files in the temp directory: {in_temp:?}"
         );
     }
 }
