@@ -419,3 +419,117 @@ async fn update_readonly_dir_fails_safe_and_keeps_binary() {
         "a failed self-replace must leave the existing binary untouched"
     );
 }
+
+/// Mount the three routes of a release: the per-major pointer, the archive and its SHA-256.
+#[cfg(windows)]
+async fn serve_release(newer: &str, triple: &str, artefact: &[u8]) -> MockServer {
+    let server = MockServer::start().await;
+    mount_pointer(&server, newer).await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!(
+            "/v{newer}/bugsee-cli-{triple}.{}",
+            artifact_ext()
+        )))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(artefact.to_vec()))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(wm_path(format!(
+            "/v{newer}/bugsee-cli-{triple}.{}.sha256",
+            artifact_ext()
+        )))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(format!("{}  x", sha256_hex(artefact))),
+        )
+        .mount(&server)
+        .await;
+    server
+}
+
+/// What is next to the binary, by file name.
+#[cfg(windows)]
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// The Windows half of `self_replace`, which is not a rename: a running `.exe` cannot be
+/// overwritten, so the crate moves the old binary aside, puts the new one in place and starts a
+/// copy of itself that deletes the leftovers once this process has exited.
+///
+/// The test above puts a sentinel in place, which proves the bytes land but not that what lands
+/// is a program. This one swaps in a REAL binary (this build plus a few trailing bytes, which a PE
+/// loader ignores) and then checks what a user depends on after an update:
+/// - the replaced `.exe` launches, and reports the version;
+/// - it can update again, over a file that was itself put there by a self-replace;
+/// - nothing but the binary is left in its directory once the helper has finished.
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_litter() {
+    let triple = host_triple();
+    let tmp = tempfile::tempdir().unwrap();
+    let bindir = tmp.path().join("bin");
+    std::fs::create_dir(&bindir).unwrap();
+    let exe = copy_binary(&bindir);
+    let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
+    let real = std::fs::read(&exe).unwrap();
+    let newer = format!("{}.99.0", current_major());
+
+    for round in 1..=2 {
+        let mut payload = real.clone();
+        payload.extend_from_slice(format!("\0BUGSEE-TEST-OVERLAY-{round}\0").as_bytes());
+        let artefacts = tmp.path().join(format!("release-{round}"));
+        std::fs::create_dir(&artefacts).unwrap();
+        let archive = build_release_archive(&artefacts, triple, &payload);
+        let server = serve_release(&newer, triple, &archive).await;
+
+        let (base, exe_for_run) = (server.uri(), exe.clone());
+        tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::new(&exe_for_run)
+                .env("BUGSEE_CLI_UPDATE_BASE_URL", &base)
+                .arg("update")
+                .assert()
+                .success();
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(&exe).unwrap(),
+            payload,
+            "round {round}: the binary should be the downloaded release"
+        );
+
+        // It is a program, not just bytes: it starts and knows its version.
+        let exe_for_run = exe.clone();
+        tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::new(&exe_for_run)
+                .arg("--version")
+                .assert()
+                .success()
+                .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
+        })
+        .await
+        .unwrap();
+
+        // The helper that removes the old binary runs after the updater exits: give it time, then
+        // require that only the binary is left.
+        let mut left = names_in(&bindir);
+        for _ in 0..80 {
+            if left == [exe_name.clone()] {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(250));
+            left = names_in(&bindir);
+        }
+        assert_eq!(
+            left,
+            [exe_name.clone()],
+            "round {round}: self-replace left files next to the binary"
+        );
+    }
+}
