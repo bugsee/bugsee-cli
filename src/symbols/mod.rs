@@ -15,7 +15,9 @@
 //!     diagnoses the build settings that silently produce unusable symbols
 //!   - `suffix`      — caller-supplied file-name suffixes (`--extension`)
 //!     that every type above accepts IN ADDITION to its built-in names
-//!   - `portable_pdb` — Portable PDB (.NET / MAUI managed code)            [TODO]
+//!   - `bmf`         — Bugsee Mapping File: the managed (.NET / Mono) signature + IL
+//!     offset -> file:line map, keyed by assembly MVID
+//!   - `dotnet`, `dotnet_bmf` — .NET assembly + portable PDB -> BMF mapping (`bmf`)
 //!   - `breakpad`    — Breakpad ASCII symbols                              [TODO]
 //!   - `jvm`         — JVM source-context bundles                          [TODO]
 //!
@@ -23,6 +25,9 @@
 //! wire format for upload is ZIP-with-Zstd entries (see `crate::compress`)
 //! keyed by debug-id on the server.
 
+pub mod bmf;
+pub mod dotnet;
+pub mod dotnet_bmf;
 pub mod dsym;
 pub mod elf;
 pub mod il2cpp_linemap;

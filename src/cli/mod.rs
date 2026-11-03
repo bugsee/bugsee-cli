@@ -5,6 +5,7 @@ pub mod debug_files;
 pub mod dsym;
 pub mod ios_deps;
 pub mod pack;
+pub mod portable_pdb;
 pub mod size_check;
 pub mod sourcemaps;
 pub mod update;

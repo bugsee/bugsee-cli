@@ -957,3 +957,144 @@ fn il2cpp_linemap_accepts_a_valid_map() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// .NET assemblies and portable PDBs (`--type portable-pdb`, `convert --to bmf`)
+// ---------------------------------------------------------------------------
+
+fn dotnet_fixture(name: &str) -> Vec<u8> {
+    std::fs::read(
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/dotnet")
+            .join(name),
+    )
+    .unwrap()
+}
+
+/// A damaged assembly or pdb is never a crash and never reaches the server. What is NOT an
+/// assembly at all (empty, text) is skipped like any other stray `.dll` in a build directory, so
+/// the run finds nothing to convert (10); a damaged one that is clearly meant to be an assembly,
+/// or any damaged pdb, is `InputInvalid` (11) naming the file.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn broken_assemblies_and_pdbs_never_crash_and_send_nothing() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"code": 0})))
+        .expect(0)
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .respond_with(ResponseTemplate::new(200))
+        .expect(0)
+        .mount(&server)
+        .await;
+
+    let dll = dotnet_fixture("BugseeSample.dll");
+    let pdb = dotnet_fixture("BugseeSample.pdb");
+    let cases: Vec<(&str, Vec<u8>, Vec<u8>, i32)> = vec![
+        ("empty dll", vec![], pdb.clone(), 10),
+        ("text dll", b"hello, not a dll".to_vec(), pdb.clone(), 10),
+        (
+            "dll cut in its headers",
+            dll[..100].to_vec(),
+            pdb.clone(),
+            11,
+        ),
+        (
+            "dll cut in its metadata",
+            dll[..dll.len() / 2].to_vec(),
+            pdb.clone(),
+            11,
+        ),
+        ("dll all 0xFF", vec![0xFF; dll.len()], pdb.clone(), 10),
+        ("empty pdb", dll.clone(), vec![], 11),
+        ("text pdb", dll.clone(), b"hello, not a pdb".to_vec(), 11),
+        (
+            "pdb cut short",
+            dll.clone(),
+            pdb[..pdb.len() / 2].to_vec(),
+            11,
+        ),
+        ("pdb all zero", dll.clone(), vec![0; pdb.len()], 11),
+        // The shipped fixtures' rewritten dll names a different pdb than this one.
+        (
+            "pdb of another build",
+            dotnet_fixture("BugseeSample.rewritten.dll"),
+            pdb.clone(),
+            11,
+        ),
+    ];
+
+    let tmp = tempfile::tempdir().unwrap();
+    let endpoint = server.uri();
+    let root = tmp.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        for (label, dll_bytes, pdb_bytes, expected) in cases {
+            let dir = root.join(label.replace(' ', "_"));
+            let dll_path = write(&dir, "Broken.dll", &dll_bytes);
+            let pdb_path = write(&dir, "Broken.pdb", &pdb_bytes);
+            for dry in [true, false] {
+                let mut args = vec![
+                    "debug-files",
+                    "upload",
+                    "--type",
+                    "portable-pdb",
+                    "--version",
+                    "1",
+                    "--build",
+                    "1",
+                    dir.to_str().unwrap(),
+                ];
+                if dry {
+                    args.push("--dry-run");
+                }
+                let out = common::cli()
+                    .args(["--endpoint", &endpoint, "--app-token", "TKN"])
+                    .args(&args)
+                    .output()
+                    .unwrap();
+                assert_eq!(
+                    code_of(&out),
+                    expected,
+                    "{label} (dry={dry}): {}",
+                    stderr(&out)
+                );
+                assert!(out.stdout.is_empty(), "{label}: stdout stays empty");
+                assert_eq!(
+                    std::fs::read(&dll_path).unwrap(),
+                    dll_bytes,
+                    "{label}: dll untouched"
+                );
+                assert_eq!(
+                    std::fs::read(&pdb_path).unwrap(),
+                    pdb_bytes,
+                    "{label}: pdb untouched"
+                );
+            }
+            // The converter fails the same way and leaves no output behind for a failed run.
+            let out_dir = dir.join("out");
+            let out = common::cli()
+                .args([
+                    "debug-files",
+                    "convert",
+                    dir.to_str().unwrap(),
+                    "--to",
+                    "bmf",
+                ])
+                .arg("--output")
+                .arg(&out_dir)
+                .output()
+                .unwrap();
+            assert_eq!(
+                code_of(&out),
+                expected,
+                "{label} (convert): {}",
+                stderr(&out)
+            );
+            let written = std::fs::read_dir(&out_dir).map(|d| d.count()).unwrap_or(0);
+            assert_eq!(written, 0, "{label}: a failed convert writes no .bmf");
+        }
+    })
+    .await
+    .unwrap();
+}
