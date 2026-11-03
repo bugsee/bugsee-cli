@@ -240,11 +240,18 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
         std::process::id(),
         STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    {
+    // From the moment the file exists, any failure removes it (a full disk, a mapping that fails
+    // its own validation): a failed run leaves nothing behind.
+    let digest = (|| -> anyhow::Result<[u8; 32]> {
         let mut out = BufWriter::new(fs::File::create(&bmf_path)?);
         converted.bmf.write(&mut out)?;
         std::io::Write::flush(&mut out)?;
-    }
+        drop(out);
+        Ok(digest_file(&bmf_path)?)
+    })()
+    .inspect_err(|_| {
+        let _ = fs::remove_file(&bmf_path);
+    })?;
 
     tracing::info!(
         assembly = %header.module_name,
@@ -278,7 +285,7 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
         );
     }
     Ok(Some(Converted {
-        digest: digest_file(&bmf_path)?,
+        digest,
         bmf: bmf_path,
         module_id: header.module_id,
         module_name: header.module_name,
@@ -291,9 +298,17 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
 fn convert_all(pairs: &[Pair], out_dir: &Path) -> anyhow::Result<Vec<Converted>> {
     let mut staged: Vec<PathBuf> = Vec::new();
     let result = convert_staged(pairs, out_dir, &mut staged).and_then(|mut done| {
+        let mut moved: Vec<PathBuf> = Vec::new();
         for c in &mut done {
             let final_path = out_dir.join(format!("{}.bmf", c.module_id));
-            fs::rename(&c.bmf, &final_path)?;
+            if let Err(e) = fs::rename(&c.bmf, &final_path) {
+                // no partial set: take back what was already moved
+                for path in &moved {
+                    let _ = fs::remove_file(path);
+                }
+                return Err(e.into());
+            }
+            moved.push(final_path.clone());
             c.bmf = final_path;
         }
         Ok(done)
@@ -558,5 +573,25 @@ mod tests {
             }
         }
         assert!(refused, "no single-byte change gave a different conversion");
+    }
+
+    #[test]
+    fn a_failure_while_moving_the_results_leaves_no_partial_set() {
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let a = pair_in(&tmp.path().join("a"), None);
+        let mut b = pair_in(&tmp.path().join("b"), None);
+        b.shipped = Some(fixture("BugseeSample.rewritten.dll"));
+        // the second result's final name is taken by a non-empty directory, so its move fails
+        let blocked = out.join("db54951704a1467eacf4bb55b8c77bfe.bmf");
+        fs::create_dir_all(blocked.join("in-the-way")).unwrap();
+
+        assert!(convert_all(&[a, b], &out).is_err());
+        let names: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        // only the blocker: neither the first result nor any staged file
+        assert_eq!(names, ["db54951704a1467eacf4bb55b8c77bfe.bmf"]);
     }
 }
