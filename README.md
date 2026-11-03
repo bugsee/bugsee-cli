@@ -93,6 +93,7 @@ bugsee-cli debug-files upload Library/Bee/artifacts/1300b0aP.dag --type portable
 ```
 
 - **The id is the shipped assembly's.** With `--shipped-dir`, each `X.dll` under the paths is paired with the `X.dll` there, and the mapping is registered under THAT module id, which is what the runtime prints. Methods are matched by full signature and IL offset, never by metadata token (the linker renumbers those). Methods the build removed, or whose IL size changed, are left out and counted in the log, since the compiler's offsets would be wrong for them.
+- **Point it at one build's output.** With `--shipped-dir`, two different compiler copies of one assembly name (the Editor's and the player's `.dag` directories, say) map to the same shipped dll and module id, so passing their common parent exits 11 ("two different assemblies ..."). Name the one `.dag` directory, as above. The same build found twice is taken once.
 - **The pdb must belong to its assembly.** It is checked against the dll's CodeView entry; a pdb from another build exits 11 with nothing sent.
 - **Development builds work too.** They ship their pdbs and need nothing, but if the pdbs were stripped after the build the frames look like Release ones and these mappings resolve them.
 - A dll without a pdb beside it (Unity's own `UnityEngine.*`, the BCL) and files that are not .NET assemblies are skipped when scanning a directory. A named `.dll` or `.pdb` must have its partner.

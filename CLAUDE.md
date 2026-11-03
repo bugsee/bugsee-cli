@@ -50,7 +50,8 @@ builds the tokio runtime, and dispatches.
 - `src/cli/` — one module per command, each owning its clap arg struct + logic:
   `debug_files` (upload/convert), `sourcemaps` (inject), `upload`
   (build/build-info), `pack`, `vcs_metadata`, `ios_deps`, `build_env`, `dsym`,
-  `xcode` (post-action, upload-dsyms). `mod.rs` defines the top-level `Cli`/`Command` and
+  `xcode` (post-action, upload-dsyms), `portable_pdb` (`--type portable-pdb` and
+  `convert --to bmf`: .NET assemblies + portable PDBs -> BMF). `mod.rs` defines the top-level `Cli`/`Command` and
   `dispatch`. The Xcode post-action's helpers live alongside: `xcactivitylog`
   (build-timings decode), `xcode_ipa` (`.app`→`.ipa` packaging + Mach-O UUID),
   `size_check` (in-build size gate).
@@ -60,7 +61,9 @@ builds the tokio runtime, and dispatches.
   (chunked artefact protocol), `build_info` (metadata-bundle ZIP), `presigned`
   (two-stage POST-metadata-then-PUT symbol upload).
 - `src/symbols/` — per-format identification/packaging (dSYM, ELF, PDB,
-  ProGuard, source map). `rust` sits ACROSS the others: a Cargo target's symbols
+  ProGuard, source map; `dotnet` is the minimal ECMA-335 / portable-PDB reader,
+  `dotnet_bmf` the signature-keyed conversion, `bmf` the BMF model + writer —
+  see `docs/unity-mono-portable-pdb.md`). `rust` sits ACROSS the others: a Cargo target's symbols
   are a `.dSYM`, a `.pdb`, or the ELF itself depending on the triple, so it
   classifies by container magic (never host OS — cross-compilation is normal),
   skips Cargo intermediates, and diagnoses the build settings that silently
