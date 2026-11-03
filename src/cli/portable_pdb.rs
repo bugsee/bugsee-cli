@@ -652,4 +652,20 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn converting_again_into_the_same_directory_replaces_the_results() {
+        // the Windows CI leg is the one that proves a re-run over existing files works there
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out");
+        let a = pair_in(&tmp.path().join("a"), None);
+        let first = convert_all(std::slice::from_ref(&a), &out).unwrap();
+        let second = convert_all(std::slice::from_ref(&a), &out).unwrap();
+        assert_eq!(first[0].bmf, second[0].bmf);
+        let names: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [format!("{}.bmf", second[0].module_id)]);
+    }
 }
