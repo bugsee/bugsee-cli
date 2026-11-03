@@ -98,8 +98,8 @@ pub enum DebugFilesCommand {
         /// Force a re-upload even if the server already has the symbol. Without
         /// it, a symbol the server already has is skipped (exit 0) and the rest
         /// of the batch continues. Applies to `--type dsym`, `--type pdb`,
-        /// `--type elf`, `--type rust`, `--type il2cpp-linemap` and
-        /// `--type sourcemaps` — sets `overwrite` on the metadata POST so
+        /// `--type portable-pdb`, `--type elf`, `--type rust`,
+        /// `--type il2cpp-linemap` and `--type sourcemaps` — sets `overwrite` on the metadata POST so
         /// format-scoped peers are replaced. Proguard ignores this flag today.
         ///
         /// For `--type elf` it is rarely needed: each library declares whether it

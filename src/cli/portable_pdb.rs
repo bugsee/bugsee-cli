@@ -174,7 +174,7 @@ fn wrap(path: &Path, what: &str, e: Error) -> anyhow::Error {
     }
 }
 
-/// Convert one pair into `out_dir/<module id>.bmf`. `None` when the pair is skipped (not an
+/// Convert one pair into a staged file in `out_dir` (see `convert_all`). `None` when the pair is skipped (not an
 /// assembly, no methods with lines, or its shipped copy is absent); a damaged or mismatched input
 /// is an error.
 pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Converted>> {
@@ -231,7 +231,15 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
     let header = converted.bmf.header.clone();
 
     fs::create_dir_all(out_dir)?;
-    let bmf_path = out_dir.join(format!("{}.bmf", header.module_id));
+    // Staged under a name of its own: the final `<module id>.bmf` is only written by `convert_all`
+    // once the whole run is known to be good (two inputs may share a module id).
+    static STAGED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let bmf_path = out_dir.join(format!(
+        ".{}.{}.{}.part",
+        header.module_id,
+        std::process::id(),
+        STAGED.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     {
         let mut out = BufWriter::new(fs::File::create(&bmf_path)?);
         converted.bmf.write(&mut out)?;
@@ -277,11 +285,35 @@ pub fn convert_pair(pair: &Pair, out_dir: &Path) -> anyhow::Result<Option<Conver
     }))
 }
 
-/// Convert every discovered pair; fail (before any upload) on the first damaged one.
+/// Convert every discovered pair into `out_dir/<module id>.bmf`; fail (before any upload) on the
+/// first damaged one. Nothing is left in `out_dir` by a failed run: every conversion is staged
+/// first and only moved to its final name once the whole run has succeeded.
 fn convert_all(pairs: &[Pair], out_dir: &Path) -> anyhow::Result<Vec<Converted>> {
+    let mut staged: Vec<PathBuf> = Vec::new();
+    let result = convert_staged(pairs, out_dir, &mut staged).and_then(|mut done| {
+        for c in &mut done {
+            let final_path = out_dir.join(format!("{}.bmf", c.module_id));
+            fs::rename(&c.bmf, &final_path)?;
+            c.bmf = final_path;
+        }
+        Ok(done)
+    });
+    // whatever is still staged (a failed run, or an identical duplicate) is removed
+    for path in staged {
+        let _ = fs::remove_file(path);
+    }
+    result
+}
+
+fn convert_staged(
+    pairs: &[Pair],
+    out_dir: &Path,
+    staged: &mut Vec<PathBuf>,
+) -> anyhow::Result<Vec<Converted>> {
     let mut out: Vec<Converted> = Vec::new();
     for pair in pairs {
         if let Some(c) = convert_pair(pair, out_dir)? {
+            staged.push(c.bmf.clone());
             // One module id is one file: the same build found twice (a copy under another
             // directory) converts to identical bytes and is taken once; two different
             // conversions would overwrite each other, so that is an error.
@@ -491,6 +523,12 @@ mod tests {
         // two copies of one build (say, under two Library subdirectories): one result
         let done = convert_all(&[a, b], &out).unwrap();
         assert_eq!(done.len(), 1);
+        // the result is `<module id>.bmf` and nothing else (no staged leftovers)
+        let names: Vec<_> = fs::read_dir(&out)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, [format!("{}.bmf", done[0].module_id)]);
 
         // the same module id with a pdb that converts to something else: refused. Find a byte of
         // the pdb whose change keeps the pdb readable and paired but changes the lines.
@@ -511,6 +549,8 @@ mod tests {
                         .unwrap_err()
                         .to_string();
                     assert!(err.contains("two different assemblies"), "{err}");
+                    // a refused run leaves nothing behind: not the first conversion, not the second
+                    assert_eq!(fs::read_dir(tmp.path().join("both")).unwrap().count(), 0);
                     refused = true;
                     break;
                 }
