@@ -511,12 +511,13 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
             "round {round}: the binary should be the downloaded release"
         );
 
-        // The helper that removes the old binary runs after the updater exits: give it time, then
-        // require that only the binary is left, and that nothing is left in the temp directory.
-        // This comes BEFORE launching the new binary, so nothing else is touching the files while
-        // the helper makes its single attempt to delete them.
+        // By the time `.assert()` returned, the helper is done: it and its `cmd.exe` inherit the
+        // updater's stdout/stderr, and `assert()` reads those pipes until every holder has closed
+        // them. The helper makes ONE attempt to delete the old binary and never retries, so a file
+        // still here means that attempt failed (nothing will remove it later), not that the helper
+        // is slow. The short wait is only for the filesystem to settle.
         let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
-        for _ in 0..80 {
+        for _ in 0..8 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
                 break;
             }
@@ -526,11 +527,12 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         assert_eq!(
             left,
             [exe_name.clone()],
-            "round {round}: self-replace left files next to the binary"
+            "round {round}: the helper exited without deleting the old binary next to the new one"
         );
         assert!(
             in_temp.is_empty(),
-            "round {round}: self-replace left files in the temp directory: {in_temp:?}"
+            "round {round}: the helper exited without deleting the old binary (still in the temp \
+             directory, and nothing will remove it later): {in_temp:?}"
         );
 
         // It is a program, not just bytes: it starts and knows its version.
