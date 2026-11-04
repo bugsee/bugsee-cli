@@ -129,6 +129,26 @@ jobs:
         # A binary killed by a signal must not look like a success (#87).
         run: node --test npm/test-launcher.js
 
+  # `bugsee-cli update` replaces the running executable with the `self-replace` crate, whose Windows
+  # implementation (move the old .exe aside, drop the new one in, delete the leftovers from a helper
+  # process) is entirely different from the Unix rename. A dependency bump that touches it (the crate
+  # itself, or the `windows-sys` it is built on) must fail HERE, by name, not somewhere in the
+  # 500-test suite. Both Windows architectures, because the release ships both.
+  self-update-windows:
+    name: self-update (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, windows-11-arm]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # One test at a time: each self-replace starts a helper process that makes a single attempt
+      # to delete the leftovers, and the test watches for exactly that.
+      - run: cargo test --test update_e2e -- --nocapture --test-threads=1
+
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
