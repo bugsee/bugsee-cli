@@ -227,10 +227,12 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
 
 /// Suffixes of the files `self-replace` creates on Windows: the old binary moved aside, and the
 /// copy of itself that deletes it after the updater exits.
+#[cfg(any(windows, test))]
 const SELF_REPLACE_SUFFIXES: [&str; 2] = [".__relocated__.exe", ".__selfdelete__.exe"];
 
 /// Whether `name` is one of the files `self-replace` leaves behind for a binary called `exe_stem`
 /// (`.<stem>.<random>.__relocated__.exe` / `.__selfdelete__.exe`).
+#[cfg(any(windows, test))]
 fn is_self_replace_leftover(name: &str, exe_stem: &str) -> bool {
     let Some(rest) = name
         .strip_prefix('.')
@@ -251,6 +253,7 @@ fn is_self_replace_leftover(name: &str, exe_stem: &str) -> bool {
 /// at that moment, an 8 MB copy of the binary stays behind for good, once per update. Clearing
 /// them on the next update bounds the litter. A leftover whose helper is still running is locked
 /// and simply fails to delete, which is why errors are not reported. Returns how many were removed.
+#[cfg(any(windows, test))]
 fn sweep_self_replace_leftovers_in(dir: &Path, exe_stem: &str) -> usize {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
