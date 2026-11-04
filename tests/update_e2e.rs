@@ -511,20 +511,10 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
             "round {round}: the binary should be the downloaded release"
         );
 
-        // It is a program, not just bytes: it starts and knows its version.
-        let exe_for_run = exe.clone();
-        tokio::task::spawn_blocking(move || {
-            assert_cmd::Command::new(&exe_for_run)
-                .arg("--version")
-                .assert()
-                .success()
-                .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
-        })
-        .await
-        .unwrap();
-
         // The helper that removes the old binary runs after the updater exits: give it time, then
         // require that only the binary is left, and that nothing is left in the temp directory.
+        // This comes BEFORE launching the new binary, so nothing else is touching the files while
+        // the helper makes its single attempt to delete them.
         let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
         for _ in 0..80 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
@@ -542,5 +532,17 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
             in_temp.is_empty(),
             "round {round}: self-replace left files in the temp directory: {in_temp:?}"
         );
+
+        // It is a program, not just bytes: it starts and knows its version.
+        let exe_for_run = exe.clone();
+        tokio::task::spawn_blocking(move || {
+            assert_cmd::Command::new(&exe_for_run)
+                .arg("--version")
+                .assert()
+                .success()
+                .stdout(predicates::str::contains(env!("CARGO_PKG_VERSION")));
+        })
+        .await
+        .unwrap();
     }
 }
