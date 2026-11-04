@@ -466,10 +466,14 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// loader ignores) and then checks what a user depends on after an update:
 /// - the replaced `.exe` launches, and reports the version;
 /// - it can update again, over a file that was itself put there by a self-replace;
-/// - nothing is left behind once the helper has finished. `self-replace` moves the old binary and
-///   starts its `.__selfdelete__.exe` helper from `env::temp_dir()` (it only falls back to the
-///   binary's directory when that is on another volume), so the updater is given a temp directory
-///   the test owns and BOTH that and the binary's directory must end up clean.
+/// - the helper cleans up after itself. `self-replace` moves the old binary and starts its
+///   `.__selfdelete__.exe` helper from `env::temp_dir()` (it only falls back to the binary's
+///   directory when that is on another volume), so the updater is given a temp directory the test
+///   owns. The helper makes ONE delete attempt and never retries, so something outside the test
+///   (a scanner) can occasionally beat it; `update` therefore sweeps what an earlier update left.
+///   The test accepts that, but only in the way it is bounded: files left by round N must be gone
+///   after round N+1, and a helper that is broken leaves files EVERY round, so at least one round
+///   must end with nothing left.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_litter() {
@@ -481,16 +485,18 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
     let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
     let real = std::fs::read(&exe).unwrap();
     let newer = format!("{}.99.0", current_major());
+    let systemp = tmp.path().join("systemp");
+    std::fs::create_dir(&systemp).unwrap();
+    let mut clean_rounds = 0;
+    let mut left_by_previous: Vec<String> = Vec::new();
 
-    for round in 1..=2 {
+    for round in 1..=3 {
         let mut payload = real.clone();
         payload.extend_from_slice(format!("\0BUGSEE-TEST-OVERLAY-{round}\0").as_bytes());
         let artefacts = tmp.path().join(format!("release-{round}"));
         std::fs::create_dir(&artefacts).unwrap();
         let archive = build_release_archive(&artefacts, triple, &payload);
         let server = serve_release(&newer, triple, &archive).await;
-        let systemp = tmp.path().join(format!("systemp-{round}"));
-        std::fs::create_dir(&systemp).unwrap();
 
         let (base, exe_for_run, temp_for_run) = (server.uri(), exe.clone(), systemp.clone());
         tokio::task::spawn_blocking(move || {
@@ -530,11 +536,24 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
             [exe_name.clone()],
             "round {round}: the old binary was not deleted from next to the new one"
         );
-        assert!(
-            in_temp.is_empty(),
-            "round {round}: the helper did not delete what it was meant to (a failed delete is never \
-             retried): {in_temp:?}"
-        );
+        // What this update's sweep was meant to remove must be gone.
+        for name in &left_by_previous {
+            assert!(
+                !in_temp.contains(name),
+                "round {round}: {name} was left by the previous update and not swept"
+            );
+        }
+        // Whatever is left is the helper's own litter and nothing else.
+        for name in &in_temp {
+            assert!(
+                name.starts_with('.')
+                    && (name.ends_with(".__relocated__.exe")
+                        || name.ends_with(".__selfdelete__.exe")),
+                "round {round}: unexpected file in the temp directory: {name}"
+            );
+        }
+        clean_rounds += usize::from(in_temp.is_empty());
+        left_by_previous = in_temp;
 
         // It is a program, not just bytes: it starts and knows its version.
         let exe_for_run = exe.clone();
@@ -548,4 +567,9 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         .await
         .unwrap();
     }
+
+    assert!(
+        clean_rounds >= 1,
+        "the helper left the old binary behind after every one of 3 updates: it is not deleting"
+    );
 }
