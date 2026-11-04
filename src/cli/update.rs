@@ -205,6 +205,9 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
     let tmp = tempfile::tempdir()?;
     let new_binary = install(&base, &target, triple, tmp.path()).await?;
 
+    #[cfg(windows)]
+    sweep_self_replace_leftovers();
+
     // Atomically replace the running executable. `self_replace` handles the
     // Windows "can't overwrite a running .exe" case (rename-then-stage) and the
     // Unix in-place rename uniformly.
@@ -220,6 +223,85 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
 
     report(current, &target, UpdateAction::Updated);
     Ok(())
+}
+
+/// Suffixes of the files `self-replace` creates on Windows: the old binary moved aside, and the
+/// copy of itself that deletes it after the updater exits.
+#[cfg(any(windows, test))]
+const SELF_REPLACE_SUFFIXES: [&str; 2] = [".__relocated__.exe", ".__selfdelete__.exe"];
+
+/// The random part `self-replace` puts in those names: 32 lowercase ASCII letters. Matching it
+/// exactly keeps the sweep from ever deleting a file somebody else named.
+#[cfg(any(windows, test))]
+fn is_generated_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_lowercase())
+}
+
+/// Whether `name` is one of the files `self-replace` leaves behind for a binary called `exe_stem`
+/// (`.<stem>.<random>.__relocated__.exe` / `.__selfdelete__.exe`; the stem matches in any case).
+#[cfg(any(windows, test))]
+fn is_self_replace_leftover(name: &str, exe_stem: &str) -> bool {
+    // The stem is whatever casing the process was started with, which Windows does not keep
+    // stable between runs, so the one written by an earlier update may differ in case.
+    let Some(rest) = name
+        .strip_prefix('.')
+        .filter(|r| {
+            r.get(..exe_stem.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(exe_stem))
+        })
+        .and_then(|r| r[exe_stem.len()..].strip_prefix('.'))
+    else {
+        return false;
+    };
+    SELF_REPLACE_SUFFIXES
+        .iter()
+        .any(|suffix| rest.strip_suffix(suffix).is_some_and(is_generated_id))
+}
+
+/// Remove what an EARLIER `update` left in `dir`, ignoring every error.
+///
+/// On Windows the helper `self-replace` starts makes ONE attempt to delete the old binary once the
+/// updater has exited, and never retries: if something else (a virus scanner, say) holds the file
+/// at that moment, an 8 MB copy of the binary stays behind for good, once per update. Clearing
+/// them on the next update bounds the litter. A leftover whose helper is still running is locked
+/// and simply fails to delete, which is why errors are not reported. Returns how many were removed.
+#[cfg(any(windows, test))]
+fn sweep_self_replace_leftovers_in(dir: &Path, exe_stem: &str) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .filter(|e| is_self_replace_leftover(&e.file_name().to_string_lossy(), exe_stem))
+        .filter(|e| std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
+/// Sweep both places `self-replace` puts them: the temp directory, and next to the binary (its
+/// fallback when the temp directory is on another volume).
+#[cfg(windows)]
+fn sweep_self_replace_leftovers() {
+    let Ok(exe) = std::env::current_exe() else {
+        return;
+    };
+    // `self-replace` names the files after the path the process was started with, but puts the
+    // fallback ones in the directory of the CANONICAL path: take each from where it takes it.
+    let Some(stem) = exe.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
+        return;
+    };
+    let mut dirs = vec![std::env::temp_dir()];
+    dirs.extend(
+        exe.canonicalize()
+            .ok()
+            .and_then(|c| c.parent().map(Path::to_path_buf)),
+    );
+    let removed: usize = dirs
+        .iter()
+        .map(|d| sweep_self_replace_leftovers_in(d, &stem))
+        .sum();
+    if removed > 0 {
+        tracing::debug!("removed {removed} file(s) left by an earlier update");
+    }
 }
 
 /// `(os, arch, triple)` for every target `bugsee-cli` publishes a binary for.
@@ -760,6 +842,94 @@ mod tests {
         assert!(
             !is_fresh(now + 10, now, ttl),
             "future timestamp → distrusted/stale"
+        );
+    }
+
+    /// 32 lowercase letters, like the random part `self-replace` generates.
+    const ID_A: &str = "mmxodzqauiijizsertstseqdbgnfjuvy";
+    const ID_B: &str = "yfvcaxcanospydggtqjzznqkxikmtycu";
+
+    #[test]
+    fn only_the_files_self_replace_leaves_are_leftovers() {
+        let stem = "bugsee-cli";
+        assert!(is_self_replace_leftover(
+            &format!(".bugsee-cli.{ID_A}.__selfdelete__.exe"),
+            stem
+        ));
+        assert!(is_self_replace_leftover(
+            &format!(".bugsee-cli.{ID_B}.__relocated__.exe"),
+            stem
+        ));
+        // Windows does not keep the casing a process was started with stable.
+        assert!(is_self_replace_leftover(
+            &format!(".BUGSEE-CLI.{ID_A}.__relocated__.exe"),
+            stem
+        ));
+        assert!(is_self_replace_leftover(
+            &format!(".bugsee-cli.{ID_A}.__relocated__.exe"),
+            "Bugsee-CLI"
+        ));
+        let upper = ID_A.to_uppercase();
+        let short = &ID_A[..31];
+        let long = format!("{ID_A}a");
+        let digit = format!("{}1", &ID_A[..31]);
+        for other in [
+            "bugsee-cli.exe".to_string(),
+            ".bugsee-cli.__relocated__.exe".to_string(), // no random part
+            format!(".bugsee-cli.{ID_A}.__temp__.exe"),
+            format!(".other.{ID_A}.__relocated__.exe"), // someone else's binary
+            format!("bugsee-cli.{ID_A}.__relocated__.exe"), // not hidden
+            ".bugsee-cli-update-check".to_string(),
+            format!(".bugsee-clix.{ID_A}.__relocated__.exe"),
+            // a random part that is not what self-replace generates
+            ".bugsee-cli.backup.__relocated__.exe".to_string(),
+            format!(".bugsee-cli.{short}.__relocated__.exe"),
+            format!(".bugsee-cli.{long}.__relocated__.exe"),
+            format!(".bugsee-cli.{digit}.__relocated__.exe"),
+            format!(".bugsee-cli.{upper}.__relocated__.exe"),
+        ] {
+            assert!(!is_self_replace_leftover(&other, stem), "{other}");
+        }
+    }
+
+    #[test]
+    fn the_sweep_removes_leftovers_and_nothing_else() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mine = [
+            format!(".bugsee-cli.{ID_A}.__relocated__.exe"),
+            format!(".bugsee-cli.{ID_B}.__selfdelete__.exe"),
+        ];
+        let dir_named_like_one = format!(".bugsee-cli.{}.__relocated__.exe", "z".repeat(32));
+        let keep = [
+            "bugsee-cli.exe".to_string(),
+            format!(".other.{ID_A}.__relocated__.exe"),
+            "notes.txt".to_string(),
+        ];
+        for n in mine.iter().chain(keep.iter()) {
+            std::fs::write(tmp.path().join(n), b"x").unwrap();
+        }
+        std::fs::create_dir(tmp.path().join(&dir_named_like_one)).unwrap();
+
+        // The directory entry is not a file: it must not count as removed, and must not abort.
+        assert_eq!(sweep_self_replace_leftovers_in(tmp.path(), "bugsee-cli"), 2);
+
+        let mut left: Vec<String> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        left.sort();
+        let mut want: Vec<String> = keep.to_vec();
+        want.push(dir_named_like_one);
+        want.sort();
+        assert_eq!(left, want);
+    }
+
+    #[test]
+    fn sweeping_a_missing_directory_is_not_an_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(
+            sweep_self_replace_leftovers_in(&tmp.path().join("nope"), "bugsee-cli"),
+            0
         );
     }
 

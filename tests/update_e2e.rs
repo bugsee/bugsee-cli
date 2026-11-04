@@ -466,10 +466,14 @@ fn names_in(dir: &Path) -> Vec<String> {
 /// loader ignores) and then checks what a user depends on after an update:
 /// - the replaced `.exe` launches, and reports the version;
 /// - it can update again, over a file that was itself put there by a self-replace;
-/// - nothing is left behind once the helper has finished. `self-replace` moves the old binary and
-///   starts its `.__selfdelete__.exe` helper from `env::temp_dir()` (it only falls back to the
-///   binary's directory when that is on another volume), so the updater is given a temp directory
-///   the test owns and BOTH that and the binary's directory must end up clean.
+/// - the helper cleans up after itself. `self-replace` moves the old binary and starts its
+///   `.__selfdelete__.exe` helper from `env::temp_dir()` (it only falls back to the binary's
+///   directory when that is on another volume), so the updater is given a temp directory the test
+///   owns. The helper makes ONE delete attempt and never retries, so something outside the test
+///   (a scanner) can occasionally beat it; `update` therefore sweeps what an earlier update left.
+///   The test accepts that, but only in the way it is bounded: files left by round N must be gone
+///   after round N+1, and a helper that is broken leaves files EVERY round, so at least one round
+///   must end with nothing left.
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_litter() {
@@ -481,16 +485,38 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
     let exe_name = exe.file_name().unwrap().to_string_lossy().into_owned();
     let real = std::fs::read(&exe).unwrap();
     let newer = format!("{}.99.0", current_major());
+    let systemp = tmp.path().join("systemp");
+    std::fs::create_dir(&systemp).unwrap();
+    let mut clean_rounds = 0;
+    let mut left_by_previous: Vec<String> = Vec::new();
+    // Files the sweep has to remove EVERY round whether or not the helper managed to clean up, so
+    // that a sweep that is not called, or looks in the wrong place, cannot pass by luck: one in each
+    // place `self-replace` can put them, the first spelled in another case than the binary's name.
+    // And one that belongs to nobody it knows, which has to survive.
+    let stem = exe_name.trim_end_matches(".exe").to_string();
+    let stranger = format!(".someone-else.{}.__relocated__.exe", "z".repeat(32));
+    std::fs::write(systemp.join(&stranger), b"not ours").unwrap();
+    let only_ours = |dir: &Path| -> Vec<String> {
+        names_in(dir)
+            .into_iter()
+            .filter(|n| *n != stranger)
+            .collect()
+    };
 
-    for round in 1..=2 {
+    for round in 1..=3 {
         let mut payload = real.clone();
         payload.extend_from_slice(format!("\0BUGSEE-TEST-OVERLAY-{round}\0").as_bytes());
         let artefacts = tmp.path().join(format!("release-{round}"));
         std::fs::create_dir(&artefacts).unwrap();
         let archive = build_release_archive(&artefacts, triple, &payload);
         let server = serve_release(&newer, triple, &archive).await;
-        let systemp = tmp.path().join(format!("systemp-{round}"));
-        std::fs::create_dir(&systemp).unwrap();
+
+        // The random part self-replace generates: 32 lowercase letters (a different one per round).
+        let id = char::from(b'a' + round as u8).to_string().repeat(32);
+        let planted_temp = format!(".{}.{id}.__relocated__.exe", stem.to_uppercase());
+        let planted_bin = format!(".{stem}.{id}.__selfdelete__.exe");
+        std::fs::write(systemp.join(&planted_temp), b"old").unwrap();
+        std::fs::write(bindir.join(&planted_bin), b"old").unwrap();
 
         let (base, exe_for_run, temp_for_run) = (server.uri(), exe.clone(), systemp.clone());
         tokio::task::spawn_blocking(move || {
@@ -517,24 +543,49 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         // that is still here after a generous wait means that attempt failed. The wait is for what
         // is not covered by the pipes: the helper's own `.__selfdelete__.exe` goes away only when
         // the last handle to it closes (`FILE_FLAG_DELETE_ON_CLOSE`), and a scanner may hold one.
-        let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
+        let (mut left, mut in_temp) = (names_in(&bindir), only_ours(&systemp));
         for _ in 0..80 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-            (left, in_temp) = (names_in(&bindir), names_in(&systemp));
+            (left, in_temp) = (names_in(&bindir), only_ours(&systemp));
         }
+        assert!(
+            !left.contains(&planted_bin),
+            "round {round}: the sweep did not remove {planted_bin} from next to the binary"
+        );
         assert_eq!(
             left,
             [exe_name.clone()],
             "round {round}: the old binary was not deleted from next to the new one"
         );
+        // What this update's sweep was meant to remove must be gone, and what is not ours stays.
         assert!(
-            in_temp.is_empty(),
-            "round {round}: the helper did not delete what it was meant to (a failed delete is never \
-             retried): {in_temp:?}"
+            !in_temp.contains(&planted_temp),
+            "round {round}: the sweep did not remove {planted_temp} from the temp directory"
         );
+        assert!(
+            systemp.join(&stranger).exists(),
+            "round {round}: the sweep removed a file that is not left by self-replace for this binary"
+        );
+        for name in &left_by_previous {
+            assert!(
+                !in_temp.contains(name),
+                "round {round}: {name} was left by the previous update and not swept"
+            );
+        }
+        // Whatever is left is the helper's own litter and nothing else.
+        for name in &in_temp {
+            assert!(
+                name.starts_with('.')
+                    && (name.ends_with(".__relocated__.exe")
+                        || name.ends_with(".__selfdelete__.exe")),
+                "round {round}: unexpected file in the temp directory: {name}"
+            );
+        }
+        clean_rounds += usize::from(in_temp.is_empty());
+        left_by_previous = in_temp;
 
         // It is a program, not just bytes: it starts and knows its version.
         let exe_for_run = exe.clone();
@@ -548,4 +599,9 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         .await
         .unwrap();
     }
+
+    assert!(
+        clean_rounds >= 1,
+        "the helper left the old binary behind after every one of 3 updates: it is not deleting"
+    );
 }
