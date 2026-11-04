@@ -231,13 +231,18 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
 const SELF_REPLACE_SUFFIXES: [&str; 2] = [".__relocated__.exe", ".__selfdelete__.exe"];
 
 /// Whether `name` is one of the files `self-replace` leaves behind for a binary called `exe_stem`
-/// (`.<stem>.<random>.__relocated__.exe` / `.__selfdelete__.exe`).
+/// (`.<stem>.<random>.__relocated__.exe` / `.__selfdelete__.exe`; the stem matches in any case).
 #[cfg(any(windows, test))]
 fn is_self_replace_leftover(name: &str, exe_stem: &str) -> bool {
+    // The stem is whatever casing the process was started with, which Windows does not keep
+    // stable between runs, so the one written by an earlier update may differ in case.
     let Some(rest) = name
         .strip_prefix('.')
-        .and_then(|r| r.strip_prefix(exe_stem))
-        .and_then(|r| r.strip_prefix('.'))
+        .filter(|r| {
+            r.get(..exe_stem.len())
+                .is_some_and(|head| head.eq_ignore_ascii_case(exe_stem))
+        })
+        .and_then(|r| r[exe_stem.len()..].strip_prefix('.'))
     else {
         return false;
     };
@@ -272,6 +277,8 @@ fn sweep_self_replace_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
+    // `self-replace` works from the canonical path, so that is where its fallback files land.
+    let exe = exe.canonicalize().unwrap_or(exe);
     let Some(stem) = exe.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
         return;
     };
@@ -837,6 +844,15 @@ mod tests {
         assert!(is_self_replace_leftover(
             ".bugsee-cli.yfvcaxcanospydggtqjzznqkxikmtycu.__relocated__.exe",
             stem
+        ));
+        // Windows does not keep the casing a process was started with stable.
+        assert!(is_self_replace_leftover(
+            ".BUGSEE-CLI.aaaa.__relocated__.exe",
+            stem
+        ));
+        assert!(is_self_replace_leftover(
+            ".bugsee-cli.aaaa.__relocated__.exe",
+            "Bugsee-CLI"
         ));
         for other in [
             "bugsee-cli.exe",

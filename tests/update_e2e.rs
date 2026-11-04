@@ -489,6 +489,19 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
     std::fs::create_dir(&systemp).unwrap();
     let mut clean_rounds = 0;
     let mut left_by_previous: Vec<String> = Vec::new();
+    // Files the sweep has to remove EVERY round whether or not the helper managed to clean up, so
+    // that a sweep that is not called, or looks in the wrong place, cannot pass by luck: one in each
+    // place `self-replace` can put them, the first spelled in another case than the binary's name.
+    // And one that belongs to nobody it knows, which has to survive.
+    let stem = exe_name.trim_end_matches(".exe").to_string();
+    let stranger = ".someone-else.zzzz.__relocated__.exe".to_string();
+    std::fs::write(systemp.join(&stranger), b"not ours").unwrap();
+    let only_ours = |dir: &Path| -> Vec<String> {
+        names_in(dir)
+            .into_iter()
+            .filter(|n| *n != ".someone-else.zzzz.__relocated__.exe")
+            .collect()
+    };
 
     for round in 1..=3 {
         let mut payload = real.clone();
@@ -497,6 +510,11 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         std::fs::create_dir(&artefacts).unwrap();
         let archive = build_release_archive(&artefacts, triple, &payload);
         let server = serve_release(&newer, triple, &archive).await;
+
+        let planted_temp = format!(".{}.planted{round}.__relocated__.exe", stem.to_uppercase());
+        let planted_bin = format!(".{stem}.planted{round}.__selfdelete__.exe");
+        std::fs::write(systemp.join(&planted_temp), b"old").unwrap();
+        std::fs::write(bindir.join(&planted_bin), b"old").unwrap();
 
         let (base, exe_for_run, temp_for_run) = (server.uri(), exe.clone(), systemp.clone());
         tokio::task::spawn_blocking(move || {
@@ -523,20 +541,32 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         // that is still here after a generous wait means that attempt failed. The wait is for what
         // is not covered by the pipes: the helper's own `.__selfdelete__.exe` goes away only when
         // the last handle to it closes (`FILE_FLAG_DELETE_ON_CLOSE`), and a scanner may hold one.
-        let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
+        let (mut left, mut in_temp) = (names_in(&bindir), only_ours(&systemp));
         for _ in 0..80 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
                 break;
             }
             std::thread::sleep(std::time::Duration::from_millis(250));
-            (left, in_temp) = (names_in(&bindir), names_in(&systemp));
+            (left, in_temp) = (names_in(&bindir), only_ours(&systemp));
         }
+        assert!(
+            !left.contains(&planted_bin),
+            "round {round}: the sweep did not remove {planted_bin} from next to the binary"
+        );
         assert_eq!(
             left,
             [exe_name.clone()],
             "round {round}: the old binary was not deleted from next to the new one"
         );
-        // What this update's sweep was meant to remove must be gone.
+        // What this update's sweep was meant to remove must be gone, and what is not ours stays.
+        assert!(
+            !in_temp.contains(&planted_temp),
+            "round {round}: the sweep did not remove {planted_temp} from the temp directory"
+        );
+        assert!(
+            systemp.join(&stranger).exists(),
+            "round {round}: the sweep removed a file that is not left by self-replace for this binary"
+        );
         for name in &left_by_previous {
             assert!(
                 !in_temp.contains(name),
