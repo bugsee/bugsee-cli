@@ -514,10 +514,11 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         // By the time `.assert()` returned, the helper is done: it and its `cmd.exe` inherit the
         // updater's stdout/stderr, and `assert()` reads those pipes until every holder has closed
         // them. The helper makes ONE attempt to delete the old binary and never retries, so a file
-        // still here means that attempt failed (nothing will remove it later), not that the helper
-        // is slow. The short wait is only for the filesystem to settle.
+        // that is still here after a generous wait means that attempt failed. The wait is for what
+        // is not covered by the pipes: the helper's own `.__selfdelete__.exe` goes away only when
+        // the last handle to it closes (`FILE_FLAG_DELETE_ON_CLOSE`), and a scanner may hold one.
         let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
-        for _ in 0..8 {
+        for _ in 0..80 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
                 break;
             }
@@ -527,12 +528,12 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         assert_eq!(
             left,
             [exe_name.clone()],
-            "round {round}: the helper exited without deleting the old binary next to the new one"
+            "round {round}: the old binary was not deleted from next to the new one"
         );
         assert!(
             in_temp.is_empty(),
-            "round {round}: the helper exited without deleting the old binary (still in the temp \
-             directory, and nothing will remove it later): {in_temp:?}"
+            "round {round}: the helper did not delete what it was meant to (a failed delete is never \
+             retried): {in_temp:?}"
         );
 
         // It is a program, not just bytes: it starts and knows its version.
