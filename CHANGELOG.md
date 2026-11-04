@@ -6,8 +6,29 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-11-04
+
+### Added
+- **Unity Mono Release builds now symbolicate: `debug-files upload --type portable-pdb` and
+  `convert --to bmf` ([#86], [#99]).** A Unity Mono Release build ships no pdb, so the runtime
+  prints a managed frame as `at Ns.Class.Method (args) [0x0000b] in <module-id>:0`. The CLI pairs
+  each assembly the compiler produced with its portable pdb, converts them to a BMF mapping keyed
+  by method signature and IL offset, and uploads it under the module id (MVID) the app actually
+  ships. `--shipped-dir` covers the builds whose linker rewrites the assemblies (managed stripping
+  Low or higher): the BMF is keyed by the shipped MVID. A pdb that does not belong to its assembly
+  exits 11 and uploads nothing, and a failed run leaves no partial set of results. The worker
+  side (bugsee/bugsee-background-worker#143) is deployed to staging. See
+  `docs/unity-mono-portable-pdb.md`. **New capability: an integrator must raise its minimum CLI
+  version to 0.9.0 before using it.**
+
 ### Fixed
-- **A Rust panic no longer exits 101.** 101 is outside the exit-code contract, so every integrator
+- **`bugsee-cli update` on Windows no longer accumulates leftover binaries ([#103]).**
+  `self-replace`'s helper makes one attempt to delete the old binary after the updater exits and
+  never retries, so a file scanner holding it at that moment left an 8 MB copy in `%TEMP%` for
+  good, once per update. `update` now removes such leftovers from earlier runs before replacing
+  itself (only the crate's own names for this binary, in any case, with the exact 32-letter random
+  part; errors ignored). Windows only; nothing changes on macOS or Linux.
+- **A Rust panic no longer exits 101 ([#98]).** 101 is outside the exit-code contract, so every integrator
   read it as a substantive failure: the Gradle plugin (bugsee/bugsee-android-gradle-plugin#96) did
   not fall back to its Kotlin uploader, and the iOS `BugseeAgent` did not either. A panic is now
   caught in `main` and mapped by phase. Before any network request was sent (a read-only GET counts too, so
@@ -17,6 +38,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   reserved no-fallback range, so an older integrator treats it as a substantive failure, exactly as
   it treated 101. A panic inside a `spawn_blocking` task (sourcemap strip/pack) is re-raised so it is
   classified the same way. The message and location still go to stderr. No other exit code changes.
+
+### Changed
+- `self-replace` 1.5.0 -> 1.5.1 ([#97]): widens its `windows-sys` range to avoid duplicate versions in the
+  tree. The Windows `update` path is now exercised for real in CI, on x64 and ARM64, in a dedicated
+  `self-update` check ([#100], [#102], [#103]).
+
+[#86]: https://github.com/bugsee/bugsee-cli/issues/86
+[#97]: https://github.com/bugsee/bugsee-cli/pull/97
+[#98]: https://github.com/bugsee/bugsee-cli/pull/98
+[#99]: https://github.com/bugsee/bugsee-cli/pull/99
+[#100]: https://github.com/bugsee/bugsee-cli/pull/100
+[#102]: https://github.com/bugsee/bugsee-cli/pull/102
+[#103]: https://github.com/bugsee/bugsee-cli/pull/103
 
 ## [0.8.2] - 2026-10-30
 
