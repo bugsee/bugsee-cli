@@ -145,8 +145,8 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      # One test at a time: each self-replace starts a helper process that makes a single attempt
-      # to delete the leftovers, and the test watches for exactly that.
+      # One test at a time, so a failure names the test that caused it and a slow runner is not
+      # also running the other update tests; it does not change the helper's single delete attempt.
       - run: cargo test --test update_e2e -- --nocapture --test-threads=1
 
   test:

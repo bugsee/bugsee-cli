@@ -511,10 +511,12 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
             "round {round}: the binary should be the downloaded release"
         );
 
-        // The helper that removes the old binary runs after the updater exits: give it time, then
-        // require that only the binary is left, and that nothing is left in the temp directory.
-        // This comes BEFORE launching the new binary, so nothing else is touching the files while
-        // the helper makes its single attempt to delete them.
+        // By the time `.assert()` returned, the helper is done: it and its `cmd.exe` inherit the
+        // updater's stdout/stderr, and `assert()` reads those pipes until every holder has closed
+        // them. The helper makes ONE attempt to delete the old binary and never retries, so a file
+        // that is still here after a generous wait means that attempt failed. The wait is for what
+        // is not covered by the pipes: the helper's own `.__selfdelete__.exe` goes away only when
+        // the last handle to it closes (`FILE_FLAG_DELETE_ON_CLOSE`), and a scanner may hold one.
         let (mut left, mut in_temp) = (names_in(&bindir), names_in(&systemp));
         for _ in 0..80 {
             if left == [exe_name.clone()] && in_temp.is_empty() {
@@ -526,11 +528,12 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         assert_eq!(
             left,
             [exe_name.clone()],
-            "round {round}: self-replace left files next to the binary"
+            "round {round}: the old binary was not deleted from next to the new one"
         );
         assert!(
             in_temp.is_empty(),
-            "round {round}: self-replace left files in the temp directory: {in_temp:?}"
+            "round {round}: the helper did not delete what it was meant to (a failed delete is never \
+             retried): {in_temp:?}"
         );
 
         // It is a program, not just bytes: it starts and knows its version.
