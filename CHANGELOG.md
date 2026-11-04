@@ -28,7 +28,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   good, once per update. `update` now removes such leftovers from earlier runs before replacing
   itself (only the crate's own names for this binary, in any case, with the exact 32-letter random
   part; errors ignored). Windows only; nothing changes on macOS or Linux.
-- **A Rust panic no longer exits 101.** 101 is outside the exit-code contract, so every integrator
+- **A Rust panic no longer exits 101 ([#98]).** 101 is outside the exit-code contract, so every integrator
   read it as a substantive failure: the Gradle plugin (bugsee/bugsee-android-gradle-plugin#96) did
   not fall back to its Kotlin uploader, and the iOS `BugseeAgent` did not either. A panic is now
   caught in `main` and mapped by phase. Before any network request was sent (a read-only GET counts too, so
@@ -43,6 +43,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `self-replace` 1.5.0 -> 1.5.1 ([#97]): widens its `windows-sys` range to avoid duplicate versions in the
   tree. The Windows `update` path is now exercised for real in CI, on x64 and ARM64, in a dedicated
   `self-update` check ([#100], [#102], [#103]).
+
+[#86]: https://github.com/bugsee/bugsee-cli/issues/86
+[#97]: https://github.com/bugsee/bugsee-cli/pull/97
+[#98]: https://github.com/bugsee/bugsee-cli/pull/98
+[#99]: https://github.com/bugsee/bugsee-cli/pull/99
+[#100]: https://github.com/bugsee/bugsee-cli/pull/100
+[#102]: https://github.com/bugsee/bugsee-cli/pull/102
+[#103]: https://github.com/bugsee/bugsee-cli/pull/103
 
 ## [0.8.2] - 2026-10-30
 
@@ -563,12 +571,6 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 [#19]: https://github.com/bugsee/bugsee-cli/issues/19
 [#20]: https://github.com/bugsee/bugsee-cli/issues/20
-[#86]: https://github.com/bugsee/bugsee-cli/issues/86
-[#97]: https://github.com/bugsee/bugsee-cli/pull/97
-[#99]: https://github.com/bugsee/bugsee-cli/pull/99
-[#100]: https://github.com/bugsee/bugsee-cli/pull/100
-[#102]: https://github.com/bugsee/bugsee-cli/pull/102
-[#103]: https://github.com/bugsee/bugsee-cli/pull/103
 [#28]: https://github.com/bugsee/bugsee-cli/issues/28
 [#29]: https://github.com/bugsee/bugsee-cli/issues/29
 
