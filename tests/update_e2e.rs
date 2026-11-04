@@ -494,12 +494,12 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
     // place `self-replace` can put them, the first spelled in another case than the binary's name.
     // And one that belongs to nobody it knows, which has to survive.
     let stem = exe_name.trim_end_matches(".exe").to_string();
-    let stranger = ".someone-else.zzzz.__relocated__.exe".to_string();
+    let stranger = format!(".someone-else.{}.__relocated__.exe", "z".repeat(32));
     std::fs::write(systemp.join(&stranger), b"not ours").unwrap();
     let only_ours = |dir: &Path| -> Vec<String> {
         names_in(dir)
             .into_iter()
-            .filter(|n| *n != ".someone-else.zzzz.__relocated__.exe")
+            .filter(|n| *n != stranger)
             .collect()
     };
 
@@ -511,8 +511,10 @@ async fn update_on_windows_leaves_a_runnable_binary_that_updates_again_and_no_li
         let archive = build_release_archive(&artefacts, triple, &payload);
         let server = serve_release(&newer, triple, &archive).await;
 
-        let planted_temp = format!(".{}.planted{round}.__relocated__.exe", stem.to_uppercase());
-        let planted_bin = format!(".{stem}.planted{round}.__selfdelete__.exe");
+        // The random part self-replace generates: 32 lowercase letters (a different one per round).
+        let id = char::from(b'a' + round as u8).to_string().repeat(32);
+        let planted_temp = format!(".{}.{id}.__relocated__.exe", stem.to_uppercase());
+        let planted_bin = format!(".{stem}.{id}.__selfdelete__.exe");
         std::fs::write(systemp.join(&planted_temp), b"old").unwrap();
         std::fs::write(bindir.join(&planted_bin), b"old").unwrap();
 

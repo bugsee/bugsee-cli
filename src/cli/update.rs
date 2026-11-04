@@ -230,6 +230,13 @@ async fn run(args: &UpdateArgs) -> anyhow::Result<()> {
 #[cfg(any(windows, test))]
 const SELF_REPLACE_SUFFIXES: [&str; 2] = [".__relocated__.exe", ".__selfdelete__.exe"];
 
+/// The random part `self-replace` puts in those names: 32 lowercase ASCII letters. Matching it
+/// exactly keeps the sweep from ever deleting a file somebody else named.
+#[cfg(any(windows, test))]
+fn is_generated_id(id: &str) -> bool {
+    id.len() == 32 && id.bytes().all(|b| b.is_ascii_lowercase())
+}
+
 /// Whether `name` is one of the files `self-replace` leaves behind for a binary called `exe_stem`
 /// (`.<stem>.<random>.__relocated__.exe` / `.__selfdelete__.exe`; the stem matches in any case).
 #[cfg(any(windows, test))]
@@ -248,7 +255,7 @@ fn is_self_replace_leftover(name: &str, exe_stem: &str) -> bool {
     };
     SELF_REPLACE_SUFFIXES
         .iter()
-        .any(|suffix| rest.strip_suffix(suffix).is_some_and(|id| !id.is_empty()))
+        .any(|suffix| rest.strip_suffix(suffix).is_some_and(is_generated_id))
 }
 
 /// Remove what an EARLIER `update` left in `dir`, ignoring every error.
@@ -277,13 +284,17 @@ fn sweep_self_replace_leftovers() {
     let Ok(exe) = std::env::current_exe() else {
         return;
     };
-    // `self-replace` works from the canonical path, so that is where its fallback files land.
-    let exe = exe.canonicalize().unwrap_or(exe);
+    // `self-replace` names the files after the path the process was started with, but puts the
+    // fallback ones in the directory of the CANONICAL path: take each from where it takes it.
     let Some(stem) = exe.file_stem().map(|s| s.to_string_lossy().into_owned()) else {
         return;
     };
     let mut dirs = vec![std::env::temp_dir()];
-    dirs.extend(exe.parent().map(Path::to_path_buf));
+    dirs.extend(
+        exe.canonicalize()
+            .ok()
+            .and_then(|c| c.parent().map(Path::to_path_buf)),
+    );
     let removed: usize = dirs
         .iter()
         .map(|d| sweep_self_replace_leftovers_in(d, &stem))
@@ -834,36 +845,50 @@ mod tests {
         );
     }
 
+    /// 32 lowercase letters, like the random part `self-replace` generates.
+    const ID_A: &str = "mmxodzqauiijizsertstseqdbgnfjuvy";
+    const ID_B: &str = "yfvcaxcanospydggtqjzznqkxikmtycu";
+
     #[test]
     fn only_the_files_self_replace_leaves_are_leftovers() {
         let stem = "bugsee-cli";
         assert!(is_self_replace_leftover(
-            ".bugsee-cli.mmxodzqauiijizsertstseqdbgnfjuvy.__selfdelete__.exe",
+            &format!(".bugsee-cli.{ID_A}.__selfdelete__.exe"),
             stem
         ));
         assert!(is_self_replace_leftover(
-            ".bugsee-cli.yfvcaxcanospydggtqjzznqkxikmtycu.__relocated__.exe",
+            &format!(".bugsee-cli.{ID_B}.__relocated__.exe"),
             stem
         ));
         // Windows does not keep the casing a process was started with stable.
         assert!(is_self_replace_leftover(
-            ".BUGSEE-CLI.aaaa.__relocated__.exe",
+            &format!(".BUGSEE-CLI.{ID_A}.__relocated__.exe"),
             stem
         ));
         assert!(is_self_replace_leftover(
-            ".bugsee-cli.aaaa.__relocated__.exe",
+            &format!(".bugsee-cli.{ID_A}.__relocated__.exe"),
             "Bugsee-CLI"
         ));
+        let upper = ID_A.to_uppercase();
+        let short = &ID_A[..31];
+        let long = format!("{ID_A}a");
+        let digit = format!("{}1", &ID_A[..31]);
         for other in [
-            "bugsee-cli.exe",
-            ".bugsee-cli.__relocated__.exe", // no random part
-            ".bugsee-cli.abc.__temp__.exe",
-            ".other.abc.__relocated__.exe", // someone else's binary
-            "bugsee-cli.abc.__relocated__.exe", // not hidden
-            ".bugsee-cli-update-check",
-            ".bugsee-clix.abc.__relocated__.exe",
+            "bugsee-cli.exe".to_string(),
+            ".bugsee-cli.__relocated__.exe".to_string(), // no random part
+            format!(".bugsee-cli.{ID_A}.__temp__.exe"),
+            format!(".other.{ID_A}.__relocated__.exe"), // someone else's binary
+            format!("bugsee-cli.{ID_A}.__relocated__.exe"), // not hidden
+            ".bugsee-cli-update-check".to_string(),
+            format!(".bugsee-clix.{ID_A}.__relocated__.exe"),
+            // a random part that is not what self-replace generates
+            ".bugsee-cli.backup.__relocated__.exe".to_string(),
+            format!(".bugsee-cli.{short}.__relocated__.exe"),
+            format!(".bugsee-cli.{long}.__relocated__.exe"),
+            format!(".bugsee-cli.{digit}.__relocated__.exe"),
+            format!(".bugsee-cli.{upper}.__relocated__.exe"),
         ] {
-            assert!(!is_self_replace_leftover(other, stem), "{other}");
+            assert!(!is_self_replace_leftover(&other, stem), "{other}");
         }
     }
 
@@ -871,18 +896,19 @@ mod tests {
     fn the_sweep_removes_leftovers_and_nothing_else() {
         let tmp = tempfile::tempdir().unwrap();
         let mine = [
-            ".bugsee-cli.aaaa.__relocated__.exe",
-            ".bugsee-cli.bbbb.__selfdelete__.exe",
+            format!(".bugsee-cli.{ID_A}.__relocated__.exe"),
+            format!(".bugsee-cli.{ID_B}.__selfdelete__.exe"),
         ];
+        let dir_named_like_one = format!(".bugsee-cli.{}.__relocated__.exe", "z".repeat(32));
         let keep = [
-            "bugsee-cli.exe",
-            ".other.cccc.__relocated__.exe",
-            "notes.txt",
+            "bugsee-cli.exe".to_string(),
+            format!(".other.{ID_A}.__relocated__.exe"),
+            "notes.txt".to_string(),
         ];
         for n in mine.iter().chain(keep.iter()) {
             std::fs::write(tmp.path().join(n), b"x").unwrap();
         }
-        std::fs::create_dir(tmp.path().join(".bugsee-cli.dddd.__relocated__.exe")).unwrap();
+        std::fs::create_dir(tmp.path().join(&dir_named_like_one)).unwrap();
 
         // The directory entry is not a file: it must not count as removed, and must not abort.
         assert_eq!(sweep_self_replace_leftovers_in(tmp.path(), "bugsee-cli"), 2);
@@ -892,8 +918,8 @@ mod tests {
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
         left.sort();
-        let mut want: Vec<String> = keep.iter().map(|s| s.to_string()).collect();
-        want.push(".bugsee-cli.dddd.__relocated__.exe".into());
+        let mut want: Vec<String> = keep.to_vec();
+        want.push(dir_named_like_one);
         want.sort();
         assert_eq!(left, want);
     }
